@@ -1,0 +1,11 @@
+{
+  "name": "FlexiDim Web",
+  "short_name": "FlexiDim",
+  "description": "Local-first control and configuration for JCL FlexiDim lighting systems.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#f4f3ef",
+  "theme_color": "#a94748",
+  "icons": [{ "src": "/flexidim/icon.png", "sizes": "167x167", "type": "image/png", "purpose": "any maskable" }]
+}
