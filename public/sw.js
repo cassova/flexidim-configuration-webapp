@@ -1,4 +1,4 @@
-const CACHE = "flexidim-web-v1";
+const CACHE = "flexidim-web-v2";
 const ASSETS = ["/", "/manifest.webmanifest", "/flexidim/icon.png", "/flexidim/sites.png", "/flexidim/scenes.png", "/flexidim/switches.png"];
 self.addEventListener("install", (event) => event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS))));
 self.addEventListener("activate", (event) => event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key))))));

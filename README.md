@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> This migration is still work in progress.  This is still very early days as I work on this.
+
 # FlexiDim Web
 
 FlexiDim Web is a local-first web migration of **JCL FlexiDim Configuration for iOS 2.97**. It exists to keep installed FlexiDim home-lighting systems usable now that the original company, mobile app, and supporting services are no longer maintained.
@@ -25,6 +28,16 @@ The original app was organized into ten sections, all represented in this migrat
 | Periods | Named time windows and active days used by scheduled behavior |
 | Users | Local user profiles, remote-access settings, permissions, and security keys |
 | Trace | Connection state, commands, replies, and diagnostic activity |
+
+The migrated interface preserves the original configuration hierarchy. Basic Assignments, Scenes, Scene to Button, and Equipment first show only the top-level locations from the iOS configuration (for example, Ground Floor, First Floor, and Exterior Front). Selecting a location replaces that menu with its child areas (for example, Hall, Snug, Lounge, and Kitchen), with a Back control to return to the location list. Their ordering and nesting come from the `.fd4cfg` archive rather than being alphabetically rearranged. The main navigation follows the iOS order: Configurations, Basic Assignments, Scenes, Scene to Button, Users, Periods, Equipment, and Trace, with Sites retained above them.
+
+The Sites section follows the original app's site-picker model: it lists the sites saved on this device, lets you select one to edit its controller and location details, and provides a **Create site** button. Configuration editing is unlocked with the **Allow changes** switch in the top-right header.
+
+With changes allowed, Basic Assignments uses the original floor → room → switch flow and exposes the recovered switch controls for assigned channels, on/dimming behavior, timing, and off priority. Its add utility can automatically give every unassigned switch all channels in that switch's room. Scenes exposes the original extractor, security, and simple sequence creation utilities. Scene to Button also uses floor → room → switch navigation and provides a visual switch face whose buttons show separate first-press and second-press assignment indicators. Equipment exposes add controls for floors, switches, and lights only while changes are allowed.
+
+Equipment also retains the original hardware sections for Floor / areas, Modules, Switch overview, and Deleted items. Area rows have separate open and information controls; the information editor supports the room name, Remote Control name, type, parent, and recovered IPA room icons. Module, switch, and light editors expose the original configuration concepts, including bus and profile operations, switch identification and brightness, and channel module/type/accessory/minimum/maximum/default/test controls. Deleted hardware can be restored or permanently removed.
+
+Within Basic Assignments, selecting a switch exposes its ordered assigned-channel list. Channels can be added, removed, selected or deselected as a group, and moved earlier or later. Selecting an assigned channel opens its own On, Off, dimming, priority, and populated On/Off fade-time controls. Priority settings use checkboxes as in the iOS app, and each configuration control includes an explanatory tooltip.
 
 ## How the migration was produced
 
@@ -133,7 +146,9 @@ The bridge reports itself at `http://127.0.0.1:8765`. Visiting that address shou
 
 ## Finding the Scene Controller
 
-The original app used local UDP discovery. Automatic discovery is not currently exposed in the browser UI, so the controller address must be entered directly.
+When **Connect** is selected, the local bridge reproduces the protocol recovered from the iOS binary: it broadcasts `FLEX` to UDP port `15270`, listens for the controller reply from local port `15001`, and then opens the controller connection on TCP port `15273`. If an older controller does not answer the broadcast, the bridge falls back to trying a saved private address and scanning the private LAN. Once found, the current address is saved into the web configuration automatically. The fallback scan is bounded to at most 1,024 local addresses per interface and probes only the configured FlexiDim controller port.
+
+Some Scene Controller generations allow only one control connection. Fully close the iOS application before connecting from FlexiDim Web if discovery succeeds but the TCP connection is refused or times out.
 
 Useful places to find it include:
 
@@ -155,6 +170,10 @@ To make a durable backup:
 3. Store the generated `.fd4web.json` file somewhere safe.
 
 Use **Import configuration** to restore that file on the same computer or move the logical configuration to another browser.
+
+The importer also accepts the original `.fd4cfg` files exported or emailed from FlexiDim Configuration for iOS. These are Apple binary property-list archives, not JSON files. FlexiDim Web decodes the archived site, areas, hardware channels, switches, scenes, button assignments, periods, and users locally in the browser and converts them to its web data model. The selected file is read only after you choose it; it is not uploaded to a server. Export a new `.fd4web.json` backup after checking the migrated configuration.
+
+The interface artwork and complete room-image set are converted from the IPA's iOS-specific `CgBI` PNG resources into browser-compatible PNG files during this migration. Imported `.fd4cfg` areas retain their original room-image identifiers.
 
 Clearing browser storage removes the working local copy, including locally stored user security keys, unless an exported backup exists.
 
