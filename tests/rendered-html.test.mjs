@@ -70,7 +70,6 @@ test("provides recovered iOS scene and channel editing controls", async () => {
     "Relative %",
     "100% time",
     "Rules",
-    "Change brightness",
     "Only when last scene was",
     "Any scene",
     "Periods",
@@ -93,12 +92,10 @@ test("provides recovered iOS scene and channel editing controls", async () => {
   assert.match(panel, /On day\(s\)/i);
   assert.match(panel, /currentSceneTimerHour << 8/);
   assert.match(panel, /currentSceneDelayMinutes \* 30/);
-  for (const label of [
-    "When light is off",
-    "When light is on",
-    "When brightness would increase",
-    "When brightness would decrease",
-  ]) assert.match(page, new RegExp(label, "i"));
+  // The fabricated per-channel "Change brightness" conditions were removed;
+  // the Rules/Periods/State flags control now hosts the sequence and linked
+  // scene, matching the iOS app.
+  assert.doesNotMatch(panel, /Change brightness/i);
   assert.doesNotMatch(panel, /▶ Run scene/);
   assert.match(panel, /currentSceneGroup\?\.name \?\? "Scenes"/);
   assert.match(panel, /Deleted scenes/);

@@ -8,6 +8,12 @@ const BRIDGE_PORT = Number(process.env.FLEXIDIM_BRIDGE_PORT || 8765);
 const sockets = new Set();
 const controllers = new Map();
 
+function log(...args) {
+  console.log(`[${new Date().toISOString().slice(11, 23)}]`, ...args);
+}
+const hex = (buffer) =>
+  buffer.length ? buffer.toString("hex").match(/.{1,2}/g).join(" ") : "(empty)";
+
 function websocketFrame(value) {
   const payload = Buffer.from(JSON.stringify(value));
   if (payload.length < 126) return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
@@ -38,33 +44,58 @@ function decodeFrames(buffer) {
 
 function writeController(ws, bytes, label) {
   const controller = controllers.get(ws);
-  if (!controller || controller.destroyed || !controller.writable) return emit(ws, { type: "status", state: "error", message: "Scene Controller is not connected" });
-  controller.write(bytes);
-  emit(ws, { type: "trace", message: `${label} · ${bytes.toString("hex").match(/.{1,2}/g).join(" ")}` });
+  if (!controller || controller.destroyed || !controller.writable) {
+    log(`✗ NOT SENT (controller not connected): ${label}`);
+    return emit(ws, { type: "status", state: "error", message: "Scene Controller is not connected" });
+  }
+  const ok = controller.write(bytes);
+  log(`→ TX ${label}  [${hex(bytes)}]${ok ? "" : "  (socket buffer full)"}`);
+  emit(ws, { type: "trace", message: `${label} · ${hex(bytes)}` });
 }
 
 function connectController(ws, host, port) {
     controllers.get(ws)?.destroy();
     if (!/^([a-z\d-]+\.)*[a-z\d-]+$|^\d{1,3}(\.\d{1,3}){3}$/i.test(host)) return emit(ws, { type: "status", state: "error", message: "Enter a valid Scene Controller address" });
+    log(`connect → ${host}:${port}`);
     emit(ws, { type: "status", state: "connecting", message: `Connecting to ${host}:${port}` });
-    let connected = false; let failed = false;
+    let connected = false; let failed = false; let keepAlive = null;
     const controller = net.createConnection({ host, port, timeout: 7000 }); controllers.set(ws, controller);
     controller.on("connect", () => {
       // The timeout above is for establishing the TCP connection only. Leaving it
       // enabled disconnects a healthy but idle controller seven seconds later.
       controller.setTimeout(0);
+      controller.setKeepAlive(true, 3000);
       connected = true;
+      log(`✓ controller connected: ${host}:${port}`);
       emit(ws, { type: "status", state: "connected", message: `Connected to Scene Controller at ${host}:${port}` });
+      // Keep the session warm. This site's backhaul is a powerline mesh that
+      // silently drops idle TCP flows after a few seconds; the iOS app stays
+      // connected by polling. Send a benign period-flag request every 3s so the
+      // link (and the controller's session) stays alive between user actions.
+      keepAlive = setInterval(() => {
+        if (controller.destroyed || !controller.writable) return;
+        const frame = packet(0x05);
+        controller.write(frame);
+        log(`♥ keep-alive  [${hex(frame)}]`);
+      }, 3000);
     });
-    controller.on("data", (data) => emit(ws, { type: "trace", message: `Controller reply · ${data.toString("hex").match(/.{1,2}/g).join(" ")}` }));
-    controller.on("timeout", () => { failed = true; controller.destroy(); emit(ws, { type: "status", state: "error", message: "Scene Controller connection timed out" }); });
-    controller.on("error", (error) => { failed = true; emit(ws, { type: "status", state: "error", message: `Controller connection failed: ${error.message}` }); });
-    controller.on("close", () => { if (!ws.destroyed && connected && !failed) emit(ws, { type: "status", state: "bridge", message: "Scene Controller disconnected" }); });
+    controller.on("data", (data) => {
+      log(`← RX controller reply  [${hex(data)}]`);
+      emit(ws, { type: "trace", message: `Controller reply · ${hex(data)}` });
+    });
+    controller.on("timeout", () => { failed = true; log(`✗ controller timed out (${host}:${port})`); controller.destroy(); emit(ws, { type: "status", state: "error", message: "Scene Controller connection timed out" }); });
+    controller.on("error", (error) => { failed = true; log(`✗ controller error: ${error.code || ""} ${error.message}`); emit(ws, { type: "status", state: "error", message: `Controller connection failed: ${error.message}` }); });
+    controller.on("close", (hadError) => { if (keepAlive) clearInterval(keepAlive); log(`controller connection closed${hadError ? " (after error)" : ""}${connected ? "" : " (never established)"}`); if (!ws.destroyed && connected && !failed) emit(ws, { type: "status", state: "bridge", message: "Scene Controller disconnected" }); });
 }
 
 function handleMessage(ws, raw) {
   let message;
-  try { message = JSON.parse(raw); } catch { return emit(ws, { type: "status", state: "error", message: "Invalid bridge message" }); }
+  try { message = JSON.parse(raw); } catch { log(`✗ invalid message: ${raw}`); return emit(ws, { type: "status", state: "error", message: "Invalid bridge message" }); }
+  log(
+    `client → ${message.type}` +
+      (message.type === "dim" ? ` (ch ${message.channel}, ${message.level}%, t=${message.transition})` : "") +
+      (message.type === "switch" ? ` (sw ${message.switch}, btn ${message.button})` : ""),
+  );
   if (message.type === "connect") {
     connectController(ws, String(message.host || ""), Number(message.port || 15273));
     return;
@@ -81,7 +112,9 @@ function handleMessage(ws, raw) {
     return;
   }
   if (message.type === "dim") writeController(ws, packet(0x04, [message.channel, message.level, message.transition]), `Channel ${message.channel} → ${message.level}%`);
-  else if (message.type === "switch") writeController(ws, packet(0x00, [message.switch, message.button]), `Switch ${message.switch}, button ${message.button}`);
+  // The app always sends a 6-byte switch body: ff f3 00 <switch> <button> 00.
+  // The trailing 0x00 is part of what the controller's CRC/length check expects.
+  else if (message.type === "switch") writeController(ws, packet(0x00, [message.switch, message.button, 0]), `Switch ${message.switch}, button ${message.button}`);
   else if (message.type === "scene") for (const [channel, level] of Object.entries(message.levels || {})) writeController(ws, packet(0x04, [channel, level, message.transition]), `Scene channel ${channel} → ${level}%`);
   else if (message.type === "periodFlags") writeController(ws, packet(0x05), "Request period flags");
   else if (message.type === "sync") emit(ws, { type: "status", state: "error", message: "Full configuration transfer needs a verified controller-specific binary profile; live commands are unaffected" });
@@ -96,7 +129,7 @@ server.on("upgrade", (request, socket) => {
   const key = request.headers["sec-websocket-key"]; if (!key) return socket.destroy();
   const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
   socket.write(["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade", `Sec-WebSocket-Accept: ${accept}`, "\r\n"].join("\r\n"));
-  sockets.add(socket); let pending = Buffer.alloc(0); emit(socket, { type: "status", state: "bridge", message: "Local FlexiDim bridge ready" });
+  sockets.add(socket); let pending = Buffer.alloc(0); log("● app client connected"); emit(socket, { type: "status", state: "bridge", message: "Local FlexiDim bridge ready" });
   socket.on("data", (chunk) => {
     pending = Buffer.concat([pending, chunk]);
     const decoded = decodeFrames(pending); pending = decoded.rest;
@@ -106,7 +139,7 @@ server.on("upgrade", (request, socket) => {
       socket.end();
     }
   });
-  socket.on("close", () => { sockets.delete(socket); controllers.get(socket)?.destroy(); controllers.delete(socket); });
+  socket.on("close", () => { log("○ app client disconnected"); sockets.delete(socket); controllers.get(socket)?.destroy(); controllers.delete(socket); });
   socket.on("error", () => undefined);
 });
 

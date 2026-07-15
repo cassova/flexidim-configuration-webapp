@@ -17,6 +17,10 @@ export type Channel = {
   kind: string;
   level: number;
   moduleId?: number;
+  moduleIndex?: number;
+  // The byte the Scene Controller addresses this channel by: the module's
+  // ordinal in the high nibble, the channel index (1-8) in the low nibble.
+  controllerChannel?: number;
   accessoryModule?: string;
   minimum?: number;
   maximum?: number;
@@ -28,6 +32,7 @@ export type WallSwitch = {
   roomId: number;
   kind: string;
   buttons: number;
+  type?: number;
   basic?: {
     channelIds: number[];
     assignOn: boolean;
@@ -141,15 +146,66 @@ export type Site = {
   id: string;
   ip: string;
   port: number;
+  routerPort?: number;
   description: string;
   address: string;
+  contact?: string;
+  email?: string;
+  phone?: string;
+  latitude?: string;
+  longitude?: string;
   timezone: string;
   dst: string;
   remote: boolean;
+  remoteServer?: string;
+  securityCode?: string;
+  autoDetect?: boolean;
 };
+// The editable logical model that belongs to one configuration. A site can
+// hold several configurations; the active one's content lives at the top level
+// of AppData, and the others are snapshotted into Configuration.content.
+export type ConfigContent = {
+  rooms: Room[];
+  channels: Channel[];
+  switches: WallSwitch[];
+  sceneGroups: SceneGroup[];
+  scenes: Scene[];
+  deletedScenes: Scene[];
+  periods: Period[];
+  users: FlexUser[];
+  assignments: Assignment[];
+  modules: FlexModule[];
+  deletedItems: DeletedItem[];
+};
+
+export type Configuration = {
+  id: number;
+  siteId: string;
+  name: string;
+  description: string;
+  lastUpdated: string;
+  content?: ConfigContent;
+};
+
+export const CONFIG_CONTENT_KEYS = [
+  "rooms",
+  "channels",
+  "switches",
+  "sceneGroups",
+  "scenes",
+  "deletedScenes",
+  "periods",
+  "users",
+  "assignments",
+  "modules",
+  "deletedItems",
+] as const;
+
 export type AppData = {
   site: Site;
   sites?: Site[];
+  configurations?: Configuration[];
+  activeConfigId?: number;
   rooms: Room[];
   channels: Channel[];
   switches: WallSwitch[];
@@ -231,6 +287,7 @@ export function convertLegacyArchive(archive: unknown): AppData {
       : "";
   };
   const topString = (key: string) => string(top[key]).trim();
+  const topNumber = (key: string) => number(dereference(top[key]));
   const instances = (name: string) =>
     Object.values(top)
       .filter((value) => className(value) === name)
@@ -287,22 +344,44 @@ export function convertLegacyArchive(archive: unknown): AppData {
   const channelIdByKey = new Map(
     channelHardware.map((item, index) => [number(item.ky), index + 1]),
   );
-  const channels: Channel[] = channelHardware.map((item, index) => ({
-    id: index + 1,
-    name: string(item.nm) || `Channel ${index + 1}`,
-    roomId: parentRoomId(item),
-    module:
-      number(item.md, -1) >= 0
-        ? `Module ${number(item.md)} / Ch${number(item.ix) + 1}`
-        : `Channel ${number(item.ix) + 1}`,
-    kind: `FlexiDim type ${number(item.hw)}`,
-    level: 0,
-    moduleId: number(item.md, -1) >= 0 ? number(item.md) : undefined,
-    accessoryModule: "None",
-    minimum: 0,
-    maximum: 100,
-    defaultLevel: 100,
-  }));
+  // The Scene Controller addresses a channel by its module's ordinal and the
+  // channel index within that module — not the app's logical channel order.
+  // The module ordinal is that module number's position in the ascending list
+  // of distinct module numbers (matching the archive's stored modules array).
+  const sortedModules = [
+    ...new Set(
+      channelHardware
+        .map((item) => number(item.md, -1))
+        .filter((moduleNumber) => moduleNumber >= 0),
+    ),
+  ].sort((a, b) => a - b);
+  const channels: Channel[] = channelHardware.map((item, index) => {
+    const moduleNumber = number(item.md, -1);
+    const channelIndex = number(item.ix);
+    const moduleOrdinal = sortedModules.indexOf(moduleNumber);
+    const controllerChannel =
+      moduleOrdinal >= 0
+        ? (moduleOrdinal << 4) | (channelIndex & 0x0f)
+        : channelIndex;
+    return {
+      id: index + 1,
+      name: string(item.nm) || `Channel ${index + 1}`,
+      roomId: parentRoomId(item),
+      module:
+        moduleNumber >= 0
+          ? `Module ${moduleNumber} / Ch${channelIndex}`
+          : `Channel ${channelIndex}`,
+      kind: `FlexiDim type ${number(item.hw)}`,
+      level: 0,
+      moduleId: moduleNumber >= 0 ? moduleNumber : undefined,
+      moduleIndex: channelIndex,
+      controllerChannel,
+      accessoryModule: "None",
+      minimum: 0,
+      maximum: 100,
+      defaultLevel: 100,
+    };
+  });
   const modules: FlexModule[] = [
     ...new Set(
       channelHardware
@@ -317,6 +396,15 @@ export function convertLegacyArchive(archive: unknown): AppData {
     pending: false,
   }));
 
+  // Recovered from the iOS binary: "Type 15 = 8 scene : Type 13 = 4 scene :
+  // Type 2 = 2 channel opto : Type 8 = 8 channel opto". The type also names the
+  // switchPic_<type> face image. buttons is the physical button count.
+  const switchTypes: Record<number, { name: string; buttons: number }> = {
+    15: { name: "8 scene", buttons: 11 },
+    13: { name: "4 scene", buttons: 7 },
+    8: { name: "8 channel opto", buttons: 8 },
+    2: { name: "2 channel opto", buttons: 2 },
+  };
   const switchSettings = instances("JCLFDSwitch");
   const switchSettingsByKey = new Map(
     switchSettings.map((item) => [number(item.ky), item]),
@@ -333,7 +421,13 @@ export function convertLegacyArchive(archive: unknown): AppData {
           return match ? [Number(match[1]) + 1] : [];
         })
       : [];
-    const buttons = Math.max(4, ...archivedButtons);
+    const type = number(item.hw);
+    const typeInfo = switchTypes[type];
+    // The archive always carries a fixed block of button-scene slots, so their
+    // count is not the physical button count — that comes from the hardware
+    // type. Fall back to a capped assignment count only for unknown types.
+    const buttons =
+      typeInfo?.buttons ?? Math.min(11, Math.max(4, ...archivedButtons));
     const basicChannelIndexes = settings
       ? Object.keys(settings)
           .flatMap((key) => {
@@ -380,8 +474,9 @@ export function convertLegacyArchive(archive: unknown): AppData {
       id: index + 1,
       name: string(item.nm) || `Switch ${index + 1}`,
       roomId: parentRoomId(item),
-      kind: `${buttons} scene`,
+      kind: typeInfo?.name ?? `${buttons} button`,
       buttons,
+      type,
       basic: {
         channelIds,
         assignOn: firstChannel?.assignOn ?? false,
@@ -513,8 +608,15 @@ export function convertLegacyArchive(archive: unknown): AppData {
       return match ? [Number(match[1])] : [];
     });
     for (const index of buttonIndexes) {
-      const archivedSceneKey = number(string(settings[`bu${index}`]));
-      const sceneId = sceneIdByKey.get(archivedSceneKey);
+      // Each slot is one logical button holding a single scene. Consecutive
+      // logical buttons pair up on the plate as the first-press / second-press
+      // of one physical button (physical P → logical 2P-1 and 2P).
+      const rawButton = settings[`bu${index}`];
+      const sceneKey =
+        typeof rawButton === "number"
+          ? rawButton
+          : number(string(rawButton) || rawButton || "");
+      const sceneId = sceneKey > 0 ? sceneIdByKey.get(sceneKey) : undefined;
       if (sceneId) assignments.push({ switchId, button: index + 1, sceneId });
     }
   }
@@ -544,19 +646,67 @@ export function convertLegacyArchive(archive: unknown): AppData {
     key: string(item.sk),
   }));
 
+  // Site fields are stored as positional NSKeyedArchiver entries ($1..$N) in
+  // the app's encode order, recovered from the iOS binary:
+  //   $1 name  $2-$5 address lines  $6 contact  $7 phone  $8 email
+  //   $9 siteID  $10 security code  $11 IP  $12 auto-detect  $14 last updated
+  //   $15 longitude  $16 latitude  $17 time zone  $18 router inbound
+  //   $19 DST rules  $28 remote server
+  const address = ["$2", "$3", "$4", "$5"]
+    .map((key) => topString(key))
+    .filter(Boolean)
+    .join(", ");
+  const dstRaw = topString("$19");
+  const dstByIndex = ["No daylight saving", "UK / Europe", "USA"];
+  const dst = /uk|europe/i.test(dstRaw)
+    ? "UK / Europe"
+    : /usa|us\b/i.test(dstRaw)
+      ? "USA"
+      : /no daylight|none/i.test(dstRaw)
+        ? "No daylight saving"
+        : dstByIndex[topNumber("$19")] ?? "UK / Europe";
+  const routerRaw = topString("$18");
+  const updatedRaw = topString("$14");
+  const updatedDate = new Date(updatedRaw);
+  const lastUpdated =
+    updatedRaw && !Number.isNaN(updatedDate.getTime())
+      ? updatedDate.toISOString()
+      : new Date().toISOString();
+  const site: Site = {
+    name: topString("$1") || "Imported FlexiDim site",
+    id: topString("$9") || "FD4",
+    ip: topString("$11") || "192.168.1.50",
+    port: 15273,
+    routerPort: /^\d+$/.test(routerRaw) ? Number(routerRaw) : 15273,
+    description: "Imported from FlexiDim Configuration for iOS",
+    address,
+    contact: topString("$6"),
+    email: topString("$8"),
+    phone: topString("$7"),
+    latitude: topString("$16"),
+    longitude: topString("$15"),
+    timezone:
+      topString("$17") ||
+      Intl.DateTimeFormat().resolvedOptions().timeZone ||
+      "Europe/London",
+    dst,
+    remote: Boolean(topString("$28")),
+    remoteServer: topString("$28"),
+    securityCode: topString("$10"),
+    autoDetect: topString("$12") !== "0" && topNumber("$12") !== 0,
+  };
   return {
-    site: {
-      name: topString("$1") || "Imported FlexiDim site",
-      id: topString("$9") || "FD4",
-      ip: topString("$11") || "192.168.1.50",
-      port: 15273,
-      description: "Imported from FlexiDim Configuration for iOS",
-      address: "",
-      timezone:
-        Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/London",
-      dst: "UK / Europe",
-      remote: false,
-    },
+    site,
+    configurations: [
+      {
+        id: 1,
+        siteId: site.id,
+        name: site.name,
+        description: site.description,
+        lastUpdated,
+      },
+    ],
+    activeConfigId: 1,
     rooms,
     channels,
     switches,

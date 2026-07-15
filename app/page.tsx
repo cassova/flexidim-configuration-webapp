@@ -1,9 +1,13 @@
 "use client";
 
 import { ChangeEvent, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   parseLegacyFd4Config,
+  CONFIG_CONTENT_KEYS,
   type AppData,
+  type Configuration,
+  type ConfigContent,
   type DeletedItem,
   type FlexModule,
   type Channel,
@@ -38,7 +42,7 @@ type EquipmentSelection =
 const tabs: { name: Tab; icon: string }[] = [
   { name: "Sites", icon: "/flexidim/sites.png" },
   { name: "Configurations", icon: "/flexidim/configurations.png" },
-  { name: "Basic Assignments", icon: "/flexidim/assignments.png" },
+  { name: "Basic Assignments", icon: "/flexidim/switches.png" },
   { name: "Scenes", icon: "/flexidim/scenes.png" },
   { name: "Scene to Button", icon: "/flexidim/scene-button.png" },
   { name: "Users", icon: "/flexidim/users.png" },
@@ -92,12 +96,31 @@ const initialData: AppData = {
     id: "FD4-0001",
     ip: "192.168.1.50",
     port: 15273,
+    routerPort: 15273,
     description: "FlexiDim lighting system",
     address: "",
+    contact: "",
+    email: "",
+    phone: "",
+    latitude: "",
+    longitude: "",
     timezone: "Europe/London",
     dst: "UK / Europe",
     remote: false,
+    remoteServer: "",
+    securityCode: "",
+    autoDetect: true,
   },
+  configurations: [
+    {
+      id: 1,
+      siteId: "FD4-0001",
+      name: "Home",
+      description: "FlexiDim lighting system",
+      lastUpdated: "2026-07-14T00:00:00.000Z",
+    },
+  ],
+  activeConfigId: 1,
   rooms: [
     { id: 1, name: "Kitchen", floor: "Ground floor", icon: roomIcons[0] },
     { id: 2, name: "Living room", floor: "Ground floor", icon: roomIcons[3] },
@@ -138,8 +161,8 @@ const initialData: AppData = {
     },
   ],
   switches: [
-    { id: 1, name: "Kitchen entrance", roomId: 1, kind: "4 scene", buttons: 4 },
-    { id: 2, name: "Living room", roomId: 2, kind: "8 scene", buttons: 8 },
+    { id: 1, name: "Kitchen entrance", roomId: 1, kind: "4 scene", type: 13, buttons: 7 },
+    { id: 2, name: "Living room", roomId: 2, kind: "8 scene", type: 15, buttons: 11 },
   ],
   scenes: [
     {
@@ -199,6 +222,131 @@ const initialData: AppData = {
   ],
 };
 
+// FlexiDim switch types (recovered from the iOS binary). The name reflects the
+// count of main scene buttons; the physical plate also carries a shifted column
+// of three extra buttons, so an "8 scene" switch has 11 physical buttons.
+const SWITCH_TYPE_BY_NAME: Record<string, { type: number; buttons: number }> = {
+  "8 scene": { type: 15, buttons: 11 },
+  "4 scene": { type: 13, buttons: 7 },
+  "8 channel opto": { type: 8, buttons: 8 },
+  "2 channel opto": { type: 2, buttons: 2 },
+};
+
+// "When button pressed" test modes (recovered from the iOS binary, with the
+// original option descriptions).
+const BUTTON_PRESS_MODES = [
+  {
+    value: "none",
+    label: "Don't send",
+    help: "No switch press information is sent to the lighting system.",
+  },
+  {
+    value: "latest",
+    label: "Latest settings",
+    help: "Switch press information is sent to the lighting system, which will interpret it based on the last configuration sent.",
+  },
+  {
+    value: "live",
+    label: "Live system",
+    help: "Commands are sent to the lighting system to show the effect of the switch press based upon the current configuration.",
+  },
+] as const;
+type ButtonPressMode = (typeof BUTTON_PRESS_MODES)[number]["value"];
+
+// The three buttons in the shifted right-hand column carry built-in functions
+// on their first press when no scene is assigned; their second press has none.
+const SPECIAL_BUTTON_FUNCTIONS = [
+  { name: "Manual raise", help: "Hold to make the lights gradually brighter." },
+  { name: "Manual lower", help: "Hold to make the lights gradually dimmer." },
+  {
+    name: "Default on/off",
+    help: "First press turns everything on; second press turns everything off.",
+  },
+];
+
+// The built-in first-press function for a shifted-column button, or undefined
+// for an ordinary button. position is the physical plate position (1-based).
+function specialButtonDefault(
+  buttons: number,
+  position: number,
+): { name: string; help: string } | undefined {
+  if (buttons < 7 || buttons % 4 !== 3) return undefined;
+  const ordinal = position - (buttons - 3);
+  if (ordinal < 1 || ordinal > 3) return undefined;
+  return SPECIAL_BUTTON_FUNCTIONS[ordinal - 1];
+}
+
+// Physical arrangement of the buttons on a FlexiDim wall switch. The plates in
+// this range are built from full columns of four buttons plus a right-hand
+// column that is shifted across and holds two buttons, a gap, then one more
+// (e.g. 7 = 4 + [2,gap,1], 11 = 4 + 4 + [2,gap,1]). Buttons are numbered
+// column-major: down each full column left-to-right, then the shifted column.
+function switchButtonLayout(count: number): {
+  cells: { button: number; column: number; row: number }[];
+  columns: string;
+} {
+  const cells: { button: number; column: number; row: number }[] = [];
+  if (count >= 7 && count % 4 === 3) {
+    const fullColumns = (count - 3) / 4;
+    let button = 1;
+    for (let column = 1; column <= fullColumns; column++) {
+      for (let row = 1; row <= 4; row++) cells.push({ button: button++, column, row });
+    }
+    // +1 for the narrow spacer column that produces the shift, +1 to land on it.
+    const shiftedColumn = fullColumns + 2;
+    for (const row of [1, 2, 4]) cells.push({ button: button++, column: shiftedColumn, row });
+    return {
+      cells,
+      columns: `${"var(--sw-col) ".repeat(fullColumns)}var(--sw-gap) var(--sw-col)`.trim(),
+    };
+  }
+  // Fallback for any other size: plain columns of four, filled top-to-bottom.
+  const columnCount = Math.max(1, Math.ceil(count / 4));
+  let button = 1;
+  for (let column = 1; column <= columnCount && button <= count; column++) {
+    for (let row = 1; row <= 4 && button <= count; row++) {
+      cells.push({ button: button++, column, row });
+    }
+  }
+  return { cells, columns: `repeat(${columnCount}, var(--sw-col))` };
+}
+
+function HelpTip({ label, help }: { label: string; help: string }) {
+  const [coords, setCoords] = useState<{ left: number; top: number } | null>(
+    null,
+  );
+  const show = (event: React.SyntheticEvent<HTMLElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setCoords({ left: rect.left + rect.width / 2, top: rect.top });
+  };
+  const hide = () => setCoords(null);
+  return (
+    <i
+      className="help-icon"
+      tabIndex={0}
+      aria-label={`${label} help`}
+      onMouseEnter={show}
+      onMouseLeave={hide}
+      onFocus={show}
+      onBlur={hide}
+    >
+      ?
+      {coords &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <span
+            className="help-tooltip"
+            role="tooltip"
+            style={{ left: coords.left, top: coords.top }}
+          >
+            {help}
+          </span>,
+          document.body,
+        )}
+    </i>
+  );
+}
+
 function Field({
   label,
   children,
@@ -210,18 +358,9 @@ function Field({
 }) {
   return (
     <label className="field">
-      <span className="option-label" title={help}>
+      <span className="option-label">
         {label}
-        {help && (
-          <i
-            tabIndex={0}
-            aria-label={`${String(label)} help`}
-            title={help}
-            data-tooltip={help}
-          >
-            ?
-          </i>
-        )}
+        {help && <HelpTip label={String(label)} help={help} />}
       </span>
       {children}
     </label>
@@ -243,18 +382,9 @@ function Toggle({
 }) {
   return (
     <label className="toggle-row">
-      <span className="option-label" title={help}>
+      <span className="option-label">
         {label}
-        {help && (
-          <i
-            tabIndex={0}
-            aria-label={`${label} help`}
-            title={help}
-            data-tooltip={help}
-          >
-            ?
-          </i>
-        )}
+        {help && <HelpTip label={label} help={help} />}
       </span>
       <button
         type="button"
@@ -357,10 +487,46 @@ function restoreAreaHierarchy(data: AppData): AppData {
     });
     return { ...scene, groupId: parentId ?? undefined };
   });
+  // The physical button count is fixed by the switch's hardware type. Older
+  // data (and pre-fix imports) stored the archive's button-scene slot count
+  // instead, so recompute from type when known and never keep an impossible
+  // count (real FlexiDim plates top out at 11 buttons).
+  const buttonsByType: Record<number, number> = { 15: 11, 13: 7, 8: 8, 2: 2 };
+  const switches = data.switches.map((wallSwitch) => {
+    const fromType =
+      wallSwitch.type != null ? buttonsByType[wallSwitch.type] : undefined;
+    const buttons =
+      fromType ?? (wallSwitch.buttons > 11 ? 11 : wallSwitch.buttons);
+    return buttons === wallSwitch.buttons
+      ? wallSwitch
+      : { ...wallSwitch, buttons };
+  });
+  // Ensure every site has at least one configuration (older data predates the
+  // multi-configuration model).
+  const configurations =
+    data.configurations?.length
+      ? data.configurations
+      : [
+          {
+            id: 1,
+            siteId: data.site.id,
+            name: data.site.name,
+            description: data.site.description,
+            lastUpdated: "",
+          },
+        ];
+  const activeConfigId =
+    data.activeConfigId &&
+    configurations.some((config) => config.id === data.activeConfigId)
+      ? data.activeConfigId
+      : configurations[0].id;
   return {
     ...data,
+    configurations,
+    activeConfigId,
     rooms: normalizedRooms,
     channels,
+    switches,
     sceneGroups: restoredSceneGroups,
     scenes: restoredScenes,
     deletedScenes: data.deletedScenes ?? [],
@@ -397,6 +563,13 @@ export default function FlexiDimWeb() {
   const [sceneButtonFloor, setSceneButtonFloor] = useState<number | null>(null);
   const [sceneButtonRoom, setSceneButtonRoom] = useState<number | null>(null);
   const [selectedButton, setSelectedButton] = useState(1);
+  const [buttonPressMode, setButtonPressMode] = useState<ButtonPressMode>("none");
+  // The logical button (2P-1 / 2P) whose scene is being chosen, and the scene
+  // group the hierarchical picker is currently browsing (null = top level).
+  const [scenePickerButton, setScenePickerButton] = useState<number | null>(null);
+  const [scenePickerGroupId, setScenePickerGroupId] = useState<number | null>(
+    null,
+  );
   const [basicFloor, setBasicFloor] = useState<number | null>(null);
   const [basicRoom, setBasicRoom] = useState<number | null>(null);
   const [basicSwitchId, setBasicSwitchId] = useState<number | null>(null);
@@ -414,6 +587,12 @@ export default function FlexiDimWeb() {
     { at: now(), text: "FlexiDim Web ready" },
   ]);
   const [installer, setInstaller] = useState(false);
+  const [allowEquipment, setAllowEquipment] = useState(false);
+  const [toasts, setToasts] = useState<
+    { id: number; text: string; tone?: "ok" | "warn" }[]
+  >([]);
+  const toastId = useRef(0);
+  const connectionRef = useRef(connection);
   const socket = useRef<WebSocket | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
   const hydrated = useRef(false);
@@ -438,8 +617,27 @@ export default function FlexiDimWeb() {
       localStorage.setItem("flexidim-web-data", JSON.stringify(data));
   }, [data]);
 
+  useEffect(() => {
+    connectionRef.current = connection;
+  }, [connection]);
+
   const addTrace = (text: string, tone?: "ok" | "warn") =>
     setTrace((items) => [{ at: now(), text, tone }, ...items].slice(0, 150));
+  const showToast = (text: string, tone?: "ok" | "warn") => {
+    const id = (toastId.current += 1);
+    setToasts((list) => [...list, { id, text, tone }]);
+    window.setTimeout(
+      () => setToasts((list) => list.filter((toast) => toast.id !== id)),
+      4000,
+    );
+  };
+  const dismissToast = (id: number) =>
+    setToasts((list) => list.filter((toast) => toast.id !== id));
+  // Record to the trace log and surface a toast for the same event.
+  const notify = (text: string, tone?: "ok" | "warn") => {
+    addTrace(text, tone);
+    showToast(text, tone);
+  };
   const roomName = (id: number) =>
     data.rooms.find((room) => room.id === id)?.name ?? "Unassigned";
   const rootAreas = data.rooms.filter(
@@ -507,7 +705,7 @@ export default function FlexiDimWeb() {
   const connect = () => {
     socket.current?.close();
     setConnection("connecting");
-    addTrace(`Searching for a FlexiDim controller on port ${data.site.port}…`);
+    notify(`Connecting to the Scene Controller on port ${data.site.port}…`);
     const ws = new WebSocket("ws://127.0.0.1:8765");
     socket.current = ws;
     ws.onopen = () => {
@@ -534,14 +732,17 @@ export default function FlexiDimWeb() {
                   ? "bridge"
                   : "error",
           );
-          addTrace(
-            message.message,
+          const tone =
             message.state === "connected"
-              ? "ok"
+              ? ("ok" as const)
               : message.state === "error"
-                ? "warn"
-                : undefined,
-          );
+                ? ("warn" as const)
+                : undefined;
+          addTrace(message.message, tone);
+          if (message.state === "connected")
+            showToast("Connected to the Scene Controller", "ok");
+          else if (message.state === "error")
+            showToast(message.message, "warn");
         } else if (message.type === "discovered") {
           updateSite({ ip: message.host, port: Number(message.port) });
           addTrace(
@@ -555,10 +756,59 @@ export default function FlexiDimWeb() {
     };
     ws.onerror = () => {
       setConnection("error");
-      addTrace("The connection to the local bridge was lost", "warn");
+      notify("The connection to the local bridge was lost", "warn");
     };
-    ws.onclose = () =>
+    ws.onclose = () => {
+      if (
+        connectionRef.current === "connected" ||
+        connectionRef.current === "bridge"
+      )
+        showToast("Disconnected from the Scene Controller", "warn");
       setConnection((state) => (state === "error" ? state : "offline"));
+    };
+  };
+
+  // A range slider fires onChange on every pixel of a drag. Transmitting a
+  // packet per tick floods the Scene Controller, which drops the connection, so
+  // live dim commands are throttled: send the first change immediately, then
+  // coalesce rapid follow-ups and always transmit the final resting value.
+  const DIM_THROTTLE_MS = 120;
+  const dimThrottle = useRef<{
+    timer: ReturnType<typeof setTimeout> | null;
+    pending: { id: number; level: number } | null;
+  }>({ timer: null, pending: null });
+
+  // The Scene Controller addresses a channel by the byte computed at import
+  // (module ordinal + channel index), not the app's logical channel id.
+  const controllerChannelFor = (id: number) =>
+    data.channels.find((channel) => channel.id === id)?.controllerChannel ?? id;
+
+  const transmitDim = (id: number, level: number) => {
+    const state = dimThrottle.current;
+    state.pending = { id, level };
+    // A cycle is already running; the latest value is kept in `pending` and
+    // goes out on the next tick (trailing edge).
+    if (state.timer) return;
+    const flush = () => {
+      if (!state.pending) {
+        state.timer = null; // idle for a full interval — stop the cycle
+        return;
+      }
+      const { id: pendingId, level: pendingLevel } = state.pending;
+      state.pending = null;
+      // Live preview transmits an instant change (transition 0). A non-zero
+      // fade starts a transition on every slider tick, and the Scene Controller
+      // drops the connection when new dims arrive mid-fade on the same channel.
+      send({
+        type: "dim",
+        channel: controllerChannelFor(pendingId),
+        level: pendingLevel,
+        transition: 0,
+      });
+      addTrace(`Channel ${pendingId} set to ${pendingLevel}%`);
+      state.timer = setTimeout(flush, DIM_THROTTLE_MS);
+    };
+    flush(); // leading edge: send immediately, then rate-limit follow-ups
   };
 
   const setChannelLevel = (id: number, level: number, transmit = true) => {
@@ -568,10 +818,7 @@ export default function FlexiDimWeb() {
         channel.id === id ? { ...channel, level } : channel,
       ),
     }));
-    if (transmit) {
-      send({ type: "dim", channel: id, level, transition: 2 });
-      addTrace(`Channel ${id} set to ${level}%`);
-    }
+    if (transmit) transmitDim(id, level);
   };
 
   const runScene = (scene: Scene | undefined) => {
@@ -579,7 +826,13 @@ export default function FlexiDimWeb() {
     Object.entries(scene.levels).forEach(([channel, level]) =>
       setChannelLevel(Number(channel), level, false),
     );
-    send({ type: "scene", levels: scene.levels, transition: scene.fade });
+    const levels = Object.fromEntries(
+      Object.entries(scene.levels).map(([id, level]) => [
+        controllerChannelFor(Number(id)),
+        level,
+      ]),
+    );
+    send({ type: "scene", levels, transition: scene.fade });
     addTrace(`Scene “${scene.name}” run`, "ok");
   };
 
@@ -615,15 +868,40 @@ export default function FlexiDimWeb() {
       id: `FD4-${String(nextNumber).padStart(4, "0")}`,
       ip: "",
       port: 15273,
+      routerPort: 15273,
       description: "FlexiDim lighting system",
       address: "",
+      contact: "",
+      email: "",
+      phone: "",
+      latitude: "",
+      longitude: "",
       timezone: data.site.timezone || "Europe/London",
       dst: data.site.dst || "UK / Europe",
       remote: false,
+      remoteServer: "",
+      securityCode: "",
+      autoDetect: true,
     };
-    setData((old) => ({ ...old, site, sites: [...sites, site] }));
+    setData((old) => {
+      const configs = old.configurations ?? [];
+      const newConfigId = Math.max(0, ...configs.map((c) => c.id)) + 1;
+      const config: Configuration = {
+        id: newConfigId,
+        siteId: site.id,
+        name: `${site.name} configuration`,
+        description: site.description,
+        lastUpdated: new Date().toISOString(),
+      };
+      return {
+        ...old,
+        site,
+        sites: [...sites, site],
+        configurations: [...configs, config],
+      };
+    });
     setConnection("offline");
-    addTrace(`Site “${site.name}” created`, "ok");
+    notify(`Site “${site.name}” created`, "ok");
   };
 
   const setChangesAllowed = (allowed: boolean) => {
@@ -634,8 +912,102 @@ export default function FlexiDimWeb() {
     );
   };
 
+  const setEquipmentAllowed = (allowed: boolean) => {
+    setAllowEquipment(allowed);
+    addTrace(
+      allowed ? "Equipment changes enabled" : "Equipment changes disabled",
+      allowed ? "ok" : "warn",
+    );
+  };
+
+  // The editable model of the active configuration lives at the top level of
+  // `data`; other configurations keep their own snapshot in `content`.
+  const snapshotContent = (source: AppData): ConfigContent =>
+    Object.fromEntries(
+      CONFIG_CONTENT_KEYS.map((key) => [key, source[key] ?? []]),
+    ) as unknown as ConfigContent;
+
+  const updateConfiguration = (id: number, patch: Partial<Configuration>) =>
+    setData((old) => ({
+      ...old,
+      configurations: (old.configurations ?? []).map((config) =>
+        config.id === id
+          ? { ...config, ...patch, lastUpdated: new Date().toISOString() }
+          : config,
+      ),
+    }));
+
+  const selectConfiguration = (id: number) =>
+    setData((old) => {
+      if (id === old.activeConfigId) return old;
+      const configs = old.configurations ?? [];
+      const target = configs.find((config) => config.id === id);
+      if (!target) return old;
+      const outgoing = snapshotContent(old);
+      const content = target.content ?? outgoing;
+      return {
+        ...old,
+        ...content,
+        activeConfigId: id,
+        configurations: configs.map((config) =>
+          config.id === old.activeConfigId
+            ? { ...config, content: outgoing }
+            : config.id === id
+              ? { ...config, content: undefined }
+              : config,
+        ),
+      };
+    });
+
+  const duplicateConfiguration = (id: number) => {
+    const source = (data.configurations ?? []).find(
+      (config) => config.id === id,
+    );
+    setData((old) => {
+      const configs = old.configurations ?? [];
+      const original = configs.find((config) => config.id === id);
+      if (!original) return old;
+      const newId = Math.max(0, ...configs.map((config) => config.id)) + 1;
+      const sourceContent =
+        original.id === old.activeConfigId
+          ? snapshotContent(old)
+          : original.content;
+      const copy: Configuration = {
+        id: newId,
+        siteId: original.siteId,
+        name: `${original.name} copy`,
+        description: original.description,
+        lastUpdated: new Date().toISOString(),
+        content: sourceContent
+          ? structuredClone(sourceContent)
+          : snapshotContent(old),
+      };
+      return { ...old, configurations: [...configs, copy] };
+    });
+    if (source) notify(`Duplicated configuration “${source.name}”`, "ok");
+  };
+
+  const deleteConfiguration = (id: number) =>
+    setData((old) => {
+      const configs = old.configurations ?? [];
+      if (configs.length <= 1) return old;
+      const remaining = configs.filter((config) => config.id !== id);
+      if (id !== old.activeConfigId)
+        return { ...old, configurations: remaining };
+      const next = remaining[0];
+      const content = next.content ?? snapshotContent(old);
+      return {
+        ...old,
+        ...content,
+        activeConfigId: next.id,
+        configurations: remaining.map((config) =>
+          config.id === next.id ? { ...config, content: undefined } : config,
+        ),
+      };
+    });
+
   const addFloor = () => {
-    if (!installer) return;
+    if (!allowEquipment) return;
     const name = window.prompt("Floor name");
     if (!name?.trim()) return;
     const id = newId(data.rooms);
@@ -659,7 +1031,7 @@ export default function FlexiDimWeb() {
   };
 
   const addModule = () => {
-    if (!installer) return;
+    if (!allowEquipment) return;
     const rawId = window.prompt("Module ID", String(newId(equipmentModules)));
     if (rawId === null) return;
     const id = Number(rawId);
@@ -712,7 +1084,7 @@ export default function FlexiDimWeb() {
     }));
 
   const moveToDeleted = (deleted: DeletedItem) => {
-    if (!installer) return;
+    if (!allowEquipment) return;
     if (
       deleted.type === "area" &&
       data.rooms.some((room) => room.parentId === deleted.item.id)
@@ -869,49 +1241,52 @@ export default function FlexiDimWeb() {
     addTrace(`${scene.name} permanently deleted`, "warn");
   };
 
-  const setButtonLight = (
+  // Each logical button holds a single scene. On the plate two consecutive
+  // logical buttons make up the first-press / second-press of one physical
+  // button, but each is stored as its own assignment.
+  const setButtonScene = (
     wallSwitch: WallSwitch,
     button: number,
-    press: "first" | "second",
-    channelId: number,
+    sceneId: number,
   ) => {
     setData((old) => {
-      const index = old.assignments.findIndex(
+      const assignments = old.assignments.filter(
         (assignment) =>
-          assignment.switchId === wallSwitch.id &&
-          assignment.button === button,
+          !(
+            assignment.switchId === wallSwitch.id &&
+            assignment.button === button
+          ),
       );
-      const existing =
-        index >= 0
-          ? old.assignments[index]
-          : { switchId: wallSwitch.id, button };
-      const updated =
-        press === "first"
-          ? {
-              ...existing,
-              sceneId: undefined,
-              channelIds: undefined,
-              channelId: channelId || undefined,
-            }
-          : {
-              ...existing,
-              secondSceneId: undefined,
-              secondChannelId: channelId || undefined,
-            };
-      const hasOperation = Boolean(
-        updated.sceneId ||
-          updated.channelId ||
-          updated.channelIds?.length ||
-          updated.secondSceneId ||
-          updated.secondChannelId,
-      );
-      const assignments = [...old.assignments];
-      if (index >= 0) {
-        if (hasOperation) assignments[index] = updated;
-        else assignments.splice(index, 1);
-      } else if (hasOperation) assignments.push(updated);
+      if (sceneId) assignments.push({ switchId: wallSwitch.id, button, sceneId });
       return { ...old, assignments };
     });
+  };
+
+  // Simulate a physical button press from the Scene-to-Button plate. The
+  // "When button pressed" mode decides what (if anything) reaches the
+  // controller: nothing, the raw button press (controller uses its own stored
+  // config), or the live effect from the current app config (run the scene).
+  const pressSceneButton = (
+    wallSwitch: WallSwitch,
+    press: "first" | "second",
+    button: number,
+  ) => {
+    if (buttonPressMode === "none") return;
+    const scene = data.scenes.find(
+      (item) => item.id === buttonAssignment(wallSwitch.id, button)?.sceneId,
+    );
+    if (buttonPressMode === "live" && scene) {
+      runScene(scene);
+      return;
+    }
+    // "latest settings", or "live" with no assigned scene: transmit the raw
+    // switch button press for the controller to interpret.
+    send({ type: "switch", switch: wallSwitch.id, button });
+    addTrace(
+      `${wallSwitch.name}: ${press} press of button ${button} sent (${
+        buttonPressMode === "live" ? "live system" : "latest settings"
+      })`,
+    );
   };
 
   const updateSwitchBasic = (
@@ -1098,15 +1473,15 @@ export default function FlexiDimWeb() {
       setSceneButtonRoom(null);
       setEquipmentSection("areas");
       setEquipmentSelection(null);
-      addTrace(`Imported ${file.name}`, "ok");
+      notify(`Imported configuration from ${file.name}`, "ok");
     } catch {
-      addTrace("That configuration file could not be read", "warn");
+      notify("That configuration file could not be read", "warn");
     }
     event.target.value = "";
   };
 
   const addChannel = () => {
-    if (!installer) return;
+    if (!allowEquipment) return;
     const name = window.prompt("Channel name");
     if (!name?.trim()) return;
     const id = newId(data.channels);
@@ -1132,7 +1507,7 @@ export default function FlexiDimWeb() {
     setEquipmentSelection({ type: "light", id });
   };
   const addSwitch = () => {
-    if (!installer) return;
+    if (!allowEquipment) return;
     const name = window.prompt("Switch name");
     if (!name?.trim()) return;
     const id = newId(data.switches);
@@ -1145,7 +1520,8 @@ export default function FlexiDimWeb() {
           name: name.trim(),
           roomId: selectedRoom,
           kind: "4 scene",
-          buttons: 4,
+          type: SWITCH_TYPE_BY_NAME["4 scene"].type,
+          buttons: SWITCH_TYPE_BY_NAME["4 scene"].buttons,
         },
       ],
     }));
@@ -1164,6 +1540,25 @@ export default function FlexiDimWeb() {
             : "Offline";
 
   const availableSites = data.sites?.length ? data.sites : [data.site];
+
+  const allConfigurations = data.configurations ?? [];
+  const siteConfigurations = allConfigurations.filter(
+    (config) => config.siteId === data.site.id,
+  );
+  const activeConfiguration =
+    allConfigurations.find((config) => config.id === data.activeConfigId) ??
+    siteConfigurations[0];
+  const formatLastUpdated = (iso: string) => {
+    if (!iso) return "—";
+    const parsed = new Date(iso);
+    return Number.isNaN(parsed.getTime())
+      ? iso
+      : parsed.toLocaleDateString(undefined, {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+        });
+  };
 
   const sitesPanel = (
     <div className="content-grid site-grid">
@@ -1246,7 +1641,7 @@ export default function FlexiDimWeb() {
         <div className="card-title">
           <div>
             <small>SITE DETAILS</small>
-            <h2>Home and location</h2>
+            <h2>Identity and contact</h2>
           </div>
         </div>
         <div className="form-grid">
@@ -1269,13 +1664,67 @@ export default function FlexiDimWeb() {
               onChange={(e) => updateSite({ address: e.target.value })}
             />
           </Field>
+          <Field label="Contact name" help="The person responsible for this site.">
+            <input
+              value={data.site.contact ?? ""}
+              placeholder="Optional"
+              onChange={(e) => updateSite({ contact: e.target.value })}
+            />
+          </Field>
+          <Field label="Email">
+            <input
+              type="email"
+              value={data.site.email ?? ""}
+              placeholder="Optional"
+              onChange={(e) => updateSite({ email: e.target.value })}
+            />
+          </Field>
+          <Field label="Phone number">
+            <input
+              value={data.site.phone ?? ""}
+              placeholder="Optional"
+              onChange={(e) => updateSite({ phone: e.target.value })}
+            />
+          </Field>
+        </div>
+      </section>
+      <section className="card form-card">
+        <div className="card-title">
+          <div>
+            <small>LOCATION &amp; TIME</small>
+            <h2>Location and daylight saving</h2>
+          </div>
+        </div>
+        <div className="form-grid">
+          <Field
+            label="Latitude"
+            help="Used with longitude to calculate local sunrise and sunset times."
+          >
+            <input
+              value={data.site.latitude ?? ""}
+              placeholder="e.g. 51.5074"
+              inputMode="decimal"
+              onChange={(e) => updateSite({ latitude: e.target.value })}
+            />
+          </Field>
+          <Field
+            label="Longitude"
+            help="Used with latitude to calculate local sunrise and sunset times."
+          >
+            <input
+              value={data.site.longitude ?? ""}
+              placeholder="e.g. -0.1278"
+              inputMode="decimal"
+              onChange={(e) => updateSite({ longitude: e.target.value })}
+            />
+          </Field>
           <Field label="Time zone">
             <input
               value={data.site.timezone}
               onChange={(e) => updateSite({ timezone: e.target.value })}
             />
           </Field>
-          <Field label="DST rules">
+          <Field label="DST rules" help="The daylight-saving ruleset for this site.">
             <select
               value={data.site.dst}
               onChange={(e) => updateSite({ dst: e.target.value })}
@@ -1286,10 +1735,67 @@ export default function FlexiDimWeb() {
             </select>
           </Field>
         </div>
+      </section>
+      <section className="card form-card">
+        <div className="card-title">
+          <div>
+            <small>NETWORK &amp; REMOTE</small>
+            <h2>Ports and remote access</h2>
+          </div>
+        </div>
+        <div className="form-grid">
+          <Field
+            label="Inbound port"
+            help="The TCP port the Scene Controller listens on (default 15273)."
+          >
+            <input
+              type="number"
+              value={data.site.port}
+              onChange={(e) => updateSite({ port: Number(e.target.value) })}
+            />
+          </Field>
+          <Field
+            label="Router inbound port"
+            help="The port forwarded on the router for remote access, if configured."
+          >
+            <input
+              type="number"
+              value={data.site.routerPort ?? data.site.port}
+              onChange={(e) => updateSite({ routerPort: Number(e.target.value) })}
+            />
+          </Field>
+          <Field
+            label="Remote server"
+            help="The remote-access server address, if this site uses one."
+          >
+            <input
+              value={data.site.remoteServer ?? ""}
+              placeholder="Optional"
+              onChange={(e) => updateSite({ remoteServer: e.target.value })}
+            />
+          </Field>
+          <Field
+            label="Security code"
+            help="The security key used for remote connections to this site."
+          >
+            <input
+              value={data.site.securityCode ?? ""}
+              placeholder="Optional"
+              onChange={(e) => updateSite({ securityCode: e.target.value })}
+            />
+          </Field>
+        </div>
         <Toggle
           label="Enable remote access"
+          help="Allow this site to be reached over the internet through the remote server."
           checked={data.site.remote}
           onChange={(remote) => updateSite({ remote })}
+        />
+        <Toggle
+          label="Auto-detect controller"
+          help="Broadcast to find the Scene Controller automatically instead of using a fixed address."
+          checked={data.site.autoDetect ?? false}
+          onChange={(autoDetect) => updateSite({ autoDetect })}
         />
       </section>
     </div>
@@ -1297,38 +1803,17 @@ export default function FlexiDimWeb() {
 
   const configPanel = (
     <div className="content-grid config-grid">
-      <section className="card">
+      <section className="card config-list-card">
         <div className="card-title">
           <div>
-            <small>LOCAL CONFIGURATION</small>
+            <small>CONFIGURATIONS</small>
             <h2>{data.site.name}</h2>
           </div>
-          <span className="version">v2.97 migrated</span>
-        </div>
-        <div className="summary-list">
-          <div>
-            <span>Configuration name</span>
-            <b>{data.site.name}</b>
-          </div>
-          <div>
-            <span>Description</span>
-            <b>{data.site.description}</b>
-          </div>
-          <div>
-            <span>Format</span>
-            <b>FlexiDim Web · fd4web</b>
-          </div>
-          <div>
-            <span>Saved</span>
-            <b>Automatically on this device</b>
-          </div>
-        </div>
-        <div className="button-row">
-          <button className="primary" onClick={exportConfig}>
-            Export configuration
-          </button>
-          <button onClick={() => fileInput.current?.click()}>
-            Import configuration
+          <button
+            className="config-import"
+            onClick={() => fileInput.current?.click()}
+          >
+            Import
           </button>
           <input
             ref={fileInput}
@@ -1338,57 +1823,136 @@ export default function FlexiDimWeb() {
             hidden
           />
         </div>
-      </section>
-      <section className="card sync-card">
-        <div className="card-title">
-          <div>
-            <small>SCENE CONTROLLER</small>
-            <h2>Configuration transfer</h2>
-          </div>
+        <div className="config-list">
+          {siteConfigurations.map((config) => (
+            <div
+              key={config.id}
+              className={`config-row ${config.id === data.activeConfigId ? "active" : ""}`}
+            >
+              <button
+                className="config-select"
+                onClick={() => selectConfiguration(config.id)}
+              >
+                <img src="/flexidim/configurations.png" alt="" />
+                <span>
+                  <b>{config.name}</b>
+                  <small>{config.description || "No description"}</small>
+                  <small>
+                    Last updated on: {formatLastUpdated(config.lastUpdated)}
+                  </small>
+                </span>
+                {config.id === data.activeConfigId ? (
+                  <em className="config-active-tag">Active</em>
+                ) : (
+                  <em>›</em>
+                )}
+              </button>
+              <div className="config-row-actions">
+                <button
+                  title={`Duplicate ${config.name}`}
+                  onClick={() => duplicateConfiguration(config.id)}
+                >
+                  Duplicate
+                </button>
+                {siteConfigurations.length > 1 && (
+                  <button
+                    className="delete"
+                    title={`Delete ${config.name}`}
+                    onClick={() => deleteConfiguration(config.id)}
+                  >
+                    Delete
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
         </div>
-        <div className="sync-graphic">
-          <img src="/flexidim/configurations.png" alt="" />
-          <div className="sync-line">
-            <i />
-            <i />
-            <i />
-          </div>
-          <img src="/flexidim/connected.png" alt="" />
-        </div>
-        <button onClick={() => addTrace("Configuration comparison requested")}>
-          Compare with Scene Controller
-        </button>
-        <button
-          className="primary"
-          disabled={connection !== "connected"}
-          onClick={() => {
-            send({ type: "sync", data });
-            addTrace("Configuration transfer started");
-          }}
-        >
-          Send configuration to Scene Controller
-        </button>
-        <p className="warning-copy">
-          Full binary configuration transfer is retained as an advanced bridge
-          operation. Live lighting control remains available without it.
-        </p>
       </section>
-      <section className={`card installer-card ${installer ? "enabled" : ""}`}>
+      {activeConfiguration && (
+        <section className="card form-card">
+          <div className="card-title">
+            <div>
+              <small>ACTIVE CONFIGURATION</small>
+              <h2>{activeConfiguration.name}</h2>
+            </div>
+            <span className="version">
+              Last updated on: {formatLastUpdated(activeConfiguration.lastUpdated)}
+            </span>
+          </div>
+          <div className="form-grid">
+            <Field label="Configuration name">
+              <input
+                value={activeConfiguration.name}
+                disabled={!installer}
+                onChange={(e) =>
+                  updateConfiguration(activeConfiguration.id, {
+                    name: e.target.value,
+                  })
+                }
+              />
+            </Field>
+            <Field label="Description">
+              <input
+                value={activeConfiguration.description}
+                disabled={!installer}
+                placeholder="Optional"
+                onChange={(e) =>
+                  updateConfiguration(activeConfiguration.id, {
+                    description: e.target.value,
+                  })
+                }
+              />
+            </Field>
+          </div>
+          <div className="config-actions">
+            <button className="primary" onClick={exportConfig}>
+              Download configuration
+            </button>
+            <button
+              onClick={() => addTrace("Configuration comparison requested")}
+            >
+              Compare with Scene Controller
+            </button>
+            <button
+              disabled={connection !== "connected"}
+              onClick={() => {
+                send({ type: "sync", data });
+                notify("Sending configuration to the Scene Controller…");
+                updateConfiguration(activeConfiguration.id, {});
+              }}
+            >
+              Send configuration to Scene Controller
+            </button>
+          </div>
+          <p className="warning-copy">
+            Download saves this configuration to a file. Send transfers it to the
+            Scene Controller; the full binary transfer is handled by the local
+            bridge.
+          </p>
+        </section>
+      )}
+      <section
+        className={`card installer-card ${allowEquipment ? "enabled" : ""}`}
+      >
         <div>
-          <small>INSTALLER ACCESS</small>
+          <small>EQUIPMENT CHANGES</small>
           <h2>
-            {installer
+            {allowEquipment
               ? "Equipment changes enabled"
               : "Equipment changes are disabled"}
           </h2>
           <p>
-            Making changes to equipment can affect proper operation of the
-            FlexiDim system.
+            Editing equipment (floors, rooms, modules, switches and lights) can
+            affect proper operation of the FlexiDim system. This is separate from
+            the main Allow changes switch, which covers everything else.
           </p>
         </div>
-        <span className={`installer-status ${installer ? "enabled" : ""}`}>
-          {installer ? "Allowed" : "Locked"}
-        </span>
+        <Toggle
+          label="Allow equipment changes"
+          help="Unlock editing of the hardware model: floors, rooms, modules, switches and lights."
+          checked={allowEquipment}
+          onChange={setEquipmentAllowed}
+        />
       </section>
     </div>
   );
@@ -1418,12 +1982,12 @@ export default function FlexiDimWeb() {
             <small>EQUIPMENT</small>
             <h2>Hardware</h2>
           </div>
-          {installer && equipmentSection === "areas" && (
+          {allowEquipment && equipmentSection === "areas" && (
             <button onClick={addFloor} aria-label="Add floor">
               ＋
             </button>
           )}
-          {installer && equipmentSection === "modules" && (
+          {allowEquipment && equipmentSection === "modules" && (
             <button onClick={addModule} aria-label="Add module">
               ＋
             </button>
@@ -1455,57 +2019,69 @@ export default function FlexiDimWeb() {
           ))}
         </div>
         {equipmentSection === "areas" && (
-          <div className="area-tier equipment-area-list">
-            <div className="equipment-list-heading">
-              {areaMenuParent ? (
-                <button onClick={() => setAreaMenuParent(null)}>
-                  ‹ Floors
-                </button>
-              ) : (
-                <span>Floors / areas</span>
-              )}
-              {areaMenuParent && <strong>{roomName(areaMenuParent)}</strong>}
-            </div>
-            {(areaMenuParent
-              ? data.rooms.filter((room) => room.parentId === areaMenuParent)
-              : rootAreas
-            ).map((area) => {
-              const children = data.rooms.filter(
-                (room) => room.parentId === area.id,
-              );
+          <div className="area-tier area-drilldown equipment-area-list">
+            {(() => {
+              const currentArea = areaMenuParent
+                ? data.rooms.find((room) => room.id === areaMenuParent)
+                : undefined;
+              const list = currentArea
+                ? data.rooms.filter((room) => room.parentId === currentArea.id)
+                : rootAreas;
               return (
-                <div className="equipment-object-row" key={area.id}>
-                  <button
-                    className={activeAreaId === area.id ? "selected" : ""}
-                    onClick={() => {
-                      setSelectedRoom(area.id);
-                      setEquipmentSelection(null);
-                      if (children.length) setAreaMenuParent(area.id);
-                    }}
-                  >
-                    <img src={area.icon} alt="" />
-                    <span>
-                      <b>{area.name}</b>
-                      <small>
-                        {children.length
-                          ? `${children.length} areas`
-                          : `${data.channels.filter((channel) => channel.roomId === area.id).length} lights · ${data.switches.filter((item) => item.roomId === area.id).length} switches`}
-                      </small>
-                    </span>
-                    <em>›</em>
-                  </button>
-                  <button
-                    className="equipment-info"
-                    aria-label={`Edit ${area.name} information`}
-                    onClick={() =>
-                      setEquipmentSelection({ type: "area", id: area.id })
-                    }
-                  >
-                    ⓘ
-                  </button>
-                </div>
+                <>
+                  {currentArea && (
+                    <div className="area-drill-header">
+                      <button
+                        onClick={() =>
+                          setAreaMenuParent(currentArea.parentId ?? null)
+                        }
+                      >
+                        ‹ {currentArea.parentId ? "Back" : "Floors"}
+                      </button>
+                      <strong>{currentArea.name}</strong>
+                    </div>
+                  )}
+                  {list.map((area) => {
+                    const children = data.rooms.filter(
+                      (room) => room.parentId === area.id,
+                    );
+                    return (
+                      <div className="scene-nav-row" key={area.id}>
+                        <button
+                          className={activeAreaId === area.id ? "selected" : ""}
+                          onClick={() => {
+                            setSelectedRoom(area.id);
+                            setEquipmentSelection(null);
+                            if (children.length) setAreaMenuParent(area.id);
+                          }}
+                        >
+                          <img src={area.icon} alt="" />
+                          <span>
+                            <b>{area.name}</b>
+                            <small>
+                              {children.length
+                                ? `${children.length} areas`
+                                : `${data.channels.filter((channel) => channel.roomId === area.id).length} lights · ${data.switches.filter((item) => item.roomId === area.id).length} switches`}
+                            </small>
+                          </span>
+                          <em>›</em>
+                        </button>
+                        <button
+                          className="scene-info-button"
+                          title={`Edit ${area.name} information`}
+                          aria-label={`Edit ${area.name} information`}
+                          onClick={() =>
+                            setEquipmentSelection({ type: "area", id: area.id })
+                          }
+                        >
+                          i
+                        </button>
+                      </div>
+                    );
+                  })}
+                </>
               );
-            })}
+            })()}
           </div>
         )}
         {equipmentSection === "modules" && (
@@ -1594,7 +2170,7 @@ export default function FlexiDimWeb() {
                 <small>FLOOR / AREA</small>
                 <h2>{selectedEquipmentArea.name}</h2>
               </div>
-              {installer && (
+              {allowEquipment && (
                 <button
                   className="delete"
                   onClick={() =>
@@ -1613,7 +2189,7 @@ export default function FlexiDimWeb() {
               <Field label="Room name">
                 <input
                   value={selectedEquipmentArea.name}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) =>
                     updateRoom(selectedEquipmentArea.id, {
                       name: event.target.value,
@@ -1624,7 +2200,7 @@ export default function FlexiDimWeb() {
               <Field label="Names for Remote Control app">
                 <input
                   value={selectedEquipmentArea.shortName ?? selectedEquipmentArea.name}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) =>
                     updateRoom(selectedEquipmentArea.id, {
                       shortName: event.target.value,
@@ -1635,7 +2211,7 @@ export default function FlexiDimWeb() {
               <Field label="Floor / area">
                 <select
                   value={selectedEquipmentArea.areaType ?? "Room"}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) =>
                     updateRoom(selectedEquipmentArea.id, {
                       areaType: event.target.value as Room["areaType"],
@@ -1650,7 +2226,7 @@ export default function FlexiDimWeb() {
               <Field label="Parent area">
                 <select
                   value={selectedEquipmentArea.parentId ?? ""}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) =>
                     updateRoom(selectedEquipmentArea.id, {
                       parentId: Number(event.target.value) || null,
@@ -1674,7 +2250,7 @@ export default function FlexiDimWeb() {
                 <button
                   key={icon}
                   className={selectedEquipmentArea.icon === icon ? "selected" : ""}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onClick={() =>
                     updateRoom(selectedEquipmentArea.id, { icon })
                   }
@@ -1691,7 +2267,7 @@ export default function FlexiDimWeb() {
                 <small>MODULE</small>
                 <h2>{selectedEquipmentModule.name}</h2>
               </div>
-              {installer && (
+              {allowEquipment && (
                 <button
                   className="delete"
                   onClick={() =>
@@ -1713,7 +2289,7 @@ export default function FlexiDimWeb() {
               <Field label="Name">
                 <input
                   value={selectedEquipmentModule.name}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) =>
                     updateModule(selectedEquipmentModule.id, {
                       name: event.target.value,
@@ -1725,7 +2301,7 @@ export default function FlexiDimWeb() {
               <Field label="Bus">
                 <select
                   value={selectedEquipmentModule.bus}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) =>
                     updateModule(selectedEquipmentModule.id, {
                       bus: event.target.value as "A" | "B",
@@ -1740,7 +2316,7 @@ export default function FlexiDimWeb() {
               <Toggle
                 label="Turn on"
                 checked={selectedEquipmentModule.enabled}
-                disabled={!installer}
+                disabled={!allowEquipment}
                 onChange={(enabled) =>
                   updateModule(selectedEquipmentModule.id, { enabled })
                 }
@@ -1780,7 +2356,7 @@ export default function FlexiDimWeb() {
                 <small>SWITCH</small>
                 <h2>{selectedEquipmentSwitch.name}</h2>
               </div>
-              {installer && (
+              {allowEquipment && (
                 <button
                   className="delete"
                   onClick={() =>
@@ -1800,7 +2376,7 @@ export default function FlexiDimWeb() {
                 <Field label="Switch name">
                   <input
                     value={selectedEquipmentSwitch.name}
-                    disabled={!installer}
+                    disabled={!allowEquipment}
                     onChange={(event) =>
                       updateSwitch(selectedEquipmentSwitch.id, {
                         name: event.target.value,
@@ -1812,7 +2388,7 @@ export default function FlexiDimWeb() {
                   <input
                     type="number"
                     value={selectedEquipmentSwitch.number ?? selectedEquipmentSwitch.id}
-                    disabled={!installer}
+                    disabled={!allowEquipment}
                     onChange={(event) =>
                       updateSwitch(selectedEquipmentSwitch.id, {
                         number: Number(event.target.value),
@@ -1823,7 +2399,7 @@ export default function FlexiDimWeb() {
                 <Field label="Switch type">
                   <select
                     value={selectedEquipmentSwitch.buttons}
-                    disabled={!installer}
+                    disabled={!allowEquipment}
                     onChange={(event) => {
                       const buttons = Number(event.target.value);
                       updateSwitch(selectedEquipmentSwitch.id, {
@@ -1845,7 +2421,7 @@ export default function FlexiDimWeb() {
                     min="0"
                     max="100"
                     value={selectedEquipmentSwitch.ledBrightness ?? 70}
-                    disabled={!installer}
+                    disabled={!allowEquipment}
                     onChange={(event) =>
                       updateSwitch(selectedEquipmentSwitch.id, {
                         ledBrightness: Number(event.target.value),
@@ -1859,7 +2435,7 @@ export default function FlexiDimWeb() {
                     min="0"
                     max="100"
                     value={selectedEquipmentSwitch.defaultBrightness ?? 100}
-                    disabled={!installer}
+                    disabled={!allowEquipment}
                     onChange={(event) =>
                       updateSwitch(selectedEquipmentSwitch.id, {
                         defaultBrightness: Number(event.target.value),
@@ -1886,7 +2462,7 @@ export default function FlexiDimWeb() {
                 <small>CHANNEL</small>
                 <h2>{selectedEquipmentLight.name}</h2>
               </div>
-              {installer && (
+              {allowEquipment && (
                 <button
                   className="delete"
                   onClick={() =>
@@ -1905,7 +2481,7 @@ export default function FlexiDimWeb() {
               <Field label="Channel name">
                 <input
                   value={selectedEquipmentLight.name}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) =>
                     updateChannel(selectedEquipmentLight.id, {
                       name: event.target.value,
@@ -1919,7 +2495,7 @@ export default function FlexiDimWeb() {
               <Field label="Module">
                 <select
                   value={selectedEquipmentLight.moduleId ?? ""}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) => {
                     const moduleId = Number(event.target.value);
                     updateChannel(selectedEquipmentLight.id, {
@@ -1939,7 +2515,7 @@ export default function FlexiDimWeb() {
               <Field label="Type">
                 <select
                   value={selectedEquipmentLight.kind}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) =>
                     updateChannel(selectedEquipmentLight.id, {
                       kind: event.target.value,
@@ -1958,7 +2534,7 @@ export default function FlexiDimWeb() {
               <Field label="Accessory module">
                 <select
                   value={selectedEquipmentLight.accessoryModule ?? "None"}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) =>
                     updateChannel(selectedEquipmentLight.id, {
                       accessoryModule: event.target.value,
@@ -1977,7 +2553,7 @@ export default function FlexiDimWeb() {
                   min="0"
                   max="100"
                   value={selectedEquipmentLight.minimum ?? 0}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) =>
                     updateChannel(selectedEquipmentLight.id, {
                       minimum: Number(event.target.value),
@@ -1991,7 +2567,7 @@ export default function FlexiDimWeb() {
                   min="0"
                   max="100"
                   value={selectedEquipmentLight.maximum ?? 100}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) =>
                     updateChannel(selectedEquipmentLight.id, {
                       maximum: Number(event.target.value),
@@ -2005,7 +2581,7 @@ export default function FlexiDimWeb() {
                   min="0"
                   max="100"
                   value={selectedEquipmentLight.defaultLevel ?? 100}
-                  disabled={!installer}
+                  disabled={!allowEquipment}
                   onChange={(event) =>
                     updateChannel(selectedEquipmentLight.id, {
                       defaultLevel: Number(event.target.value),
@@ -2082,7 +2658,7 @@ export default function FlexiDimWeb() {
                 <small>{data.rooms.find((room) => room.id === activeAreaId)?.floor ?? "AREA"}</small>
                 <h2>{roomName(activeAreaId)}</h2>
               </div>
-              {installer && (
+              {allowEquipment && (
                 <div className="button-row compact">
                   <button onClick={addSwitch}>＋ Switch</button>
                   <button className="primary" onClick={addChannel}>＋ Light</button>
@@ -2125,7 +2701,7 @@ export default function FlexiDimWeb() {
             <small>SWITCHES</small>
             <h2>Switch overview</h2>
           </div>
-          {installer && <button onClick={addSwitch}>＋</button>}
+          {allowEquipment && <button onClick={addSwitch}>＋</button>}
         </div>
         {data.switches.map((item) => (
           <button
@@ -2207,7 +2783,10 @@ export default function FlexiDimWeb() {
                             ? {
                                 ...s,
                                 kind: e.target.value,
-                                buttons: e.target.value.startsWith("8") ? 8 : 4,
+                                type: SWITCH_TYPE_BY_NAME[e.target.value]?.type,
+                                buttons:
+                                  SWITCH_TYPE_BY_NAME[e.target.value]?.buttons ??
+                                  s.buttons,
                               }
                             : s,
                         ),
@@ -2665,12 +3244,10 @@ export default function FlexiDimWeb() {
                         />
                         <span className="option-label">
                           On priority
-                          <i
-                            tabIndex={0}
-                            aria-label="On priority help"
-                            title="Give this channel's On command priority over lower-priority state changes."
-                            data-tooltip="Give this channel's On command priority over lower-priority state changes."
-                          >?</i>
+                          <HelpTip
+                            label="On priority"
+                            help="Give this channel's On command priority over lower-priority state changes."
+                          />
                         </span>
                       </label>
                       <label title="Give this channel's Off command priority over lower-priority state changes.">
@@ -2688,12 +3265,10 @@ export default function FlexiDimWeb() {
                         />
                         <span className="option-label">
                           Off priority
-                          <i
-                            tabIndex={0}
-                            aria-label="Off priority help"
-                            title="Give this channel's Off command priority over lower-priority state changes."
-                            data-tooltip="Give this channel's Off command priority over lower-priority state changes."
-                          >?</i>
+                          <HelpTip
+                            label="Off priority"
+                            help="Give this channel's Off command priority over lower-priority state changes."
+                          />
                         </span>
                       </label>
                     </div>
@@ -2783,19 +3358,12 @@ export default function FlexiDimWeb() {
       })
     : undefined;
   const sceneFadeTimes = [0, 0.5, 1, 1.5, 2, 2.5, 3, 5, 10, 15, 30, 60];
-  const sceneRuleMask = (selectedSceneChannelSettings?.flags ?? 0) & 0x0f;
   const currentSceneTimerMode = currentScene?.nextSceneMode ?? -1;
   const currentSceneTimerValue = Math.max(0, currentScene?.nextSceneTime ?? 0);
   const currentSceneTimerHour = (currentSceneTimerValue >> 8) & 0xff;
   const currentSceneTimerMinute = currentSceneTimerValue & 0xff;
   const currentSceneDelayMinutes = Math.floor(currentSceneTimerValue / 30);
   const currentSceneDelaySeconds = (currentSceneTimerValue % 30) * 2;
-  const sceneBrightnessRules = [
-    { bit: 1, label: "When light is off" },
-    { bit: 2, label: "When light is on" },
-    { bit: 4, label: "When brightness would increase" },
-    { bit: 8, label: "When brightness would decrease" },
-  ];
 
   const scenesPanel = (
     <div className="master-detail scene-layout">
@@ -3104,66 +3672,27 @@ export default function FlexiDimWeb() {
                     <Toggle label="Auto start" help="Automatically start this scene when its configured trigger becomes active." checked={currentScene.autoStart ?? false} disabled={!installer} onChange={(autoStart) => updateScene(currentScene.id, { autoStart })} />
                     <Toggle label="Relative %" help="Treat brightness as a percentage change relative to the channel's current level." checked={selectedSceneChannelSettings.relativePercent} disabled={!installer} onChange={(relativePercent) => updateSceneChannel(currentScene.id, selectedSceneChannel.id, { relativePercent })} />
                     <Toggle label="100% time" help="Use the configured fade time as the time for a complete 0–100% transition." checked={selectedSceneChannelSettings.use100PercentTime} disabled={!installer} onChange={(use100PercentTime) => updateSceneChannel(currentScene.id, selectedSceneChannel.id, { use100PercentTime })} />
-                    <div className="scene-rule-tabs">
-                      {(["rules", "periods", "flags"] as const).map((panel) => (
-                        <button key={panel} className={sceneRulePanel === panel ? "active" : ""} onClick={() => setSceneRulePanel(panel)}>
-                          {panel === "flags" ? "State flags" : panel[0].toUpperCase() + panel.slice(1)}
-                        </button>
-                      ))}
-                    </div>
-                    <div className="scene-rule-panel">
-                      {sceneRulePanel === "rules" ? (
-                        <div className="scene-brightness-rules">
-                          <div className="scene-rule-heading">
-                            <div><b>Change brightness</b><small>Select one or more conditions.</small></div>
-                            <button
-                              className={sceneRuleMask === 0x0f ? "active" : ""}
-                              disabled={!installer}
-                              onClick={() => updateSceneChannel(currentScene.id, selectedSceneChannel.id, { flags: (selectedSceneChannelSettings.flags & ~0x0f) | 0x0f })}
-                            >Always</button>
-                          </div>
-                          {sceneBrightnessRules.map((rule) => {
-                            const enabled = Boolean(sceneRuleMask & rule.bit);
-                            return (
-                              <div className="scene-rule-condition" key={rule.bit}>
-                                <span>{rule.label}</span>
-                                <button
-                                  className={enabled ? "enabled" : ""}
-                                  disabled={!installer}
-                                  aria-label={`${enabled ? "Remove" : "Add"} rule: ${rule.label}`}
-                                  onClick={() => updateSceneChannel(currentScene.id, selectedSceneChannel.id, { flags: selectedSceneChannelSettings.flags ^ rule.bit })}
-                                >{enabled ? "−" : "+"}</button>
-                              </div>
-                            );
-                          })}
-                          <div className="scene-rule-delay">
-                            <div><b>Delay</b><small>Wait before changing this channel.</small></div>
-                            <div className="scene-stepper">
-                              <button disabled={!installer || selectedSceneChannelSettings.delay <= 0} onClick={() => updateSceneChannel(currentScene.id, selectedSceneChannel.id, { delay: Math.max(0, selectedSceneChannelSettings.delay - 0.5) })}>−</button>
-                              <output>{selectedSceneChannelSettings.delay.toFixed(1)} secs</output>
-                              <button disabled={!installer} onClick={() => updateSceneChannel(currentScene.id, selectedSceneChannel.id, { delay: selectedSceneChannelSettings.delay + 0.5 })}>＋</button>
-                            </div>
-                          </div>
-                          <Field label="Only when last scene was" help="Restrict this scene to run only after the selected previous scene.">
-                            <select value={currentScene.previousSceneId ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { previousSceneId: Number(event.target.value) || undefined })}>
-                              <option value="0">Any scene</option>
-                              {data.scenes.filter((scene) => scene.id !== currentScene.id).map((scene) => <option key={scene.id} value={scene.id}>{scene.name}</option>)}
-                            </select>
-                          </Field>
-                        </div>
-                      ) : sceneRulePanel === "periods" ? (
-                        <div className="scene-period-grid">
-                          <Field label="Period 1"><select value={currentScene.period1 ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { period1: Number(event.target.value) })}><option value="0">None</option>{data.periods.map((period) => <option key={period.id} value={period.id}>{period.name}</option>)}</select></Field>
-                          <Field label="Period 2"><select value={currentScene.period2 ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { period2: Number(event.target.value) })}><option value="0">None</option>{data.periods.map((period) => <option key={period.id} value={period.id}>{period.name}</option>)}</select></Field>
-                        </div>
-                      ) : (
-                        <Field label="State flag" help="The controller state flag used by this scene's rules."><input type="number" min="0" value={currentScene.stateFlag ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { stateFlag: Number(event.target.value) })} /></Field>
-                      )}
-                    </div>
+                    <Field label="Delay" help="Wait this long after the scene runs before this channel changes.">
+                      <div className="scene-stepper">
+                        <button disabled={!installer || selectedSceneChannelSettings.delay <= 0} onClick={() => updateSceneChannel(currentScene.id, selectedSceneChannel.id, { delay: Math.max(0, selectedSceneChannelSettings.delay - 0.5) })}>−</button>
+                        <output>{selectedSceneChannelSettings.delay.toFixed(1)} secs</output>
+                        <button disabled={!installer} onClick={() => updateSceneChannel(currentScene.id, selectedSceneChannel.id, { delay: selectedSceneChannelSettings.delay + 0.5 })}>＋</button>
+                      </div>
+                    </Field>
                   </>
                 ) : <Empty>Select a channel to edit its scene settings.</Empty>}
               </section>
             </div>
+            <div className="scene-rule-sections">
+              <div className="scene-rule-tabs">
+                {(["rules", "periods", "flags"] as const).map((panel) => (
+                  <button key={panel} className={sceneRulePanel === panel ? "active" : ""} onClick={() => setSceneRulePanel(panel)}>
+                    {panel === "flags" ? "State flags" : panel[0].toUpperCase() + panel.slice(1)}
+                  </button>
+                ))}
+              </div>
+              {sceneRulePanel === "rules" ? (
+                <>
             <div className="scene-sequence-sections">
               <section className="scene-sequence-card">
                 <div className="scene-sequence-heading"><small>SEQUENCE</small><h3>Additional process</h3><p>Only used if the main scene runs.</p></div>
@@ -3250,6 +3779,26 @@ export default function FlexiDimWeb() {
                 </div>
               </section>
             </div>
+            <div className="scene-rule-panel-body">
+              <Field label="Only when last scene was" help="Restrict this scene to run only after the selected previous scene.">
+                <select value={currentScene.previousSceneId ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { previousSceneId: Number(event.target.value) || undefined })}>
+                  <option value="0">Any scene</option>
+                  {data.scenes.filter((scene) => scene.id !== currentScene.id).map((scene) => <option key={scene.id} value={scene.id}>{scene.name}</option>)}
+                </select>
+              </Field>
+            </div>
+                </>
+              ) : sceneRulePanel === "periods" ? (
+                <div className="scene-rule-panel-body scene-period-grid">
+                  <Field label="Period 1" help="Only run this scene while the selected period is active."><select value={currentScene.period1 ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { period1: Number(event.target.value) })}><option value="0">None</option>{data.periods.map((period) => <option key={period.id} value={period.id}>{period.name}</option>)}</select></Field>
+                  <Field label="Period 2" help="A second period condition for this scene."><select value={currentScene.period2 ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { period2: Number(event.target.value) })}><option value="0">None</option>{data.periods.map((period) => <option key={period.id} value={period.id}>{period.name}</option>)}</select></Field>
+                </div>
+              ) : (
+                <div className="scene-rule-panel-body">
+                  <Field label="State flag" help="The controller state flag set or tested by this scene."><input type="number" min="0" value={currentScene.stateFlag ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { stateFlag: Number(event.target.value) })} /></Field>
+                </div>
+              )}
+            </div>
           </>
         ) : (
           <Empty>Select a floor, area, or scene.</Empty>
@@ -3272,14 +3821,56 @@ export default function FlexiDimWeb() {
     : [];
   const currentSceneButtonSwitch =
     sceneButtonSwitches.find((item) => item.id === selectedSwitch);
-  const currentButtonAssignment = currentSceneButtonSwitch
-    ? buttonAssignment(currentSceneButtonSwitch.id, selectedButton)
+  // selectedButton is the physical plate position; each position pairs two
+  // logical buttons — first press (2P-1) and second press (2P).
+  const firstPressAssignment = currentSceneButtonSwitch
+    ? buttonAssignment(currentSceneButtonSwitch.id, selectedButton * 2 - 1)
     : undefined;
-  const sceneButtonLights = currentSceneButtonSwitch
-    ? data.channels.filter(
-        (channel) => channel.roomId === currentSceneButtonSwitch.roomId,
-      )
-    : [];
+  const secondPressAssignment = currentSceneButtonSwitch
+    ? buttonAssignment(currentSceneButtonSwitch.id, selectedButton * 2)
+    : undefined;
+  const selectedButtonFirstDefault = currentSceneButtonSwitch
+    ? specialButtonDefault(currentSceneButtonSwitch.buttons, selectedButton)
+    : undefined;
+  // The picker opens on the switch's own area (iOS default) but can be
+  // navigated out to any floor/area. Scene groups mirror the area tree by name.
+  const sceneButtonSwitchRoom = currentSceneButtonSwitch
+    ? data.rooms.find((room) => room.id === currentSceneButtonSwitch.roomId)
+    : undefined;
+  const sceneButtonStartGroupId = sceneButtonSwitchRoom
+    ? (sceneGroups.find(
+        (group) =>
+          group.name.trim().toLowerCase() ===
+          sceneButtonSwitchRoom.name.trim().toLowerCase(),
+      )?.id ?? null)
+    : null;
+  const sceneBreadcrumb = (scene: Scene) =>
+    (scene.folderPath?.length
+      ? scene.folderPath
+      : [scene.group || "Scenes"]
+    ).join(" : ");
+  const sceneLabel = (sceneId?: number) => {
+    const scene = data.scenes.find((item) => item.id === sceneId);
+    return scene ? `${scene.name} (${sceneBreadcrumb(scene)})` : undefined;
+  };
+  const openScenePicker = (buttonNo: number) => {
+    setScenePickerGroupId(sceneButtonStartGroupId);
+    setScenePickerButton(buttonNo);
+  };
+  const assignPickerScene = (sceneId: number) => {
+    if (scenePickerButton != null && currentSceneButtonSwitch)
+      setButtonScene(currentSceneButtonSwitch, scenePickerButton, sceneId);
+    setScenePickerButton(null);
+  };
+  const pickerGroup = sceneGroups.find(
+    (group) => group.id === scenePickerGroupId,
+  );
+  const pickerChildGroups = sceneGroups
+    .filter((group) => group.parentId === scenePickerGroupId)
+    .sort((a, b) => a.displayRank - b.displayRank);
+  const pickerScenes = data.scenes.filter(
+    (scene) => (scene.groupId ?? null) === scenePickerGroupId,
+  );
 
   const sceneButtonPanel = (
     <div className="master-detail scene-button-layout">
@@ -3365,7 +3956,7 @@ export default function FlexiDimWeb() {
                 <img src="/flexidim/switches.png" alt="" />
                 <span>
                   <b>{item.name}</b>
-                  <small>{item.buttons} buttons</small>
+                  <small>{item.kind} · {item.buttons} buttons</small>
                 </span>
                 <em>›</em>
               </button>
@@ -3383,92 +3974,179 @@ export default function FlexiDimWeb() {
               </div>
             </div>
             <div className="switch-editor-body">
-              <div className="switch-plate" aria-label="Switch button layout">
-                {Array.from(
-                  { length: currentSceneButtonSwitch.buttons },
-                  (_, index) => index + 1,
-                ).map((button) => {
-                  const assignment = buttonAssignment(
-                    currentSceneButtonSwitch.id,
-                    button,
-                  );
-                  const hasFirst = Boolean(
-                    assignment?.sceneId ||
-                      assignment?.channelId ||
-                      assignment?.channelIds?.length,
-                  );
-                  const hasSecond = Boolean(
-                    assignment?.secondSceneId || assignment?.secondChannelId,
-                  );
-                  return (
-                    <button
-                      key={button}
-                      className={selectedButton === button ? "selected" : ""}
-                      onClick={() => setSelectedButton(button)}
-                      aria-label={`Button ${button}${hasSecond ? ", first and second press assigned" : hasFirst ? ", first press assigned" : ", unassigned"}`}
-                    >
-                      <span>{button}</span>
-                      <i className={hasFirst ? "active" : ""} />
-                      <i className={hasSecond ? "active" : ""} />
-                    </button>
-                  );
-                })}
-              </div>
+              {(() => {
+                const layout = switchButtonLayout(
+                  currentSceneButtonSwitch.buttons,
+                );
+                return (
+                  <div
+                    className="switch-plate"
+                    aria-label={`${currentSceneButtonSwitch.kind} switch button layout`}
+                    style={{ gridTemplateColumns: layout.columns }}
+                  >
+                    {layout.cells.map(({ button: position, column, row }) => {
+                      const firstButtonNo = position * 2 - 1;
+                      const secondButtonNo = position * 2;
+                      const hasFirst = Boolean(
+                        buttonAssignment(
+                          currentSceneButtonSwitch.id,
+                          firstButtonNo,
+                        )?.sceneId,
+                      );
+                      const hasSecond = Boolean(
+                        buttonAssignment(
+                          currentSceneButtonSwitch.id,
+                          secondButtonNo,
+                        )?.sceneId,
+                      );
+                      const hasDefault = Boolean(
+                        specialButtonDefault(
+                          currentSceneButtonSwitch.buttons,
+                          position,
+                        ),
+                      );
+                      return (
+                        <button
+                          key={position}
+                          className={selectedButton === position ? "selected" : ""}
+                          style={{ gridColumn: column, gridRow: row }}
+                          onClick={() => {
+                            setSelectedButton(position);
+                            pressSceneButton(
+                              currentSceneButtonSwitch,
+                              "first",
+                              firstButtonNo,
+                            );
+                          }}
+                          aria-label={`Buttons ${firstButtonNo} and ${secondButtonNo}${hasSecond ? ", first and second press assigned" : hasFirst ? ", first press assigned" : hasDefault ? ", built-in function" : ", unassigned"}`}
+                        >
+                          <span className="switch-button-dots">
+                            <i
+                              className={
+                                hasFirst ? "active" : hasDefault ? "default" : ""
+                              }
+                            />
+                            <i className={hasSecond ? "active" : ""} />
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
               <div className="button-operation-editor">
-                <small>BUTTON {selectedButton}</small>
-                <h3>Controlled light</h3>
-                <Field label="First press">
-                  <select
-                    value={
-                      currentButtonAssignment?.channelIds?.length
-                        ? "all"
-                        : (currentButtonAssignment?.channelId ?? "")
-                    }
-                    disabled={!installer}
-                    onChange={(event) =>
-                      setButtonLight(
-                        currentSceneButtonSwitch,
-                        selectedButton,
-                        "first",
-                        Number(event.target.value),
-                      )
-                    }
-                  >
-                    <option value="">No operation</option>
-                    {currentButtonAssignment?.channelIds?.length && (
-                      <option value="all">All room lights (basic)</option>
+                <small>
+                  BUTTONS {selectedButton * 2 - 1} &amp; {selectedButton * 2}
+                </small>
+                <h3>Assigned scenes</h3>
+                <div className="press-assign">
+                  <div className="press-assign-text">
+                    <span className="option-label">
+                      First press
+                      <HelpTip
+                        label="First press"
+                        help="The scene run when this button is pressed once."
+                      />
+                    </span>
+                    <p className="press-assign-value">
+                      {sceneLabel(firstPressAssignment?.sceneId) ??
+                        (selectedButtonFirstDefault
+                          ? `Default — ${selectedButtonFirstDefault.name}`
+                          : "Not assigned")}
+                    </p>
+                  </div>
+                  <div className="press-assign-actions">
+                    <button
+                      className="press-edit"
+                      disabled={!installer}
+                      onClick={() => openScenePicker(selectedButton * 2 - 1)}
+                      aria-label="Choose scene for first press"
+                    >
+                      Edit
+                    </button>
+                    {firstPressAssignment?.sceneId && (
+                      <button
+                        className="press-x"
+                        disabled={!installer}
+                        aria-label="Clear first press"
+                        onClick={() =>
+                          setButtonScene(
+                            currentSceneButtonSwitch,
+                            selectedButton * 2 - 1,
+                            0,
+                          )
+                        }
+                      >
+                        ✕
+                      </button>
                     )}
-                    {sceneButtonLights.map((channel) => (
-                      <option value={channel.id} key={channel.id}>
-                        {channel.name}
-                      </option>
+                  </div>
+                </div>
+                {selectedButtonFirstDefault && !firstPressAssignment?.sceneId && (
+                  <p className="hint press-default-hint">
+                    {selectedButtonFirstDefault.help}
+                  </p>
+                )}
+                <div className="press-assign">
+                  <div className="press-assign-text">
+                    <span className="option-label">
+                      Second press
+                      <HelpTip
+                        label="Second press"
+                        help="An optional scene run when the button is pressed a second time."
+                      />
+                    </span>
+                    <p className="press-assign-value">
+                      {sceneLabel(secondPressAssignment?.sceneId) ?? "Not assigned"}
+                    </p>
+                  </div>
+                  <div className="press-assign-actions">
+                    <button
+                      className="press-edit"
+                      disabled={!installer}
+                      onClick={() => openScenePicker(selectedButton * 2)}
+                      aria-label="Choose scene for second press"
+                    >
+                      Edit
+                    </button>
+                    {secondPressAssignment?.sceneId && (
+                      <button
+                        className="press-x"
+                        disabled={!installer}
+                        aria-label="Clear second press"
+                        onClick={() =>
+                          setButtonScene(
+                            currentSceneButtonSwitch,
+                            selectedButton * 2,
+                            0,
+                          )
+                        }
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="button-send-mode">
+                  <span className="option-label">When button pressed</span>
+                  <div className="send-mode-options">
+                    {BUTTON_PRESS_MODES.map((mode) => (
+                      <div className="send-mode-option" key={mode.value}>
+                        <button
+                          type="button"
+                          className={buttonPressMode === mode.value ? "active" : ""}
+                          onClick={() => setButtonPressMode(mode.value)}
+                        >
+                          {mode.label}
+                        </button>
+                        <HelpTip label={mode.label} help={mode.help} />
+                      </div>
                     ))}
-                  </select>
-                </Field>
-                <Field label="Second press">
-                  <select
-                    value={currentButtonAssignment?.secondChannelId ?? ""}
-                    disabled={!installer}
-                    onChange={(event) =>
-                      setButtonLight(
-                        currentSceneButtonSwitch,
-                        selectedButton,
-                        "second",
-                        Number(event.target.value),
-                      )
-                    }
-                  >
-                    <option value="">No second-press operation</option>
-                    {sceneButtonLights.map((channel) => (
-                      <option value={channel.id} key={channel.id}>
-                        {channel.name}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
+                  </div>
+                </div>
                 {!installer && (
                   <p className="hint">
-                    Turn on Allow changes to edit button operations.
+                    Turn on Allow changes to edit button scenes.
                   </p>
                 )}
               </div>
@@ -3478,6 +4156,84 @@ export default function FlexiDimWeb() {
           <Empty>Choose a floor, room, and switch.</Empty>
         )}
       </section>
+      {scenePickerButton != null && (
+        <div
+          className="scene-picker-overlay"
+          onClick={() => setScenePickerButton(null)}
+        >
+          <div
+            className="scene-picker"
+            role="dialog"
+            aria-label="Choose a scene"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="scene-picker-head">
+              {scenePickerGroupId !== null ? (
+                <button
+                  className="scene-picker-back"
+                  onClick={() =>
+                    setScenePickerGroupId(pickerGroup?.parentId ?? null)
+                  }
+                >
+                  ‹ Back
+                </button>
+              ) : (
+                <span />
+              )}
+              <strong>{pickerGroup?.name ?? "All areas"}</strong>
+              <button
+                className="scene-picker-close"
+                aria-label="Close"
+                onClick={() => setScenePickerButton(null)}
+              >
+                ✕
+              </button>
+            </div>
+            <div className="scene-picker-list">
+              {pickerChildGroups.map((group) => {
+                const areaCount = sceneGroups.filter(
+                  (item) => item.parentId === group.id,
+                ).length;
+                const sceneCount = data.scenes.filter(
+                  (scene) => scene.groupId === group.id,
+                ).length;
+                return (
+                  <button
+                    key={`group-${group.id}`}
+                    className="scene-picker-group"
+                    onClick={() => setScenePickerGroupId(group.id)}
+                  >
+                    <img src={group.icon} alt="" />
+                    <span>
+                      <b>{group.name}</b>
+                      <small>
+                        {areaCount} areas · {sceneCount} scenes
+                      </small>
+                    </span>
+                    <em>›</em>
+                  </button>
+                );
+              })}
+              {pickerScenes.map((scene) => (
+                <button
+                  key={`scene-${scene.id}`}
+                  className="scene-picker-scene"
+                  onClick={() => assignPickerScene(scene.id)}
+                >
+                  <img src="/flexidim/scenes.png" alt="" />
+                  <span>
+                    <b>{scene.name}</b>
+                    <small>{sceneBreadcrumb(scene)}</small>
+                  </span>
+                </button>
+              ))}
+              {!pickerChildGroups.length && !pickerScenes.length && (
+                <p className="hint">No areas or scenes here.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 
@@ -3624,7 +4380,7 @@ export default function FlexiDimWeb() {
           </div>
           <button
             className="primary"
-            onClick={() =>
+            onClick={() => {
               setData((old) => ({
                 ...old,
                 users: [
@@ -3637,8 +4393,9 @@ export default function FlexiDimWeb() {
                     key: crypto.randomUUID().replace(/-/g, " ").slice(0, 19),
                   },
                 ],
-              }))
-            }
+              }));
+              notify("New user created", "ok");
+            }}
           >
             ＋ New user
           </button>
@@ -3831,6 +4588,19 @@ export default function FlexiDimWeb() {
         <span>Local-first · Configuration saved on this device</span>
         <span>Recovered from iOS v2.97</span>
       </footer>
+      <div className="toast-stack" role="status" aria-live="polite">
+        {toasts.map((toast) => (
+          <button
+            key={toast.id}
+            className={`toast ${toast.tone ?? "info"}`}
+            onClick={() => dismissToast(toast.id)}
+            aria-label={`Dismiss: ${toast.text}`}
+          >
+            <i />
+            <span>{toast.text}</span>
+          </button>
+        ))}
+      </div>
     </main>
   );
 }
