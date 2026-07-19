@@ -61,8 +61,8 @@ You'll see, per frame:
 [12:01:03.590] ← RX 192.168.178.42:15273  (N bytes)   <-- the controller's reply
 ```
 The **TX** line is the wire-level ground truth. RX lines show whether the
-controller replies, but plaintext live dim/switch commands do not require a
-separate TCP handshake in this app version.
+controller replies. A type-0 local session must send the 23-byte authentication
+record documented in [`../protocol.md`](../protocol.md) before live commands.
 
 If the app crashes on spawn (some jailbreak/anti-debug combos), attach instead
 after launching it by hand: `frida -U -n FlexiDim -l tools/flexidim-trace.js`.

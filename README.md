@@ -68,6 +68,10 @@ FlexiDim Scene Controller :15273
 
 The bridge listens on loopback only. It is not exposed to other devices on the LAN and does not route lighting data through a cloud service.
 
+See [protocol.md](protocol.md) for the recovered discovery, authentication,
+framing, live-command, controller-status, configuration-archive, comparison,
+and whole-controller-transfer details, including confidence and safety limits.
+
 ## Implemented functionality
 
 - Responsive recreation of the original iPad landscape interface
