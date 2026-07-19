@@ -52,9 +52,23 @@ const tcp = net.createServer((sock) => {
   const who = `${sock.remoteAddress}:${sock.remotePort}`;
   console.log(`\n[${ts()}] ● app connected from ${who}`);
   let pending = Buffer.alloc(0);
+  let authenticated = false;
   sock.on('data', (chunk) => {
-    console.log(`[${ts()}] ← RX raw  [${hex(chunk)}]`);
     pending = Buffer.concat([pending, chunk]);
+    if (!authenticated && pending.length >= 23) {
+      const login = pending.subarray(0, 23);
+      const nonce = login.subarray(16, 22).toString('ascii');
+      if (/^\d{6}$/.test(nonce) && login[22] === 0xff) {
+        authenticated = true;
+        pending = pending.subarray(23);
+        console.log(`[${ts()}] ← RX AUTH [16-byte key redacted ${nonce} ff]`);
+      }
+    }
+    if (!authenticated) {
+      console.log(`[${ts()}] ← waiting for 23-byte iOS authentication record (${pending.length}/23 bytes)`);
+      return;
+    }
+    if (pending.length) console.log(`[${ts()}] ← RX command bytes [${hex(pending)}]`);
     const { frames, rest } = splitFrames(pending);
     pending = rest;
     // Frames have no terminator, so splitFrames holds the last one back until

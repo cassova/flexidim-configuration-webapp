@@ -1,4 +1,5 @@
 import { parse } from "@plist/binary.parse";
+import { controllerChannelAddress } from "./flexidim-addressing.mjs";
 
 export type Room = {
   id: number;
@@ -344,25 +345,27 @@ export function convertLegacyArchive(archive: unknown): AppData {
   const channelIdByKey = new Map(
     channelHardware.map((item, index) => [number(item.ky), index + 1]),
   );
-  // The Scene Controller addresses a channel by its module's ordinal and the
-  // channel index within that module — not the app's logical channel order.
-  // The module ordinal is that module number's position in the ascending list
-  // of distinct module numbers (matching the archive's stored modules array).
-  const sortedModules = [
-    ...new Set(
-      channelHardware
-        .map((item) => number(item.md, -1))
-        .filter((moduleNumber) => moduleNumber >= 0),
-    ),
-  ].sort((a, b) => a - b);
+  // The iOS app's moduleForModuleNumber: searches the site's stored module
+  // array and sendDiM: addresses a channel as `index + modulePosition * 8`.
+  // Module identifiers happen to be ordered at many sites, but sorting them is
+  // not protocol-correct: the archive order is the source of truth.
+  const archivedModuleCount = Math.max(0, topNumber("modc"));
+  const archivedModules = Array.from(
+    { length: archivedModuleCount },
+    (_, moduleIndex) => number(topString(`$${30 + moduleIndex}`), -1),
+  ).filter((moduleNumber) => moduleNumber >= 0);
+  const encounteredModules = channelHardware
+    .map((item) => number(item.md, -1))
+    .filter((moduleNumber) => moduleNumber >= 0);
+  const orderedModules = [...new Set([...archivedModules, ...encounteredModules])];
   const channels: Channel[] = channelHardware.map((item, index) => {
     const moduleNumber = number(item.md, -1);
     const channelIndex = number(item.ix);
-    const moduleOrdinal = sortedModules.indexOf(moduleNumber);
-    const controllerChannel =
-      moduleOrdinal >= 0
-        ? (moduleOrdinal << 4) | (channelIndex & 0x0f)
-        : channelIndex;
+    const modulePosition = orderedModules.indexOf(moduleNumber);
+    const controllerChannel = controllerChannelAddress(
+      modulePosition,
+      channelIndex,
+    );
     return {
       id: index + 1,
       name: string(item.nm) || `Channel ${index + 1}`,
@@ -382,13 +385,7 @@ export function convertLegacyArchive(archive: unknown): AppData {
       defaultLevel: 100,
     };
   });
-  const modules: FlexModule[] = [
-    ...new Set(
-      channelHardware
-        .map((item) => number(item.md, -1))
-        .filter((moduleId) => moduleId >= 0),
-    ),
-  ].map((moduleId) => ({
+  const modules: FlexModule[] = orderedModules.map((moduleId) => ({
     id: moduleId,
     name: `Module ${moduleId}`,
     bus: "A",
@@ -477,6 +474,9 @@ export function convertLegacyArchive(archive: unknown): AppData {
       kind: typeInfo?.name ?? `${buttons} button`,
       buttons,
       type,
+      // sendSwMessage: receives JCLFDHardware.index, not the switch's
+      // position in the configuration's logical list.
+      number: number(item.ix, index + 1),
       basic: {
         channelIds,
         assignOn: firstChannel?.assignOn ?? false,

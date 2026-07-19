@@ -18,6 +18,8 @@ import {
   type Site,
   type WallSwitch,
 } from "./fd4cfg";
+import { controllerChannelAddress } from "./flexidim-addressing.mjs";
+import { defaultOnOffCommands, rawControllerButton } from "./live-switch.mjs";
 
 type Tab =
   | "Sites"
@@ -437,7 +439,7 @@ function restoreAreaHierarchy(data: AppData): AppData {
     areaType:
       room.areaType ?? (room.parentId ? ("Room" as const) : ("Floor" as const)),
   }));
-  const channels = data.channels.map((channel) => {
+  const normalizedChannels = data.channels.map((channel) => {
     const moduleMatch = channel.module.match(/Module\s+(\d+)/i);
     return {
       ...channel,
@@ -452,11 +454,36 @@ function restoreAreaHierarchy(data: AppData): AppData {
   });
   const moduleIds = [
     ...new Set(
-      channels
+      normalizedChannels
         .map((channel) => channel.moduleId)
         .filter((id): id is number => id !== undefined),
     ),
   ];
+  // Migrate data imported by the previous webapp build. That importer encoded
+  // module position in a four-bit nibble. Detect that exact signature before
+  // rewriting so correctly imported archives with a non-sorted module order
+  // remain untouched.
+  const legacyModuleOrder = [...moduleIds].sort((a, b) => a - b);
+  const hasLegacyAddresses = normalizedChannels.some((channel) => {
+    const position = legacyModuleOrder.indexOf(channel.moduleId ?? -1);
+    return position > 0 && channel.moduleIndex != null &&
+      channel.controllerChannel ===
+        ((position << 4) | (channel.moduleIndex & 0x0f));
+  });
+  const channels = hasLegacyAddresses
+    ? normalizedChannels.map((channel) => {
+        const position = legacyModuleOrder.indexOf(channel.moduleId ?? -1);
+        return position >= 0 && channel.moduleIndex != null
+          ? {
+              ...channel,
+              controllerChannel: controllerChannelAddress(
+                position,
+                channel.moduleIndex,
+              ),
+            }
+          : channel;
+      })
+    : normalizedChannels;
   const restoredSceneGroups: SceneGroup[] = data.sceneGroups?.length
     ? data.sceneGroups
     : [];
@@ -715,6 +742,7 @@ export default function FlexiDimWeb() {
           type: "discover",
           host: data.site.ip,
           port: data.site.port,
+          securityCode: data.site.securityCode,
         }),
       );
     };
@@ -749,6 +777,17 @@ export default function FlexiDimWeb() {
             `Controller discovered at ${message.host}:${message.port}`,
             "ok",
           );
+        } else if (message.type === "channelStatus" && message.levels) {
+          const levels = message.levels as Record<string, number>;
+          setData((old) => ({
+            ...old,
+            channels: old.channels.map((channel) => {
+              const level = levels[String(channel.controllerChannel ?? channel.id)];
+              return Number.isFinite(level) && level !== channel.level
+                ? { ...channel, level }
+                : channel;
+            }),
+          }));
         } else if (message.type === "trace") addTrace(message.message);
       } catch {
         addTrace(String(event.data));
@@ -779,9 +818,11 @@ export default function FlexiDimWeb() {
   }>({ timer: null, pending: null });
 
   // The Scene Controller addresses a channel by the byte computed at import
-  // (module ordinal + channel index), not the app's logical channel id.
+  // (stored module position * 8 + channel index), not the logical channel id.
   const controllerChannelFor = (id: number) =>
     data.channels.find((channel) => channel.id === id)?.controllerChannel ?? id;
+  const controllerSwitchFor = (wallSwitch: WallSwitch) =>
+    wallSwitch.number ?? wallSwitch.id;
 
   const transmitDim = (id: number, level: number) => {
     const state = dimThrottle.current;
@@ -837,7 +878,7 @@ export default function FlexiDimWeb() {
   };
 
   const pressSwitch = (wallSwitch: WallSwitch, button: number) => {
-    send({ type: "switch", switch: wallSwitch.id, button });
+    send({ type: "switch", switch: controllerSwitchFor(wallSwitch), button });
     const scene = assignedScene(wallSwitch.id, button);
     if (scene) runScene(scene);
     else addTrace(`${wallSwitch.name}: button ${button} pressed`);
@@ -1270,6 +1311,7 @@ export default function FlexiDimWeb() {
     wallSwitch: WallSwitch,
     press: "first" | "second",
     button: number,
+    physicalPosition: number,
   ) => {
     if (buttonPressMode === "none") return;
     const scene = data.scenes.find(
@@ -1279,11 +1321,55 @@ export default function FlexiDimWeb() {
       runScene(scene);
       return;
     }
+    const builtIn = specialButtonDefault(
+      wallSwitch.buttons,
+      physicalPosition,
+    );
+    if (
+      buttonPressMode === "live" &&
+      !scene &&
+      builtIn?.name === "Default on/off"
+    ) {
+      const commands = defaultOnOffCommands(wallSwitch, data.channels);
+      if (!commands.length) {
+        addTrace(`${wallSwitch.name}: Default on/off has no Basic Assignment channels`, "warn");
+        return;
+      }
+      for (const command of commands) {
+        send({
+          type: "dim",
+          channel: controllerChannelFor(command.id),
+          level: command.level,
+          transition: command.transition,
+        });
+      }
+      setData((old) => ({
+        ...old,
+        channels: old.channels.map((channel) => {
+          const command = commands.find((candidate) => candidate.id === channel.id);
+          return command ? { ...channel, level: command.level } : channel;
+        }),
+      }));
+      addTrace(
+        `${wallSwitch.name}: Default on/off → ${commands[0].level ? "on" : "off"} (${commands.length} channels)`,
+        "ok",
+      );
+      return;
+    }
     // "latest settings", or "live" with no assigned scene: transmit the raw
-    // switch button press for the controller to interpret.
-    send({ type: "switch", switch: wallSwitch.id, button });
+    // physical switch button for the controller to interpret. Logical scene
+    // slots (2P-1/2P) are not valid switch-command button addresses.
+    const controllerButton = rawControllerButton(
+      wallSwitch.buttons,
+      physicalPosition,
+    );
+    send({
+      type: "switch",
+      switch: controllerSwitchFor(wallSwitch),
+      button: controllerButton,
+    });
     addTrace(
-      `${wallSwitch.name}: ${press} press of button ${button} sent (${
+      `${wallSwitch.name}: ${press} press of button ${controllerButton} sent (${
         buttonPressMode === "live" ? "live system" : "latest settings"
       })`,
     );
@@ -4016,6 +4102,7 @@ export default function FlexiDimWeb() {
                               currentSceneButtonSwitch,
                               "first",
                               firstButtonNo,
+                              position,
                             );
                           }}
                           aria-label={`Buttons ${firstButtonNo} and ${secondButtonNo}${hasSecond ? ", first and second press assigned" : hasFirst ? ", first press assigned" : hasDefault ? ", built-in function" : ", unassigned"}`}

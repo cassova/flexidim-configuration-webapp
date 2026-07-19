@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 import { discoverController } from "./discovery.mjs";
+import { parseControllerReplies } from "./controller-replies.mjs";
 import { packet } from "./protocol.mjs";
+import { authenticationRecord } from "./session.mjs";
 
 const BRIDGE_PORT = Number(process.env.FLEXIDIM_BRIDGE_PORT || 8765);
 const sockets = new Set();
@@ -22,6 +24,33 @@ function websocketFrame(value) {
 }
 
 function emit(ws, value) { if (!ws.destroyed) ws.write(websocketFrame(value)); }
+
+function queueControllerStatus(ws, controller, statuses) {
+  controller.flexidimPendingLevels ??= {};
+  controller.flexidimKnownLevels ??= new Map();
+  controller.flexidimStatusReports ??= 0;
+  controller.flexidimStatusChanges ??= 0;
+  for (const status of statuses) {
+    const previous = controller.flexidimKnownLevels.get(status.channel);
+    controller.flexidimKnownLevels.set(status.channel, status.level);
+    controller.flexidimPendingLevels[status.channel] = status.level;
+    controller.flexidimStatusReports += 1;
+    if (previous !== status.level) controller.flexidimStatusChanges += 1;
+    if (controller.flexidimStatusReports >= 128) {
+      log(`↻ controller status synchronized: 128 channel reports, ${controller.flexidimStatusChanges} level changes`);
+      controller.flexidimStatusReports = 0;
+      controller.flexidimStatusChanges = 0;
+    }
+  }
+  if (!controller.flexidimStatusTimer) {
+    controller.flexidimStatusTimer = setTimeout(() => {
+      controller.flexidimStatusTimer = undefined;
+      const levels = controller.flexidimPendingLevels;
+      controller.flexidimPendingLevels = {};
+      if (Object.keys(levels).length) emit(ws, { type: "channelStatus", levels });
+    }, 500);
+  }
+}
 
 function decodeFrames(buffer) {
   const messages = []; let closeRequested = false; let offset = 0;
@@ -44,48 +73,82 @@ function decodeFrames(buffer) {
 
 function writeController(ws, bytes, label) {
   const controller = controllers.get(ws);
-  if (!controller || controller.destroyed || !controller.writable) {
+  if (!controller || controller.destroyed || !controller.writable || !controller.flexidimAuthenticated) {
     log(`✗ NOT SENT (controller not connected): ${label}`);
     return emit(ws, { type: "status", state: "error", message: "Scene Controller is not connected" });
   }
   const ok = controller.write(bytes);
+  controller.flexidimLastTx = { at: Date.now(), label, bytes: Buffer.from(bytes) };
   log(`→ TX ${label}  [${hex(bytes)}]${ok ? "" : "  (socket buffer full)"}`);
   emit(ws, { type: "trace", message: `${label} · ${hex(bytes)}` });
 }
 
-function connectController(ws, host, port) {
+function connectController(ws, host, port, securityCode) {
     controllers.get(ws)?.destroy();
     if (!/^([a-z\d-]+\.)*[a-z\d-]+$|^\d{1,3}(\.\d{1,3}){3}$/i.test(host)) return emit(ws, { type: "status", state: "error", message: "Enter a valid Scene Controller address" });
     log(`connect → ${host}:${port}`);
     emit(ws, { type: "status", state: "connecting", message: `Connecting to ${host}:${port}` });
-    let connected = false; let failed = false; let keepAlive = null;
+    let connected = false; let failed = false; let connectedAt = 0;
     const controller = net.createConnection({ host, port, timeout: 7000 }); controllers.set(ws, controller);
     controller.on("connect", () => {
       // The timeout above is for establishing the TCP connection only. Leaving it
       // enabled disconnects a healthy but idle controller seven seconds later.
       controller.setTimeout(0);
       controller.setKeepAlive(true, 3000);
+      let login;
+      try {
+        login = authenticationRecord(securityCode);
+      } catch (error) {
+        failed = true;
+        log(`✗ controller authentication not sent: ${error.message}`);
+        emit(ws, { type: "status", state: "error", message: error.message });
+        controller.destroy();
+        return;
+      }
       connected = true;
-      log(`✓ controller connected: ${host}:${port}`);
-      emit(ws, { type: "status", state: "connected", message: `Connected to Scene Controller at ${host}:${port}` });
-      // Keep the session warm. This site's backhaul is a powerline mesh that
-      // silently drops idle TCP flows after a few seconds; the iOS app stays
-      // connected by polling. Send a benign period-flag request every 3s so the
-      // link (and the controller's session) stays alive between user actions.
-      keepAlive = setInterval(() => {
-        if (controller.destroyed || !controller.writable) return;
-        const frame = packet(0x05);
-        controller.write(frame);
-        log(`♥ keep-alive  [${hex(frame)}]`);
-      }, 3000);
+      connectedAt = Date.now();
+      // Recovered from stream0:handleEvent: in the iOS app. A site-type-0
+      // session starts with key + six-digit random nonce + 0xff. The app only
+      // enters tcpState 3 (command-ready) after writing this record.
+      controller.write(login);
+      controller.flexidimAuthenticated = true;
+      log(`→ TX controller authentication [16-byte key redacted + ${login.subarray(16, 22).toString("ascii")} + ff]`);
+      log(`✓ controller authenticated: ${host}:${port}`);
+      emit(ws, { type: "trace", message: "Controller authentication sent (security code redacted)" });
+      emit(ws, { type: "status", state: "connected", message: `Authenticated with Scene Controller at ${host}:${port}` });
+      // Do not add an application-level poll here. The iOS app only emits its
+      // period-flag request for encrypted remote sessions, where it is a
+      // different, longer frame. Sending a guessed plaintext 0x05 frame to a
+      // local controller causes real controllers to terminate the TCP stream.
     });
     controller.on("data", (data) => {
-      log(`← RX controller reply  [${hex(data)}]`);
-      emit(ws, { type: "trace", message: `Controller reply · ${hex(data)}` });
+      controller.flexidimRxBuffer = Buffer.concat([controller.flexidimRxBuffer ?? Buffer.alloc(0), data]);
+      const replies = parseControllerReplies(controller.flexidimRxBuffer);
+      controller.flexidimRxBuffer = Buffer.from(replies.rest);
+      if (replies.statuses.length) queueControllerStatus(ws, controller, replies.statuses);
+      if (replies.visible.length) {
+        const visible = Buffer.concat(replies.visible);
+        log(`← RX controller reply  [${hex(visible)}]`);
+        emit(ws, { type: "trace", message: `Controller reply · ${hex(visible)}` });
+      }
     });
     controller.on("timeout", () => { failed = true; log(`✗ controller timed out (${host}:${port})`); controller.destroy(); emit(ws, { type: "status", state: "error", message: "Scene Controller connection timed out" }); });
     controller.on("error", (error) => { failed = true; log(`✗ controller error: ${error.code || ""} ${error.message}`); emit(ws, { type: "status", state: "error", message: `Controller connection failed: ${error.message}` }); });
-    controller.on("close", (hadError) => { if (keepAlive) clearInterval(keepAlive); log(`controller connection closed${hadError ? " (after error)" : ""}${connected ? "" : " (never established)"}`); if (!ws.destroyed && connected && !failed) emit(ws, { type: "status", state: "bridge", message: "Scene Controller disconnected" }); });
+    controller.on("close", (hadError) => {
+      if (controller.flexidimStatusTimer) clearTimeout(controller.flexidimStatusTimer);
+      const last = controller.flexidimLastTx;
+      const age = last ? Date.now() - last.at : undefined;
+      const lifetime = connectedAt ? Date.now() - connectedAt : 0;
+      const diagnostic = last
+        ? `; ${age}ms after TX ${last.label} [${hex(last.bytes)}]`
+        : `; no command sent during ${lifetime}ms connection`;
+      log(`controller connection closed${hadError ? " (after error)" : ""}${connected ? "" : " (never established)"}${diagnostic}`);
+      if (!ws.destroyed && connected && !failed) emit(ws, {
+        type: "status",
+        state: "bridge",
+        message: `Scene Controller disconnected${last ? ` after ${last.label}` : ""}`,
+      });
+    });
 }
 
 function handleMessage(ws, raw) {
@@ -97,7 +160,7 @@ function handleMessage(ws, raw) {
       (message.type === "switch" ? ` (sw ${message.switch}, btn ${message.button})` : ""),
   );
   if (message.type === "connect") {
-    connectController(ws, String(message.host || ""), Number(message.port || 15273));
+    connectController(ws, String(message.host || ""), Number(message.port || 15273), String(message.securityCode || ""));
     return;
   }
   if (message.type === "discover") {
@@ -107,7 +170,7 @@ function handleMessage(ws, raw) {
       if (ws.destroyed) return;
       if (!host) return emit(ws, { type: "status", state: "error", message: `No FlexiDim controller was found on this local network at port ${port}` });
       emit(ws, { type: "discovered", host, port });
-      connectController(ws, host, port);
+      connectController(ws, host, port, String(message.securityCode || ""));
     }).catch((error) => emit(ws, { type: "status", state: "error", message: `Controller discovery failed: ${error.message}` }));
     return;
   }
@@ -116,7 +179,7 @@ function handleMessage(ws, raw) {
   // The trailing 0x00 is part of what the controller's CRC/length check expects.
   else if (message.type === "switch") writeController(ws, packet(0x00, [message.switch, message.button, 0]), `Switch ${message.switch}, button ${message.button}`);
   else if (message.type === "scene") for (const [channel, level] of Object.entries(message.levels || {})) writeController(ws, packet(0x04, [channel, level, message.transition]), `Scene channel ${channel} → ${level}%`);
-  else if (message.type === "periodFlags") writeController(ws, packet(0x05), "Request period flags");
+  else if (message.type === "periodFlags") emit(ws, { type: "status", state: "error", message: "Period flags are only available through the iOS encrypted remote-session protocol" });
   else if (message.type === "sync") emit(ws, { type: "status", state: "error", message: "Full configuration transfer needs a verified controller-specific binary profile; live commands are unaffected" });
 }
 

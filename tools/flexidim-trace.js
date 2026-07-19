@@ -108,6 +108,16 @@ function peerOf(fd) {
   return null;
 }
 
+function ipv4Sockaddr(sa) {
+  try {
+    if (!sa || sa.isNull() || sa.add(1).readU8() !== 2) return null;
+    return {
+      port: (sa.add(2).readU8() << 8) | sa.add(3).readU8(),
+      ip: `${sa.add(4).readU8()}.${sa.add(5).readU8()}.${sa.add(6).readU8()}.${sa.add(7).readU8()}`,
+    };
+  } catch (_) { return null; }
+}
+
 function isController(peer) {
   return peer && (CONTROLLER_PORTS.includes(peer.port) || DUMP_ALL);
 }
@@ -159,11 +169,18 @@ for (const [name, dir] of [['sendto', 'TX'], ['recvfrom', 'RX']]) {
   const addr = Module.findExportByName(null, name);
   if (!addr) continue;
   Interceptor.attach(addr, {
-    onEnter(args) { this.fd = args[0].toInt32(); this.buf = args[1]; this.dir = dir; },
+    onEnter(args) {
+      this.fd = args[0].toInt32();
+      this.buf = args[1];
+      this.dir = dir;
+      // sendto carries its destination at arg 4. recvfrom fills arg 4 before
+      // returning, so keep the pointer and parse it in onLeave.
+      this.sockaddr = args[4];
+    },
     onLeave(retval) {
       const n = retval.toInt32();
       if (!this.buf || n <= 0) return;
-      let peer = peerOf(this.fd);
+      const peer = ipv4Sockaddr(this.sockaddr) || peerOf(this.fd);
       if (!isController(peer) && !DUMP_ALL) return;
       const bytes = new Uint8Array(this.buf.readByteArray(n));
       report(this.dir, this.fd, peer, bytes);
@@ -204,6 +221,7 @@ if (ObjC.available) {
   // The comms methods live on JCLAppDelegate in this build.
   const argInt = (args, i) => args[i].toInt32();
   hookObjC('JCLAppDelegate', '- sendDiMessage:brightness:transition:', (a) => `channel=${argInt(a, 2)} level=${argInt(a, 3)} fade=${argInt(a, 4)}`);
+  hookObjC('JCLAppDelegate', '- sendDiM:brightness:transition:', (a) => `wire-channel=${argInt(a, 2)} level=${argInt(a, 3)} fade=${argInt(a, 4)}`);
   hookObjC('JCLAppDelegate', '- sendSwMessage:button:', (a) => `switch=${argInt(a, 2)} button=${argInt(a, 3)}`);
   hookObjC('JCLAppDelegate', '- initTCPto:onPort:', (a) => {
     try { return `host=${new ObjC.Object(a[2]).toString()} port=${a[3].toInt32()}`; } catch (e) { return ''; }
