@@ -5,8 +5,17 @@ import { discoverController } from "./discovery.mjs";
 import { parseControllerReplies } from "./controller-replies.mjs";
 import { packet } from "./protocol.mjs";
 import { authenticationRecord } from "./session.mjs";
+import { capabilityFor, SAFE_LOCAL_PROFILE } from "./controller-capabilities.mjs";
 
 const BRIDGE_PORT = Number(process.env.FLEXIDIM_BRIDGE_PORT || 8765);
+const BRIDGE_HOST = String(process.env.FLEXIDIM_BRIDGE_HOST || "127.0.0.1");
+const BRIDGE_TOKEN = String(process.env.FLEXIDIM_BRIDGE_TOKEN || "");
+const BRIDGE_ORIGINS = String(process.env.FLEXIDIM_BRIDGE_ORIGINS || "")
+  .split(",").map((value) => value.trim()).filter(Boolean);
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+if (!LOOPBACK_HOSTS.has(BRIDGE_HOST) && !BRIDGE_TOKEN) {
+  throw new Error("FLEXIDIM_BRIDGE_TOKEN is required when the bridge binds beyond loopback");
+}
 const sockets = new Set();
 const controllers = new Map();
 
@@ -125,6 +134,10 @@ function connectController(ws, host, port, securityCode) {
       controller.flexidimRxBuffer = Buffer.concat([controller.flexidimRxBuffer ?? Buffer.alloc(0), data]);
       const replies = parseControllerReplies(controller.flexidimRxBuffer);
       controller.flexidimRxBuffer = Buffer.from(replies.rest);
+      if (replies.invalid.length) {
+        log(`✗ controller reply integrity check failed [${hex(Buffer.concat(replies.invalid))}]`);
+        emit(ws, { type: "trace", message: `Controller reply failed integrity check · ${hex(Buffer.concat(replies.invalid))}` });
+      }
       if (replies.statuses.length) queueControllerStatus(ws, controller, replies.statuses);
       if (replies.visible.length) {
         const visible = Buffer.concat(replies.visible);
@@ -159,6 +172,12 @@ function handleMessage(ws, raw) {
       (message.type === "dim" ? ` (ch ${message.channel}, ${message.level}%, t=${message.transition})` : "") +
       (message.type === "switch" ? ` (sw ${message.switch}, btn ${message.button})` : ""),
   );
+  if (!capabilityFor(message.type)) {
+    return emit(ws, {
+      type: "status", state: "error",
+      message: `${message.type} is disabled by controller profile ${SAFE_LOCAL_PROFILE.id}; captured protocol evidence and recoverable hardware validation are required`,
+    });
+  }
   if (message.type === "connect") {
     connectController(ws, String(message.host || ""), Number(message.port || 15273), String(message.securityCode || ""));
     return;
@@ -180,19 +199,30 @@ function handleMessage(ws, raw) {
   else if (message.type === "switch") writeController(ws, packet(0x00, [message.switch, message.button, 0]), `Switch ${message.switch}, button ${message.button}`);
   else if (message.type === "scene") for (const [channel, level] of Object.entries(message.levels || {})) writeController(ws, packet(0x04, [channel, level, message.transition]), `Scene channel ${channel} → ${level}%`);
   else if (message.type === "periodFlags") emit(ws, { type: "status", state: "error", message: "Period flags are only available through the iOS encrypted remote-session protocol" });
-  else if (message.type === "sync") emit(ws, { type: "status", state: "error", message: "Full configuration transfer needs a verified controller-specific binary profile; live commands are unaffected" });
 }
 
 const server = http.createServer((request, response) => {
-  response.setHeader("Access-Control-Allow-Origin", "*"); response.setHeader("Content-Type", "application/json");
+  const origin = request.headers.origin;
+  if (origin && (BRIDGE_ORIGINS.includes(origin) || (LOOPBACK_HOSTS.has(BRIDGE_HOST) && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin))))
+    response.setHeader("Access-Control-Allow-Origin", origin);
+  response.setHeader("Content-Type", "application/json");
   response.end(JSON.stringify({ service: "FlexiDim local bridge", status: "ready", port: BRIDGE_PORT }));
 });
 
 server.on("upgrade", (request, socket) => {
+  const origin = String(request.headers.origin || "");
+  const token = new URL(request.url || "/", "http://bridge.local").searchParams.get("token") || "";
+  const originAllowed = !BRIDGE_ORIGINS.length || BRIDGE_ORIGINS.includes(origin) ||
+    (LOOPBACK_HOSTS.has(BRIDGE_HOST) && (!origin || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)));
+  if (!originAllowed || (BRIDGE_TOKEN && token !== BRIDGE_TOKEN)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    return socket.destroy();
+  }
   const key = request.headers["sec-websocket-key"]; if (!key) return socket.destroy();
   const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
   socket.write(["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade", `Sec-WebSocket-Accept: ${accept}`, "\r\n"].join("\r\n"));
   sockets.add(socket); let pending = Buffer.alloc(0); log("● app client connected"); emit(socket, { type: "status", state: "bridge", message: "Local FlexiDim bridge ready" });
+  emit(socket, { type: "capabilities", profile: SAFE_LOCAL_PROFILE });
   socket.on("data", (chunk) => {
     pending = Buffer.concat([pending, chunk]);
     const decoded = decodeFrames(pending); pending = decoded.rest;
@@ -215,6 +245,6 @@ server.on("error", (error) => {
   process.exit(1);
 });
 
-server.listen(BRIDGE_PORT, "127.0.0.1", () => console.log(`FlexiDim local bridge ready at ws://127.0.0.1:${BRIDGE_PORT}`));
+server.listen(BRIDGE_PORT, BRIDGE_HOST, () => console.log(`FlexiDim local bridge ready at ws://${BRIDGE_HOST}:${BRIDGE_PORT}`));
 function shutdown() { for (const socket of sockets) socket.destroy(); for (const controller of controllers.values()) controller.destroy(); server.close(); }
 process.on("SIGINT", shutdown); process.on("SIGTERM", shutdown);

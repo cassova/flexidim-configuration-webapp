@@ -9,6 +9,13 @@ export type Room = {
   parentId?: number | null;
   shortName?: string;
   areaType?: "Floor" | "Area" | "Room";
+  legacyKey?: number;
+  displayRank?: number;
+  hardwareType?: number;
+  hardwareIndex?: number;
+  legacy?: Record<string, unknown>;
+  bridgeUrl?: string;
+  bridgeToken?: string;
 };
 export type Channel = {
   id: number;
@@ -26,6 +33,16 @@ export type Channel = {
   minimum?: number;
   maximum?: number;
   defaultLevel?: number;
+  maximumPermissible?: number;
+  accessoryType?: number;
+  shortName?: string;
+  displayRank?: number;
+  hardwareType?: number;
+  channelIndex?: number;
+  dimmable?: boolean;
+  hardwareChanged?: boolean;
+  legacyKey?: number;
+  legacy?: Record<string, unknown>;
 };
 export type WallSwitch = {
   id: number;
@@ -61,6 +78,11 @@ export type WallSwitch = {
   number?: number;
   ledBrightness?: number;
   defaultBrightness?: number;
+  shortName?: string;
+  displayRank?: number;
+  hardwareType?: number;
+  legacyKey?: number;
+  legacy?: Record<string, unknown>;
 };
 export type FlexModule = {
   id: number;
@@ -68,6 +90,8 @@ export type FlexModule = {
   bus: "A" | "B";
   enabled: boolean;
   pending: boolean;
+  position?: number;
+  legacy?: Record<string, unknown>;
 };
 export type SceneGroup = {
   id: number;
@@ -84,6 +108,8 @@ export type SceneChannelSettings = {
   use100PercentTime: boolean;
   delay: number;
   flags: number;
+  color?: { red: number; green: number; blue: number };
+  kelvin?: number;
 };
 export type Scene = {
   id: number;
@@ -112,6 +138,14 @@ export type Scene = {
   stateFlag?: number;
   flags?: number;
   utility?: "extractor" | "security" | "simple";
+  legacyKey?: number;
+  displayRank?: number;
+  locked?: boolean;
+  sceneType?: number;
+  period1Mode?: "always" | "during" | "not-during";
+  period2Mode?: "none" | "and" | "or";
+  stateFlagAction?: "none" | "set" | "clear" | "require-set" | "require-clear";
+  legacy?: Record<string, unknown>;
 };
 export type Period = {
   id: number;
@@ -120,6 +154,10 @@ export type Period = {
   end: string;
   days: string[];
   enabled: boolean;
+  startMode?: number;
+  endMode?: number;
+  legacyIndex?: number;
+  legacy?: Record<string, unknown>;
 };
 export type FlexUser = {
   id: number;
@@ -127,6 +165,13 @@ export type FlexUser = {
   remote: boolean;
   changes: boolean;
   key: string;
+  legacyKey?: number;
+  securityCode?: string;
+  roomIds?: number[];
+  switchIds?: number[];
+  profileData?: string;
+  profileVersion?: number;
+  legacy?: Record<string, unknown>;
 };
 export type Assignment = {
   switchId: number;
@@ -161,6 +206,14 @@ export type Site = {
   remoteServer?: string;
   securityCode?: string;
   autoDetect?: boolean;
+  addressLines?: string[];
+  siteType?: number;
+  routerInbound?: boolean;
+  wirelessGateways?: { address: string; count: number }[];
+  moduleOrderA?: number[];
+  moduleOrderB?: number[];
+  updatedAt?: string;
+  legacy?: Record<string, unknown>;
 };
 // The editable logical model that belongs to one configuration. A site can
 // hold several configurations; the active one's content lives at the top level
@@ -186,6 +239,7 @@ export type Configuration = {
   description: string;
   lastUpdated: string;
   content?: ConfigContent;
+  legacy?: Record<string, unknown>;
 };
 
 export const CONFIG_CONTENT_KEYS = [
@@ -331,6 +385,12 @@ export function convertLegacyArchive(archive: unknown): AppData {
         parent && number(parent.ty) === 0
           ? (roomIdByKey.get(number(parent.ky)) ?? null)
           : null,
+      shortName: string(item.sn) || string(item.nm) || `Area ${index + 1}`,
+      displayRank: number(item.dr, index),
+      hardwareType: number(item.hw),
+      hardwareIndex: number(item.ix),
+      legacyKey: number(item.ky),
+      legacy: { ...item },
     };
   });
   if (!rooms.length)
@@ -378,19 +438,30 @@ export function convertLegacyArchive(archive: unknown): AppData {
       level: 0,
       moduleId: moduleNumber >= 0 ? moduleNumber : undefined,
       moduleIndex: channelIndex,
+      channelIndex,
       controllerChannel,
-      accessoryModule: "None",
-      minimum: 0,
-      maximum: 100,
-      defaultLevel: 100,
+      accessoryModule: string(item.am) || "None",
+      accessoryType: number(item.at),
+      minimum: number(item.mn),
+      maximum: number(item.mx, 100),
+      maximumPermissible: number(item.mp, 100),
+      defaultLevel: number(item.df, 100),
+      shortName: string(item.sn) || string(item.nm),
+      displayRank: number(item.dr, index),
+      hardwareType: number(item.hw),
+      dimmable: item.dm === true || number(item.dm) > 0,
+      hardwareChanged: item.hc === true || number(item.hc) > 0,
+      legacyKey: number(item.ky),
+      legacy: { ...item },
     };
   });
-  const modules: FlexModule[] = orderedModules.map((moduleId) => ({
+  const modules: FlexModule[] = orderedModules.map((moduleId, position) => ({
     id: moduleId,
     name: `Module ${moduleId}`,
     bus: "A",
     enabled: true,
     pending: false,
+    position,
   }));
 
   // Recovered from the iOS binary: "Type 15 = 8 scene : Type 13 = 4 scene :
@@ -477,6 +548,11 @@ export function convertLegacyArchive(archive: unknown): AppData {
       // sendSwMessage: receives JCLFDHardware.index, not the switch's
       // position in the configuration's logical list.
       number: number(item.ix, index + 1),
+      shortName: string(item.sn) || string(item.nm),
+      displayRank: number(item.dr, index),
+      hardwareType: type,
+      legacyKey: number(item.ky),
+      legacy: { hardware: { ...item }, settings: settings ? { ...settings } : undefined },
       basic: {
         channelIds,
         assignOn: firstChannel?.assignOn ?? false,
@@ -594,6 +670,11 @@ export function convertLegacyArchive(archive: unknown): AppData {
       period2: number(item.p2),
       stateFlag: number(item.sf),
       flags: number(item.fl),
+      legacyKey: number(item.ky),
+      displayRank: number(item.dr, index),
+      locked: number(item.lk) > 0,
+      sceneType: number(item.ty),
+      legacy: { ...item },
     };
   };
   const scenes: Scene[] = leafScenes.map(mapScene);
@@ -630,21 +711,43 @@ export function convertLegacyArchive(archive: unknown): AppData {
       {
         id: index + 1,
         name,
-        start: minutes(item.sm),
-        end: minutes(item.em),
+        // The archive keys are st/et for time and sm/em for the independent
+        // sunrise/sunset/absolute modes. Older builds accidentally treated
+        // the mode values as clock minutes.
+        start: minutes(item.st),
+        end: minutes(item.et),
         days: allDays,
         enabled: true,
+        startMode: number(item.sm),
+        endMode: number(item.em),
+        legacyIndex: number(item.ix, index),
+        legacy: { ...item },
       },
     ];
   });
 
-  const users: FlexUser[] = instances("JCLFDUser").map((item, index) => ({
-    id: index + 1,
-    name: string(item.nm) || `User ${index + 1}`,
-    remote: number(item.rc) > 0,
-    changes: number(item.ve) > 0,
-    key: string(item.sk),
-  }));
+  const users: FlexUser[] = instances("JCLFDUser").map((item, index) => {
+    const roomKeys = Object.keys(item)
+      .filter((key) => /^rm\d+$/.test(key))
+      .map((key) => number(item[key]));
+    return {
+      id: index + 1,
+      name: string(item.nm) || `User ${index + 1}`,
+      remote: false,
+      changes: true,
+      key: string(item.sc),
+      securityCode: string(item.sc),
+      legacyKey: number(item.ky),
+      roomIds: roomKeys.flatMap((key) => {
+        const roomId = roomIdByKey.get(key);
+        return roomId ? [roomId] : [];
+      }),
+      switchIds: [],
+      profileData: string(item.ud),
+      profileVersion: number(item.ve),
+      legacy: { ...item },
+    };
+  });
 
   // Site fields are stored as positional NSKeyedArchiver entries ($1..$N) in
   // the app's encode order, recovered from the iOS binary:
@@ -652,8 +755,8 @@ export function convertLegacyArchive(archive: unknown): AppData {
   //   $9 siteID  $10 security code  $11 IP  $12 auto-detect  $14 last updated
   //   $15 longitude  $16 latitude  $17 time zone  $18 router inbound
   //   $19 DST rules  $28 remote server
-  const address = ["$2", "$3", "$4", "$5"]
-    .map((key) => topString(key))
+  const addressLines = ["$2", "$3", "$4", "$5"].map((key) => topString(key));
+  const address = addressLines
     .filter(Boolean)
     .join(", ");
   const dstRaw = topString("$19");
@@ -694,6 +797,18 @@ export function convertLegacyArchive(archive: unknown): AppData {
     remoteServer: topString("$28"),
     securityCode: topString("$10"),
     autoDetect: topString("$12") !== "0" && topNumber("$12") !== 0,
+    addressLines,
+    siteType: topNumber("$13"),
+    routerInbound: Boolean(routerRaw) && routerRaw !== "0",
+    wirelessGateways: [0, 1, 2, 3].flatMap((index) => {
+      const address = topString(`$${20 + index * 2}`);
+      const count = topNumber(`$${21 + index * 2}`);
+      return address ? [{ address, count }] : [];
+    }),
+    moduleOrderA: archivedModules,
+    moduleOrderB: [],
+    updatedAt: lastUpdated,
+    legacy: { top: { ...top } },
   };
   return {
     site,

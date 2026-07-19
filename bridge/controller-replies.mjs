@@ -5,6 +5,7 @@
 export function parseControllerReplies(buffer) {
   const statuses = [];
   const visible = [];
+  const invalid = [];
   let offset = 0;
 
   while (offset < buffer.length) {
@@ -18,6 +19,13 @@ export function parseControllerReplies(buffer) {
     }
     if (offset + length > buffer.length) break;
     const record = buffer.subarray(offset, offset + length);
+    const expected = record.subarray(0, -1).reduce((sum, byte) => (sum + byte) & 0xff, 0);
+    if (record.at(-1) !== expected) {
+      invalid.push(record);
+      visible.push(record);
+      offset += length;
+      continue;
+    }
     if (kind === 0xf2) {
       statuses.push({
         // Status addresses are zero-based; webapp/controller TX addresses are
@@ -31,5 +39,5 @@ export function parseControllerReplies(buffer) {
     offset += length;
   }
 
-  return { statuses, visible, rest: buffer.subarray(offset) };
+  return { statuses, visible, invalid, rest: buffer.subarray(offset) };
 }

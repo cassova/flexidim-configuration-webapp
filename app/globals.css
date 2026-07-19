@@ -3034,3 +3034,37 @@ footer {
     transform: translateY(0);
   }
 }
+
+.scene-colour-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.scene-colour-control img {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+.scene-colour-control input[type="color"] {
+  width: 64px;
+  height: 42px;
+}
+.user-access-editor {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 7px 14px;
+  padding: 12px;
+  border-radius: 10px;
+  background: #f5f3ef;
+}
+.user-access-editor strong {
+  grid-column: 1 / -1;
+  color: var(--red);
+}
+.user-access-editor label {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+}

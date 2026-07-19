@@ -6,6 +6,7 @@ import { controllerChannelAddress } from "../app/flexidim-addressing.mjs";
 import { defaultOnOffCommands, rawControllerButton } from "../app/live-switch.mjs";
 import { authenticationRecord } from "../bridge/session.mjs";
 import { parseControllerReplies } from "../bridge/controller-replies.mjs";
+import { capabilityFor, SAFE_LOCAL_PROFILE } from "../bridge/controller-capabilities.mjs";
 
 test("separates quiet f2 level synchronization from visible controller replies", () => {
   const mixed = Buffer.from([
@@ -26,6 +27,13 @@ test("buffers an incomplete f2 status record across TCP chunks", () => {
   const parsed = parseControllerReplies(Buffer.from([0xf2, 0x10, 0x64]));
   assert.deepEqual(parsed.statuses, []);
   assert.deepEqual([...parsed.rest], [0xf2, 0x10, 0x64]);
+});
+
+test("rejects controller records whose additive integrity byte is wrong", () => {
+  const parsed = parseControllerReplies(Buffer.from([0xf2, 0x10, 0x64, 0x00]));
+  assert.deepEqual(parsed.statuses, []);
+  assert.equal(parsed.invalid.length, 1);
+  assert.deepEqual([...parsed.invalid[0]], [0xf2, 0x10, 0x64, 0x00]);
 });
 
 test("builds the site-type-0 authentication record used before iOS commands", () => {
@@ -105,4 +113,12 @@ test("uses the discovery protocol recovered from the iOS binary", () => {
   assert.equal(FLEXIDIM_DISCOVERY_MESSAGE, "FLEX");
   assert.equal(FLEXIDIM_DISCOVERY_PORT, 15270);
   assert.equal(FLEXIDIM_DISCOVERY_REPLY_PORT, 15001);
+});
+
+test("keeps unverified commissioning writes denied by default", () => {
+  assert.equal(capabilityFor("dim"), true);
+  assert.equal(capabilityFor("switch"), true);
+  assert.equal(capabilityFor("sync"), false);
+  assert.equal(capabilityFor("moduleProfiles"), false);
+  assert.equal(SAFE_LOCAL_PROFILE.fullTransfer, false);
 });

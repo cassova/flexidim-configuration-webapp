@@ -206,7 +206,7 @@ client must request.
 | `f2` | Channel-status record type |
 | address | Zero-based controller address |
 | level | Current brightness, normally `00`–`64` |
-| check | One-byte integrity value; algorithm not yet documented |
+| check | Low byte of the sum of every preceding record byte |
 
 The receive address is one less than the transmit address:
 
@@ -230,7 +230,7 @@ controller status synchronized: 128 channel reports, N level changes
 Five-byte `f4` and `f5` records arrive immediately after accepted dim commands.
 They contain the affected zero-based address and resulting level. Captures show
 both types for each changed channel, but their distinct internal roles and
-one-byte integrity algorithms are not yet proven. They remain visible in trace
+their final byte is the low byte of the sum of every preceding byte. They remain visible in trace
 logs as command/state acknowledgements.
 
 Example response to four channels set to 100%:
@@ -257,6 +257,12 @@ The browser sends JSON messages over the loopback WebSocket:
 | `switch` | `switch`, `button` | Build and send command `00` |
 | `scene` | `levels`, `transition` | Send one dim frame per entry |
 | `sync` | configuration data | Currently refused; see below |
+
+The bridge advertises a deny-by-default controller capability profile. The
+baseline `type-0-live-only` profile permits only verified live dim/switch and
+passive status behavior. Detection, profiles, verification, blind commands,
+remote sessions, and full transfer remain disabled until a hardware-specific
+profile supplies captured and tested evidence.
 
 The bridge sends:
 
@@ -476,6 +482,7 @@ independent of the full-transfer path and safe to test normally.
 | CRC, escaping, client frames | `bridge/protocol.mjs` |
 | `f2`/`f4`/`f5` receive parsing | `bridge/controller-replies.mjs` |
 | WebSocket/TCP bridge | `bridge/server.mjs` |
+| Deny-by-default controller profile | `bridge/controller-capabilities.mjs` |
 | `.fd4cfg` conversion | `app/fd4cfg.ts` |
 | Channel address calculation | `app/flexidim-addressing.mjs` |
 | Built-in switch behavior | `app/live-switch.mjs` |
@@ -485,7 +492,6 @@ independent of the full-transfer path and safe to test normally.
 
 ## Open protocol questions
 
-- What checksum algorithm is used by `f2`, `f4`, and `f5` records?
 - What distinct roles do `f4` and `f5` play?
 - What are the exact verification/CRC request and response frames?
 - What are the compiled image's sections, sizes, offsets, and version markers?

@@ -68,6 +68,12 @@ FlexiDim Scene Controller :15273
 
 The bridge listens on loopback only. It is not exposed to other devices on the LAN and does not route lighting data through a cloud service.
 
+For an iPad or another computer, the Sites screen can instead use a configurable
+`ws://`/`wss://` companion address and pairing token. Binding the bridge beyond
+loopback requires `FLEXIDIM_BRIDGE_TOKEN`; use `FLEXIDIM_BRIDGE_ORIGINS` to list
+allowed web origins and terminate TLS in a trusted local reverse proxy for
+`wss://`. Unauthenticated non-loopback startup is refused.
+
 See [protocol.md](protocol.md) for the recovered discovery, authentication,
 framing, live-command, controller-status, configuration-archive, comparison,
 and whole-controller-transfer details, including confidence and safety limits.
@@ -83,10 +89,12 @@ and whole-controller-transfer details, including confidence and safety limits.
 - Scene-to-button assignment and testing
 - Browser-local automatic configuration persistence
 - Portable JSON configuration backup and restore
+- Recovered DST rule-table parsing and sunrise/sunset calculation
 - Installer-access warning and explicit `FLEXIDIM` unlock flow
 - Trace view for connections, commands, packets, and controller responses
 - Installable PWA manifest and offline application shell
 - Local Scene Controller bridge
+- Configurable paired bridge endpoint for an iPad/companion deployment
 - Recovered legacy packet framing and CRC-16/X25 implementation
 - Desktop, tablet, and mobile layouts
 
