@@ -10,13 +10,13 @@ Scene Controller, decode it, and debug the webapp against it.
 | `controller-emulator.mjs` | Fake Scene Controller — debug the webapp/bridge with no hardware. |
 | `controller-probe.mjs` | One-socket, zero-or-one-frame probe for isolating controller disconnects without the web app. |
 
-## Why the FritzBox packet trace was empty
+## Why a packet trace on the router is empty
 
-The iPad and the controller were both plugged into the FritzBox. The LAN ports
-on a FritzBox (like any consumer router) are a **hardware switch**: frames
-between two LAN devices are forwarded in silicon and never reach the CPU that
-the packet-capture tool taps. So the trace only ever shows traffic to/from the
-FritzBox itself — never iPad↔controller. This is expected, not a bug.
+The iPad and the controller were both plugged into the router. The LAN ports
+on a consumer router are a **hardware switch**: frames between two LAN devices
+are forwarded in silicon and never reach the CPU that the packet-capture tool
+taps. So the trace only ever shows traffic to/from the router itself — never
+iPad↔controller. This is expected, not a bug.
 
 Reliable capture points, in order of preference:
 1. **On the iPad** (Frida or tcpdump) — you have the jailbreak, so do this.
