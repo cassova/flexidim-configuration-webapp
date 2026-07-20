@@ -80,7 +80,7 @@ loopback requires `FLEXIDIM_BRIDGE_TOKEN`; use `FLEXIDIM_BRIDGE_ORIGINS` to list
 allowed web origins and terminate TLS in a trusted local reverse proxy for
 `wss://`. Unauthenticated non-loopback startup is refused.
 
-See [protocol.md](protocol.md) for the recovered discovery, authentication,
+See [PROTOCOL_.md](PROTOCOL.md) for the recovered discovery, authentication,
 framing, live-command, controller-status, configuration-archive, comparison,
 and whole-controller-transfer details, including confidence and safety limits.
 
