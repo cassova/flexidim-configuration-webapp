@@ -17,6 +17,12 @@ import {
   type SceneGroup,
   type Site,
   type WallSwitch,
+  mergeImportedSite,
+  normalizeSiteTimeZone,
+  stringifyConfiguration,
+  isStarterSite,
+  upsertImportedConfiguration,
+  siteImportDetailsEqual,
 } from "./fd4cfg";
 import { controllerChannelAddress } from "./flexidim-addressing.mjs";
 import { defaultOnOffCommands, rawControllerButton } from "./live-switch.mjs";
@@ -433,15 +439,20 @@ function newId(items: { id: number }[]) {
   return Math.max(0, ...items.map((item) => item.id)) + 1;
 }
 function now() {
-  return new Date().toLocaleTimeString([], {
+  return new Date().toLocaleTimeString("en-GB", {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
+    hourCycle: "h23",
   });
 }
 function generateSecurityKey() {
   const bytes = crypto.getRandomValues(new Uint8Array(8));
   return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function validControllerSecurityCode(value?: string) {
+  return typeof value === "string" && /^[\x20-\x7e]{16}$/.test(value);
 }
 
 function restoreAreaHierarchy(data: AppData): AppData {
@@ -602,6 +613,7 @@ function restoreAreaHierarchy(data: AppData): AppData {
       wirelessGateways: data.site.wirelessGateways ?? [],
       bridgeUrl: data.site.bridgeUrl ?? "ws://127.0.0.1:8765",
       bridgeToken: data.site.bridgeToken ?? "",
+      timezone: normalizeSiteTimeZone(data.site.timezone, data.site.dst),
     },
   };
 }
@@ -664,7 +676,7 @@ export default function FlexiDimWeb() {
     "offline" | "bridge" | "connecting" | "connected" | "error"
   >("offline");
   const [trace, setTrace] = useState<TraceItem[]>([
-    { at: now(), text: "FlexiDim Web ready" },
+    { at: "—", text: "FlexiDim Web ready" },
   ]);
   const [installer, setInstaller] = useState(false);
   const [allowEquipment, setAllowEquipment] = useState(false);
@@ -698,7 +710,7 @@ export default function FlexiDimWeb() {
 
   useEffect(() => {
     if (hydrated.current)
-      localStorage.setItem("flexidim-web-data", JSON.stringify({
+      localStorage.setItem("flexidim-web-data", stringifyConfiguration({
         format: "FlexiDim Web Local Data", schemaVersion: STORAGE_VERSION, data,
       }));
   }, [data]);
@@ -803,6 +815,12 @@ export default function FlexiDimWeb() {
   const connect = () => {
     if ((data.site.siteType ?? 0) !== 0) {
       notify("Remote and encrypted controller sessions are not enabled until their protocol profile is verified", "warn");
+      return;
+    }
+    if (!validControllerSecurityCode(data.site.securityCode)) {
+      setTab("Sites");
+      setConnection("error");
+      notify("Enter the controller's 16-character ASCII security code in Sites → Network & Remote before connecting", "warn");
       return;
     }
     socket.current?.close();
@@ -1134,6 +1152,47 @@ export default function FlexiDimWeb() {
     });
     setConnection("offline");
     notify(`Site “${site.name}” created`, "ok");
+  };
+
+  const deleteSite = (siteId: string) => {
+    const site = (data.sites?.length ? data.sites : [data.site]).find(
+      (candidate) => candidate.id === siteId,
+    );
+    if (!site || !window.confirm(`Delete site “${site.name}” and all of its configurations?`)) return;
+    socket.current?.close();
+    setConnection("offline");
+    setData((old) => {
+      const allSites = old.sites?.length ? old.sites : [old.site];
+      if (allSites.length <= 1) return old;
+      const sites = allSites.filter((candidate) => candidate.id !== siteId);
+      const outgoing = snapshotContent(old);
+      const configurations = (old.configurations ?? [])
+        .map((configuration) =>
+          configuration.id === old.activeConfigId
+            ? { ...configuration, content: outgoing }
+            : configuration,
+        )
+        .filter((configuration) => configuration.siteId !== siteId);
+      if (old.site.id !== siteId) return { ...old, sites, configurations };
+      const nextSite = sites[0];
+      const nextConfiguration = configurations.find(
+        (configuration) => configuration.siteId === nextSite.id,
+      );
+      const content = nextConfiguration?.content ?? emptyConfigContent();
+      return {
+        ...old,
+        ...content,
+        site: nextSite,
+        sites,
+        activeConfigId: nextConfiguration?.id,
+        configurations: configurations.map((configuration) =>
+          configuration.id === nextConfiguration?.id
+            ? { ...configuration, content: undefined }
+            : configuration,
+        ),
+      };
+    });
+    notify(`Site “${site.name}” deleted`, "ok");
   };
 
   const setChangesAllowed = (allowed: boolean) => {
@@ -1504,7 +1563,7 @@ export default function FlexiDimWeb() {
     });
     setData((old) => {
       let created: Scene[] = [];
-      let assignments = [...old.assignments];
+      const assignments = [...old.assignments];
       if (utility === "simple") {
         for (const room of old.rooms) {
           const wallSwitch = old.switches.find((item) => item.roomId === room.id && item.basic?.channelIds.length);
@@ -1815,14 +1874,13 @@ export default function FlexiDimWeb() {
   const exportConfig = () => {
     const blob = new Blob(
       [
-        JSON.stringify(
+        stringifyConfiguration(
           {
             format: "FlexiDim Web Configuration",
             version: 1,
             exportedAt: new Date().toISOString(),
             data,
           },
-          null,
           2,
         ),
       ],
@@ -1877,39 +1935,65 @@ export default function FlexiDimWeb() {
         const sameName = sites.find((site) => site.name.toLocaleLowerCase() === imported.site.name.toLocaleLowerCase());
         let targetSite = imported.site;
         if (sameId) {
-          const importedDate = new Date(imported.site.updatedAt ?? 0).getTime();
-          const currentDate = new Date(sameId.updatedAt ?? 0).getTime();
-          const useImported = window.confirm(
-            `A site with ID ${sameId.id} already exists. ${importedDate > currentDate ? "The imported site details are newer." : currentDate > importedDate ? "The saved site details are newer." : "The timestamps match."} Use the imported site details?`,
-          );
-          targetSite = useImported ? imported.site : sameId;
+          if (siteImportDetailsEqual(sameId, imported.site)) {
+            targetSite = mergeImportedSite(sameId, imported.site, true);
+          } else {
+            const importedDate = new Date(imported.site.updatedAt ?? 0).getTime();
+            const currentDate = new Date(sameId.updatedAt ?? 0).getTime();
+            const freshness = importedDate && currentDate
+              ? importedDate > currentDate
+                ? "The imported site details are newer."
+                : currentDate > importedDate
+                  ? "The saved site details are newer."
+                  : "The timestamps match, but the site details differ."
+              : "The imported and saved site details differ.";
+            const useImported = window.confirm(
+              `A site with ID ${sameId.id} already exists. ${freshness} The matching configuration will be refreshed rather than duplicated. Use the imported site details too?`,
+            );
+            targetSite = mergeImportedSite(sameId, imported.site, useImported);
+          }
         } else if (sameName) {
           window.alert("The imported site has an existing name but a different Site ID, so a new site will be created.");
         }
         setData((old) => {
           const outgoing = snapshotContent(old);
-          const oldConfigs = (old.configurations ?? []).map((config) =>
-            config.id === old.activeConfigId ? { ...config, content: outgoing } : config);
-          const newConfigId = Math.max(0, ...oldConfigs.map((config) => config.id)) + 1;
           const importedConfig = imported.configurations?.[0];
+          const configurationName = importedConfig?.name ?? `${targetSite.name} import`;
+          const existingSites = old.sites?.length ? old.sites : [old.site];
+          const starterSiteIds = new Set(
+            existingSites
+              .filter((site) => site.id !== targetSite.id && isStarterSite(site, old.configurations ?? []))
+              .map((site) => site.id),
+          );
+          let configurations = (old.configurations ?? [])
+            .map((config) =>
+              config.id === old.activeConfigId ? { ...config, content: outgoing } : config)
+            .filter((config) => !starterSiteIds.has(config.siteId));
           const configuration: Configuration = {
-            id: newConfigId,
+            id: 0,
             siteId: targetSite.id,
-            name: importedConfig?.name ?? `${targetSite.name} import`,
+            name: configurationName,
             description: importedConfig?.description ?? `Imported from ${file.name}`,
             lastUpdated: importedConfig?.lastUpdated ?? new Date().toISOString(),
           };
-          const existingSites = old.sites?.length ? old.sites : [old.site];
-          const nextSites = existingSites.some((site) => site.id === targetSite.id)
-            ? existingSites.map((site) => site.id === targetSite.id ? targetSite : site)
-            : [...existingSites, targetSite];
+          const upserted = upsertImportedConfiguration(
+            configurations,
+            configuration,
+            old.activeConfigId,
+          );
+          configurations = upserted.configurations;
+          const configurationId = upserted.configurationId;
+          const retainedSites = existingSites.filter((site) => !starterSiteIds.has(site.id));
+          const nextSites = retainedSites.some((site) => site.id === targetSite.id)
+            ? retainedSites.map((site) => site.id === targetSite.id ? targetSite : site)
+            : [...retainedSites, targetSite];
           return {
             ...old,
             ...snapshotContent(imported),
             site: targetSite,
             sites: nextSites,
-            configurations: [...oldConfigs, configuration],
-            activeConfigId: newConfigId,
+            configurations,
+            activeConfigId: configurationId,
           };
         });
       } else {
@@ -2021,7 +2105,7 @@ export default function FlexiDimWeb() {
     const parsed = new Date(iso);
     return Number.isNaN(parsed.getTime())
       ? iso
-      : parsed.toLocaleDateString(undefined, {
+      : parsed.toLocaleDateString("en-GB", {
           year: "numeric",
           month: "short",
           day: "numeric",
@@ -2033,8 +2117,11 @@ export default function FlexiDimWeb() {
     ? solarTimes(new Date(), latitudeValue, longitudeValue)
     : { sunrise: undefined, sunset: undefined };
   const formatSiteTime = (date?: Date) => date
-    ? new Intl.DateTimeFormat(undefined, {
-        hour: "2-digit", minute: "2-digit", timeZone: data.site.timezone || undefined,
+    ? new Intl.DateTimeFormat("en-GB", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+        timeZone: normalizeSiteTimeZone(data.site.timezone, data.site.dst),
       }).format(date)
     : "—";
   const locateSite = () => {
@@ -2089,6 +2176,15 @@ export default function FlexiDimWeb() {
           <span className={`status-pill ${connection}`}>
             ● {connectionLabel}
           </span>
+          {availableSites.length > 1 && (
+            <button
+              className="delete"
+              disabled={!installer}
+              onClick={() => deleteSite(data.site.id)}
+            >
+              Delete site
+            </button>
+          )}
         </div>
         <div className="site-hero">
           <img src="/flexidim/sites.png" alt="" />
@@ -2296,13 +2392,20 @@ export default function FlexiDimWeb() {
             />
           </Field>
           <Field
-            label="Security code"
-            help="The security key used for remote connections to this site."
+            label="Controller security code"
+            help="Required for every type-0 controller connection. Import it from the site's .fd4cfg file or enter the controller's 16-character ASCII key."
           >
             <input
+              type="password"
               value={data.site.securityCode ?? ""}
               disabled={!installer}
-              placeholder="Optional"
+              required
+              minLength={16}
+              maxLength={16}
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="Required — 16 characters"
+              aria-invalid={Boolean(data.site.securityCode) && !validControllerSecurityCode(data.site.securityCode)}
               onChange={(e) => updateSite({ securityCode: e.target.value })}
             />
           </Field>
@@ -2343,7 +2446,6 @@ export default function FlexiDimWeb() {
           </div>
           <button
             className="config-import"
-            disabled={!installer}
             onClick={() => fileInput.current?.click()}
           >
             Import

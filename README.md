@@ -68,6 +68,12 @@ FlexiDim Scene Controller :15273
 
 The bridge listens on loopback only. It is not exposed to other devices on the LAN and does not route lighting data through a cloud service.
 
+Type-0 controllers require the site's 16-character ASCII security code before
+they accept a session. Importing the original `.fd4cfg` file restores this value.
+For a manually created site, turn on **Allow changes** and enter it under
+**Sites → Network & Remote → Controller security code**. The user-profile keys
+on the Users tab are separate credentials and cannot replace the site key.
+
 For an iPad or another computer, the Sites screen can instead use a configurable
 `ws://`/`wss://` companion address and pairing token. Binding the bridge beyond
 loopback requires `FLEXIDIM_BRIDGE_TOKEN`; use `FLEXIDIM_BRIDGE_ORIGINS` to list

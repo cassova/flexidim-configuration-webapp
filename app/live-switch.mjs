@@ -17,7 +17,10 @@ export function defaultOnOffCommands(wallSwitch, channels) {
   if (!basic?.channelIds?.length) return [];
   const byId = new Map(channels.map((channel) => [channel.id, channel]));
   const stateChannels = basic.channelIds
-    .filter((id) => basic.channelSettings?.[id]?.assignOff ?? basic.assignOff)
+    // Decide from the outputs this action actually turns on. An Off-only
+    // channel legitimately remains at 0% after the On press and must not force
+    // every subsequent press back into the On branch.
+    .filter((id) => basic.channelSettings?.[id]?.assignOn ?? basic.assignOn)
     .map((id) => byId.get(id))
     .filter(Boolean);
   // This mirrors the app's Default On/Off decision: only turn off when every

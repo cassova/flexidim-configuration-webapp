@@ -24,6 +24,11 @@ test("configuration picker accepts original iOS backups", async () => {
   const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.match(source, /accept="[^"]*\.fd4cfg/i);
   assert.match(source, /parseLegacyFd4Config\(await file\.arrayBuffer\(\)\)/);
+  assert.doesNotMatch(
+    source,
+    /className="config-import"\s+disabled=/,
+    "configuration import must remain available before installer unlock",
+  );
 });
 
 test("retains the iOS navigation order and drill-down configuration hierarchy", async () => {
@@ -45,7 +50,7 @@ test("retains the iOS navigation order and drill-down configuration hierarchy", 
   assert.match(page, /className="area-tier area-drilldown"/);
   assert.match(page, /setAreaMenuParent\(null\)/);
   assert.match(page, /‹ Floors/);
-  assert.match(page, /restoreAreaHierarchy\(JSON\.parse\(saved\)\)/);
+  assert.match(page, /restoreAreaHierarchy\(value\)/);
   assert.match(page, /visibleSceneGroups/);
   assert.match(page, /setSceneGroupId\(group\.id\)/);
   assert.match(page, /className="scene-info-button"/);
@@ -154,7 +159,7 @@ test("provides the recovered equipment browser and hardware editors", async () =
     "LED brightness",
     "Default brightness",
     "Resend all configuration information",
-    "Email configuration details",
+    "Export configuration details",
   ]) assert.match(page, new RegExp(label));
   assert.match(page, /Edit \$\{area\.name\} information/);
   assert.match(page, /moveToDeleted/);

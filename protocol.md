@@ -168,9 +168,11 @@ There is no separate live-scene frame in the implemented path. Running a scene
 expands its channel levels into one dim frame per affected channel.
 
 The built-in **Default on/off** action similarly expands the switch's Basic
-Assignment channels. It sends 100% unless every participating output is already
-at 100%; otherwise it sends 0%. Per-channel assignment flags and fade times are
-honored. This is one logical action but multiple wire frames.
+Assignment channels. It sends 100% unless every On-assigned output is already
+at 100%; otherwise it sends 0% to every Off-assigned output. Off-only outputs
+do not participate in the state decision because the On press intentionally
+leaves them unchanged. Per-channel assignment flags and fade times are honored.
+This is one logical action but multiple wire frames.
 
 ### Channel addressing — hardware verified
 
@@ -206,7 +208,7 @@ client must request.
 | `f2` | Channel-status record type |
 | address | Zero-based controller address |
 | level | Current brightness, normally `00`–`64` |
-| check | Low byte of the sum of every preceding record byte |
+| check | Low seven bits of the sum of every preceding record byte |
 
 The receive address is one less than the transmit address:
 
@@ -230,7 +232,7 @@ controller status synchronized: 128 channel reports, N level changes
 Five-byte `f4` and `f5` records arrive immediately after accepted dim commands.
 They contain the affected zero-based address and resulting level. Captures show
 both types for each changed channel, but their distinct internal roles and
-their final byte is the low byte of the sum of every preceding byte. They remain visible in trace
+their final byte is the low seven bits of the sum of every preceding byte. They remain visible in trace
 logs as command/state acknowledgements.
 
 Example response to four channels set to 100%:

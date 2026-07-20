@@ -29,10 +29,27 @@ test("buffers an incomplete f2 status record across TCP chunks", () => {
   assert.deepEqual([...parsed.rest], [0xf2, 0x10, 0x64]);
 });
 
+test("accepts the controller's seven-bit f2 integrity values", () => {
+  const parsed = parseControllerReplies(Buffer.from([
+    0xf2, 0x00, 0x00, 0x72,
+    0xf2, 0x01, 0x00, 0x73,
+    0xf2, 0x02, 0x00, 0x74,
+    0xf2, 0x03, 0x00, 0x75,
+  ]));
+  assert.deepEqual(parsed.statuses, [
+    { channel: 1, level: 0 },
+    { channel: 2, level: 0 },
+    { channel: 3, level: 0 },
+    { channel: 4, level: 0 },
+  ]);
+  assert.deepEqual(parsed.invalid, []);
+});
+
 test("rejects controller records whose additive integrity byte is wrong", () => {
   const parsed = parseControllerReplies(Buffer.from([0xf2, 0x10, 0x64, 0x00]));
   assert.deepEqual(parsed.statuses, []);
   assert.equal(parsed.invalid.length, 1);
+  assert.equal(parsed.visible.length, 0);
   assert.deepEqual([...parsed.invalid[0]], [0xf2, 0x10, 0x64, 0x00]);
 });
 
@@ -72,29 +89,51 @@ test("maps shifted built-in plate buttons to iOS wire button numbers", () => {
   assert.equal(rawControllerButton(7, 7), 8);
 });
 
-test("expands live Default on/off into basic-assignment dim commands", () => {
+test("Default on/off ignores Off-only channels when choosing the next state", () => {
+  // Off-only channels intentionally remain at 0% after an On press. They must
+  // not prevent the next press from choosing Off, but must receive that Off
+  // command. The uneven groups ensure the behavior is driven by assignment
+  // flags rather than a fixed channel count or ordering.
+  const onAndOffChannelIds = [101, 205, 309];
+  const offOnlyChannelIds = [407, 503];
+  const channelIds = [...onAndOffChannelIds, ...offOnlyChannelIds];
   const wallSwitch = {
     basic: {
-      channelIds: [22, 20, 16, 2],
+      channelIds,
       assignOn: true,
       assignOff: true,
       onTime: 0.5,
       offTime: 0.5,
-      channelSettings: {},
+      channelSettings: {
+        407: { assignOn: false, assignOff: true },
+        503: { assignOn: false, assignOff: true },
+      },
     },
   };
-  const off = [22, 20, 16, 2].map((id) => ({ id, level: 0 }));
-  assert.deepEqual(defaultOnOffCommands(wallSwitch, off), [
-    { id: 22, level: 100, transition: 1 },
-    { id: 20, level: 100, transition: 1 },
-    { id: 16, level: 100, transition: 1 },
-    { id: 2, level: 100, transition: 1 },
-  ]);
-  const on = off.map((channel) => ({ ...channel, level: 100 }));
+  const channels = channelIds.map((id) => ({ id, level: 0 }));
+
+  const firstPress = defaultOnOffCommands(wallSwitch, channels);
+  assert.deepEqual(firstPress, onAndOffChannelIds.map((id) => ({
+    id,
+    level: 100,
+    transition: 1,
+  })));
+
+  const afterFirstPress = channels.map((channel) => {
+    const command = firstPress.find(({ id }) => id === channel.id);
+    return command ? { ...channel, level: command.level } : channel;
+  });
   assert.deepEqual(
-    defaultOnOffCommands(wallSwitch, on).map(({ level }) => level),
-    [0, 0, 0, 0],
+    offOnlyChannelIds.map((id) => afterFirstPress.find((channel) => channel.id === id)?.level),
+    [0, 0],
   );
+
+  const secondPress = defaultOnOffCommands(wallSwitch, afterFirstPress);
+  assert.deepEqual(secondPress, channelIds.map((id) => ({
+    id,
+    level: 0,
+    transition: 1,
+  })));
 });
 
 test("builds a bounded controller scan from private LAN interfaces", () => {

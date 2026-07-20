@@ -19,10 +19,11 @@ export function parseControllerReplies(buffer) {
     }
     if (offset + length > buffer.length) break;
     const record = buffer.subarray(offset, offset + length);
-    const expected = record.subarray(0, -1).reduce((sum, byte) => (sum + byte) & 0xff, 0);
+    // Controller reply checks are seven-bit additive values. This matters for
+    // f2 records: f2 03 00 sums to f5, whose transmitted check is 75.
+    const expected = record.subarray(0, -1).reduce((sum, byte) => (sum + byte) & 0x7f, 0);
     if (record.at(-1) !== expected) {
       invalid.push(record);
-      visible.push(record);
       offset += length;
       continue;
     }

@@ -14,8 +14,6 @@ export type Room = {
   hardwareType?: number;
   hardwareIndex?: number;
   legacy?: Record<string, unknown>;
-  bridgeUrl?: string;
-  bridgeToken?: string;
 };
 export type Channel = {
   id: number;
@@ -214,7 +212,99 @@ export type Site = {
   moduleOrderB?: number[];
   updatedAt?: string;
   legacy?: Record<string, unknown>;
+  bridgeUrl?: string;
+  bridgeToken?: string;
 };
+
+function isIanaTimeZone(value: string) {
+  try {
+    new Intl.DateTimeFormat("en-GB", { timeZone: value }).format(0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Convert legacy numeric/invalid timezone values into a render-safe IANA ID. */
+export function normalizeSiteTimeZone(
+  value: unknown,
+  dst: string,
+  fallback = Intl.DateTimeFormat().resolvedOptions().timeZone,
+) {
+  const candidate = typeof value === "string" ? value.trim() : "";
+  if (candidate && isIanaTimeZone(candidate)) return candidate;
+  if (/uk|europe/i.test(dst)) return "Europe/London";
+  if (/no daylight|none/i.test(dst) && Number(candidate) === 0) return "UTC";
+  return fallback && isIanaTimeZone(fallback) ? fallback : "UTC";
+}
+
+/** Serialize imported configuration data, including BigInts from binary plists. */
+export function stringifyConfiguration(value: unknown, space?: number) {
+  return JSON.stringify(
+    value,
+    (_key, item) => {
+      if (typeof item !== "bigint") return item;
+      const numeric = Number(item);
+      return Number.isSafeInteger(numeric) ? numeric : item.toString();
+    },
+    space,
+  );
+}
+
+const validControllerSecurityCode = (value?: string) =>
+  typeof value === "string" && /^[\x20-\x7e]{16}$/.test(value);
+
+/**
+ * Merge an imported iOS site with the browser's existing site record.
+ * Controller credentials come from the valid record and must not be lost when
+ * the user elects to retain newer local site details. Bridge connection values
+ * are browser-local and are therefore always retained from the current site.
+ */
+export function mergeImportedSite(
+  current: Site,
+  imported: Site,
+  useImportedDetails: boolean,
+): Site {
+  const merged = useImportedDetails ? { ...imported } : { ...current };
+  if (!validControllerSecurityCode(merged.securityCode)) {
+    const fallback = useImportedDetails ? current.securityCode : imported.securityCode;
+    if (validControllerSecurityCode(fallback)) merged.securityCode = fallback;
+  }
+  merged.bridgeUrl = current.bridgeUrl ?? imported.bridgeUrl;
+  merged.bridgeToken = current.bridgeToken ?? imported.bridgeToken;
+  return merged;
+}
+
+/** Compare only portable site fields; ignore timestamps, raw archive and local bridge settings. */
+export function siteImportDetailsEqual(left: Site, right: Site) {
+  const comparable = (site: Site) => ({
+    name: site.name,
+    id: site.id,
+    ip: site.ip,
+    port: site.port,
+    routerPort: site.routerPort ?? null,
+    description: site.description,
+    address: site.address,
+    contact: site.contact ?? "",
+    email: site.email ?? "",
+    phone: site.phone ?? "",
+    latitude: site.latitude ?? "",
+    longitude: site.longitude ?? "",
+    timezone: site.timezone,
+    dst: site.dst,
+    remote: site.remote,
+    remoteServer: site.remoteServer ?? "",
+    securityCode: site.securityCode ?? "",
+    autoDetect: site.autoDetect ?? true,
+    addressLines: site.addressLines ?? [],
+    siteType: site.siteType ?? 0,
+    routerInbound: site.routerInbound ?? false,
+    wirelessGateways: site.wirelessGateways ?? [],
+    moduleOrderA: site.moduleOrderA ?? [],
+    moduleOrderB: site.moduleOrderB ?? [],
+  });
+  return stringifyConfiguration(comparable(left)) === stringifyConfiguration(comparable(right));
+}
 // The editable logical model that belongs to one configuration. A site can
 // hold several configurations; the active one's content lives at the top level
 // of AppData, and the others are snapshotted into Configuration.content.
@@ -273,6 +363,55 @@ export type AppData = {
   modules?: FlexModule[];
   deletedItems?: DeletedItem[];
 };
+
+/** True only for the untouched demo site created before a real import. */
+export function isStarterSite(
+  site: Site,
+  configurations: Configuration[],
+) {
+  const siteConfigurations = configurations.filter(
+    (configuration) => configuration.siteId === site.id,
+  );
+  return (
+    site.id === "FD4-0001" &&
+    site.name === "Home" &&
+    site.description === "FlexiDim lighting system" &&
+    !site.securityCode &&
+    !site.legacy &&
+    siteConfigurations.length === 1 &&
+    siteConfigurations[0].name === "Home"
+  );
+}
+
+/** Replace a same-site, same-name import and collapse duplicates from older builds. */
+export function upsertImportedConfiguration(
+  configurations: Configuration[],
+  imported: Configuration,
+  activeConfigId?: number,
+) {
+  const matching = configurations.filter(
+    (configuration) =>
+      configuration.siteId === imported.siteId &&
+      configuration.name === imported.name,
+  );
+  const configurationId =
+    matching.find((configuration) => configuration.id === activeConfigId)?.id ??
+    matching[0]?.id ??
+    Math.max(0, ...configurations.map((configuration) => configuration.id)) + 1;
+  return {
+    configurationId,
+    configurations: [
+      ...configurations.filter(
+        (configuration) =>
+          !(
+            configuration.siteId === imported.siteId &&
+            configuration.name === imported.name
+          ),
+      ),
+      { ...imported, id: configurationId },
+    ],
+  };
+}
 
 type ArchiveObject = Record<string, unknown>;
 type UID = { CF$UID?: number; UID?: number };
@@ -774,7 +913,7 @@ export function convertLegacyArchive(archive: unknown): AppData {
   const lastUpdated =
     updatedRaw && !Number.isNaN(updatedDate.getTime())
       ? updatedDate.toISOString()
-      : new Date().toISOString();
+      : "";
   const site: Site = {
     name: topString("$1") || "Imported FlexiDim site",
     id: topString("$9") || "FD4",
@@ -788,10 +927,7 @@ export function convertLegacyArchive(archive: unknown): AppData {
     phone: topString("$7"),
     latitude: topString("$16"),
     longitude: topString("$15"),
-    timezone:
-      topString("$17") ||
-      Intl.DateTimeFormat().resolvedOptions().timeZone ||
-      "Europe/London",
+    timezone: normalizeSiteTimeZone(topString("$17"), dst),
     dst,
     remote: Boolean(topString("$28")),
     remoteServer: topString("$28"),
