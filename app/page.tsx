@@ -3,13 +3,23 @@
 import { ChangeEvent, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
+  canonicalizeAppData,
+  buildUserProfileData,
+  controllerConnectionRequest,
+  emptyConfigContent,
+  isFlexiDimWorkspace,
+  materializeAppData,
+  mergeLegacyBrowserConnectionState,
+  orderUserAccess,
   parseLegacyFd4Config,
   CONFIG_CONTENT_KEYS,
+  deleteConfigEntity,
   type AppData,
   type Configuration,
   type ConfigContent,
   type DeletedItem,
   type FlexModule,
+  type FlexiDimWorkspace,
   type Channel,
   type Room,
   type Scene,
@@ -23,6 +33,8 @@ import {
   isStarterSite,
   upsertImportedConfiguration,
   siteImportDetailsEqual,
+  updateUserProfile,
+  validateConfigContent,
 } from "./fd4cfg";
 import { controllerChannelAddress } from "./flexidim-addressing.mjs";
 import { defaultOnOffCommands, rawControllerButton } from "./live-switch.mjs";
@@ -127,7 +139,7 @@ const initialData: AppData = {
     siteType: 0,
     routerInbound: false,
     wirelessGateways: [],
-    bridgeUrl: "ws://127.0.0.1:8765",
+    bridgeUrl: "/bridge",
     bridgeToken: "",
   },
   configurations: [
@@ -611,20 +623,10 @@ function restoreAreaHierarchy(data: AppData): AppData {
       siteType: data.site.siteType ?? 0,
       routerInbound: data.site.routerInbound ?? Boolean(data.site.routerPort),
       wirelessGateways: data.site.wirelessGateways ?? [],
-      bridgeUrl: data.site.bridgeUrl ?? "ws://127.0.0.1:8765",
+      bridgeUrl: data.site.bridgeUrl ?? "/bridge",
       bridgeToken: data.site.bridgeToken ?? "",
       timezone: normalizeSiteTimeZone(data.site.timezone, data.site.dst),
     },
-  };
-}
-
-const STORAGE_VERSION = 2;
-
-function emptyConfigContent(): ConfigContent {
-  return {
-    rooms: [], channels: [], switches: [], sceneGroups: [], scenes: [],
-    deletedScenes: [], periods: [], users: [], assignments: [], modules: [],
-    deletedItems: [],
   };
 }
 
@@ -638,7 +640,19 @@ function looksLikeAppData(value: unknown): value is AppData {
 }
 
 export default function FlexiDimWeb() {
-  const [data, setData] = useState<AppData>(initialData);
+  const [workspace, setWorkspace] = useState<FlexiDimWorkspace>(() =>
+    canonicalizeAppData(initialData),
+  );
+  const data = materializeAppData(workspace);
+  const setData = (
+    update: AppData | ((previous: AppData) => AppData),
+  ) =>
+    setWorkspace((previousWorkspace) => {
+      const previous = materializeAppData(previousWorkspace);
+      const next =
+        typeof update === "function" ? update(previous) : update;
+      return canonicalizeAppData(next);
+    });
   const [tab, setTab] = useState<Tab>("Sites");
   const [selectedScene, setSelectedScene] = useState(2);
   const [selectedRoom, setSelectedRoom] = useState(1);
@@ -687,50 +701,14 @@ export default function FlexiDimWeb() {
   const connectionRef = useRef(connection);
   const socket = useRef<WebSocket | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
-  const hydrated = useRef(false);
+  const serverReady = useRef(false);
+  const serverRevision = useRef(0);
+  const lastSyncedWorkspace = useRef("");
+  const pendingWorkspace = useRef<FlexiDimWorkspace | null>(null);
+  const workspaceSaveInFlight = useRef(false);
+  const workspaceSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [storageLoaded, setStorageLoaded] = useState(false);
   const [dstYearRule, setDstYearRule] = useState<DstYearRule | null>(null);
-
-  useEffect(() => {
-    const saved = localStorage.getItem("flexidim-web-data");
-    if (saved) {
-      try {
-        const stored = JSON.parse(saved);
-        const value = stored?.format === "FlexiDim Web Local Data" ? stored.data : stored;
-        if (!looksLikeAppData(value)) throw new Error("Invalid saved configuration");
-        const parsed = restoreAreaHierarchy(value);
-        window.setTimeout(() => setData(parsed), 0);
-      } catch {
-        /* keep safe defaults */
-      }
-    }
-    hydrated.current = true;
-    navigator.serviceWorker?.register("/sw.js").catch(() => undefined);
-    return () => socket.current?.close();
-  }, []);
-
-  useEffect(() => {
-    if (hydrated.current)
-      localStorage.setItem("flexidim-web-data", stringifyConfiguration({
-        format: "FlexiDim Web Local Data", schemaVersion: STORAGE_VERSION, data,
-      }));
-  }, [data]);
-
-  useEffect(() => {
-    let active = true;
-    loadDstRuleSet(data.site.dst)
-      .then((set) => {
-        if (!active) return;
-        const year = new Date().getUTCFullYear();
-        setDstYearRule(set.rules.find((rule) => rule.year === year) ?? null);
-      })
-      .catch(() => active && setDstYearRule(null));
-    return () => { active = false; };
-  }, [data.site.dst]);
-
-  useEffect(() => {
-    connectionRef.current = connection;
-  }, [connection]);
-
   const addTrace = (text: string, tone?: "ok" | "warn") =>
     setTrace((items) => [{ at: now(), text, tone }, ...items].slice(0, 150));
   const showToast = (text: string, tone?: "ok" | "warn") => {
@@ -748,6 +726,193 @@ export default function FlexiDimWeb() {
     addTrace(text, tone);
     showToast(text, tone);
   };
+
+  useEffect(() => {
+    let active = true;
+    let migrationWorkspace = workspace;
+    let legacyBrowserWorkspace: FlexiDimWorkspace | undefined;
+    const saved = localStorage.getItem("flexidim-web-data");
+    if (saved)
+      try {
+        const stored = JSON.parse(saved);
+        const value = stored?.format === "FlexiDim Web Local Data" ? stored.data : stored;
+        const restored = isFlexiDimWorkspace(value)
+          ? value
+          : looksLikeAppData(value)
+            ? canonicalizeAppData(restoreAreaHierarchy(value))
+            : undefined;
+        if (!restored) throw new Error("Invalid saved configuration");
+        migrationWorkspace = restored;
+        legacyBrowserWorkspace = restored;
+      } catch {
+        /* Ignore an invalid legacy browser copy and retain safe defaults. */
+      }
+
+    const loadWorkspace = async () => {
+      try {
+        const response = await fetch("/api/workspace", {
+          headers: { accept: "application/json" },
+          cache: "no-store",
+        });
+        if (!response.ok)
+          throw new Error(`Server returned ${response.status}`);
+        const payload = await response.json();
+        let authoritative = migrationWorkspace;
+        let revision = Number(payload.revision) || 0;
+        if (payload.workspace != null) {
+          if (!isFlexiDimWorkspace(payload.workspace))
+            throw new Error("The server returned an invalid workspace");
+          authoritative = payload.workspace;
+          if (legacyBrowserWorkspace) {
+            const merged = mergeLegacyBrowserConnectionState(
+              authoritative,
+              legacyBrowserWorkspace,
+            );
+            if (
+              stringifyConfiguration(merged) !==
+              stringifyConfiguration(authoritative)
+            ) {
+              const migrationResponse = await fetch("/api/workspace", {
+                method: "PUT",
+                headers: { "content-type": "application/json" },
+                body: stringifyConfiguration({
+                  workspace: merged,
+                  expectedRevision: revision,
+                }),
+              });
+              const migrated = await migrationResponse.json();
+              if (!migrationResponse.ok)
+                throw new Error(
+                  migrated.error ??
+                    "Could not migrate the working browser connection settings",
+                );
+              authoritative = merged;
+              revision = Number(migrated.revision);
+            }
+          }
+        } else {
+          const createResponse = await fetch("/api/workspace", {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: stringifyConfiguration({
+              workspace: migrationWorkspace,
+              expectedRevision: 0,
+            }),
+          });
+          const created = await createResponse.json();
+          if (!createResponse.ok)
+            throw new Error(created.error ?? "Could not create the server workspace");
+          revision = Number(created.revision);
+        }
+        if (!active) return;
+        serverRevision.current = revision;
+        lastSyncedWorkspace.current = stringifyConfiguration(authoritative);
+        setWorkspace(authoritative);
+        serverReady.current = true;
+        setStorageLoaded(true);
+        localStorage.removeItem("flexidim-web-data");
+        if (payload.workspace != null)
+          showToast("Configuration loaded from the server", "ok");
+      } catch (error) {
+        if (!active) return;
+        notify(
+          `Server storage unavailable: ${
+            error instanceof Error ? error.message : "unknown error"
+          }`,
+          "warn",
+        );
+      }
+    };
+    void loadWorkspace();
+    navigator.serviceWorker
+      ?.register("/sw.js", { updateViaCache: "none" })
+      .then((registration) => registration.update())
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      socket.current?.close();
+    };
+    // The initial workspace is intentionally captured once as a migration
+    // candidate for installations upgrading from browser-only storage.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const flushWorkspaceToServer = async () => {
+    if (workspaceSaveInFlight.current || !serverReady.current) return;
+    const next = pendingWorkspace.current;
+    if (!next) return;
+    pendingWorkspace.current = null;
+    const serialized = stringifyConfiguration(next);
+    if (serialized === lastSyncedWorkspace.current) return;
+    workspaceSaveInFlight.current = true;
+    try {
+      const response = await fetch("/api/workspace", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: stringifyConfiguration({
+          workspace: next,
+          expectedRevision: serverRevision.current,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok)
+        throw new Error(
+          response.status === 409
+            ? "Another browser changed this configuration; reload before saving again"
+            : (payload.error ?? `Server returned ${response.status}`),
+        );
+      serverRevision.current = Number(payload.revision);
+      lastSyncedWorkspace.current = serialized;
+    } catch (error) {
+      notify(
+        `Configuration not saved: ${
+          error instanceof Error ? error.message : "unknown error"
+        }`,
+        "warn",
+      );
+    } finally {
+      workspaceSaveInFlight.current = false;
+      if (pendingWorkspace.current) void flushWorkspaceToServer();
+    }
+  };
+
+  useEffect(() => {
+    if (!serverReady.current) return;
+    if (
+      stringifyConfiguration(workspace) === lastSyncedWorkspace.current
+    )
+      return;
+    pendingWorkspace.current = workspace;
+    if (workspaceSaveTimer.current)
+      window.clearTimeout(workspaceSaveTimer.current);
+    workspaceSaveTimer.current = window.setTimeout(
+      () => void flushWorkspaceToServer(),
+      500,
+    );
+    return () => {
+      if (workspaceSaveTimer.current)
+        window.clearTimeout(workspaceSaveTimer.current);
+    };
+    // flushWorkspaceToServer deliberately reads the latest refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace]);
+
+  useEffect(() => {
+    let active = true;
+    loadDstRuleSet(data.site.dst)
+      .then((set) => {
+        if (!active) return;
+        const year = new Date().getUTCFullYear();
+        setDstYearRule(set.rules.find((rule) => rule.year === year) ?? null);
+      })
+      .catch(() => active && setDstYearRule(null));
+    return () => { active = false; };
+  }, [data.site.dst]);
+
+  useEffect(() => {
+    connectionRef.current = connection;
+  }, [connection]);
+
   const roomName = (id: number) =>
     data.rooms.find((room) => room.id === id)?.name ?? "Unassigned";
   const rootAreas = data.rooms.filter(
@@ -813,8 +978,8 @@ export default function FlexiDimWeb() {
   };
 
   const connect = () => {
-    if ((data.site.siteType ?? 0) !== 0) {
-      notify("Remote and encrypted controller sessions are not enabled until their protocol profile is verified", "warn");
+    if (!storageLoaded) {
+      notify("The saved configuration is still loading; try Connect again in a moment", "warn");
       return;
     }
     if (!validControllerSecurityCode(data.site.securityCode)) {
@@ -823,12 +988,36 @@ export default function FlexiDimWeb() {
       notify("Enter the controller's 16-character ASCII security code in Sites → Network & Remote before connecting", "warn");
       return;
     }
+    let controllerRequest;
+    try {
+      controllerRequest = controllerConnectionRequest(data.site);
+    } catch (error) {
+      setConnection("error");
+      notify(
+        error instanceof Error ? error.message : "Invalid controller connection settings",
+        "warn",
+      );
+      return;
+    }
     socket.current?.close();
     setConnection("connecting");
-    notify(`Connecting to the Scene Controller on port ${data.site.port}…`);
+    notify(
+      controllerRequest.type === "discover"
+        ? `Searching the local network for a Scene Controller on port ${controllerRequest.port}…`
+        : `Connecting to the Scene Controller at ${controllerRequest.host}:${controllerRequest.port}…`,
+    );
     let bridgeUrl: URL;
     try {
-      bridgeUrl = new URL(data.site.bridgeUrl || "ws://127.0.0.1:8765");
+      const configuredBridgeUrl = (data.site.bridgeUrl || "").trim();
+      const useServerBridge =
+        !configuredBridgeUrl ||
+        configuredBridgeUrl === "/bridge" ||
+        configuredBridgeUrl === "ws://127.0.0.1:8765";
+      bridgeUrl = useServerBridge
+        ? new URL("/bridge", window.location.href)
+        : new URL(configuredBridgeUrl);
+      if (bridgeUrl.protocol === "http:") bridgeUrl.protocol = "ws:";
+      if (bridgeUrl.protocol === "https:") bridgeUrl.protocol = "wss:";
       if (!/^wss?:$/.test(bridgeUrl.protocol)) throw new Error();
     } catch {
       notify("Enter a valid ws:// or wss:// bridge address", "warn");
@@ -840,14 +1029,7 @@ export default function FlexiDimWeb() {
     socket.current = ws;
     ws.onopen = () => {
       setConnection("bridge");
-      ws.send(
-        JSON.stringify({
-          type: data.site.autoDetect === false ? "connect" : "discover",
-          host: data.site.ip,
-          port: data.site.port,
-          securityCode: data.site.securityCode,
-        }),
-      );
+      ws.send(JSON.stringify(controllerRequest));
     };
     ws.onmessage = (event) => {
       try {
@@ -1126,7 +1308,7 @@ export default function FlexiDimWeb() {
       siteType: 0,
       routerInbound: false,
       wirelessGateways: [],
-      bridgeUrl: data.site.bridgeUrl ?? "ws://127.0.0.1:8765",
+      bridgeUrl: data.site.bridgeUrl ?? "/bridge",
       bridgeToken: "",
     };
     setData((old) => {
@@ -1288,11 +1470,18 @@ export default function FlexiDimWeb() {
   const deleteConfiguration = (id: number) =>
     setData((old) => {
       const configs = old.configurations ?? [];
-      if (configs.length <= 1) return old;
+      const target = configs.find((config) => config.id === id);
+      if (
+        !target ||
+        configs.filter((config) => config.siteId === target.siteId).length <= 1
+      )
+        return old;
       const remaining = configs.filter((config) => config.id !== id);
       if (id !== old.activeConfigId)
         return { ...old, configurations: remaining };
-      const next = remaining[0];
+      const next =
+        remaining.find((config) => config.siteId === target.siteId) ??
+        remaining[0];
       const content = next.content ?? snapshotContent(old);
       return {
         ...old,
@@ -1353,13 +1542,27 @@ export default function FlexiDimWeb() {
     setEquipmentSelection({ type: "module", id });
   };
 
-  const updateRoom = (id: number, patch: Partial<Room>) =>
+  const updateRoom = (id: number, patch: Partial<Room>) => {
+    if (patch.parentId != null) {
+      const roomById = new Map(data.rooms.map((room) => [room.id, room]));
+      const visited = new Set([id]);
+      let parentId: number | null | undefined = patch.parentId;
+      while (parentId != null) {
+        if (visited.has(parentId)) {
+          window.alert("An area cannot be moved beneath one of its descendants.");
+          return;
+        }
+        visited.add(parentId);
+        parentId = roomById.get(parentId)?.parentId;
+      }
+    }
     setData((old) => ({
       ...old,
       rooms: old.rooms.map((room) =>
         room.id === id ? { ...room, ...patch } : room,
       ),
     }));
+  };
   const updateChannel = (id: number, patch: Partial<Channel>) =>
     setData((old) => {
       const modules = [...(old.modules ?? equipmentModules)].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
@@ -1427,47 +1630,21 @@ export default function FlexiDimWeb() {
       return;
     }
     setData((old) => {
-      const removedChannelId = deleted.type === "light" ? deleted.item.id : undefined;
-      const removedSwitchId = deleted.type === "switch" ? deleted.item.id : undefined;
+      const entityType = {
+        area: "room",
+        light: "channel",
+        switch: "switch",
+        module: "module",
+      } as const;
+      const content = deleteConfigEntity(
+        snapshotContent(old),
+        entityType[deleted.type],
+        deleted.item.id,
+      );
       return {
-      ...old,
-      rooms:
-        deleted.type === "area"
-          ? old.rooms.filter((item) => item.id !== deleted.item.id)
-          : old.rooms,
-      channels:
-        deleted.type === "light"
-          ? old.channels.filter((item) => item.id !== deleted.item.id)
-          : old.channels,
-      modules:
-        deleted.type === "module"
-          ? (old.modules ?? equipmentModules).filter(
-              (item) => item.id !== deleted.item.id,
-            )
-          : old.modules,
-      deletedItems: [...(old.deletedItems ?? []), deleted],
-      scenes: removedChannelId ? old.scenes.map((scene) => {
-        const levels = { ...scene.levels };
-        const channelSettings = { ...scene.channelSettings };
-        delete levels[removedChannelId];
-        delete channelSettings[removedChannelId];
-        return { ...scene, levels, channelSettings };
-      }) : old.scenes,
-      assignments: old.assignments.filter((assignment) =>
-        assignment.switchId !== removedSwitchId && assignment.channelId !== removedChannelId &&
-        assignment.secondChannelId !== removedChannelId && !(assignment.channelIds ?? []).includes(removedChannelId ?? -1)),
-      switches: (removedChannelId
-        ? old.switches.map((wallSwitch) => wallSwitch.basic ? {
-            ...wallSwitch,
-            basic: {
-              ...wallSwitch.basic,
-              channelIds: wallSwitch.basic.channelIds.filter((id) => id !== removedChannelId),
-              channelSettings: Object.fromEntries(Object.entries(wallSwitch.basic.channelSettings ?? {}).filter(([id]) => Number(id) !== removedChannelId)),
-            },
-          } : wallSwitch)
-        : deleted.type === "switch"
-          ? old.switches.filter((item) => item.id !== deleted.item.id)
-          : old.switches),
+        ...old,
+        ...content,
+        deletedItems: [...content.deletedItems, deleted],
       };
     });
     setEquipmentSelection(null);
@@ -1631,21 +1808,14 @@ export default function FlexiDimWeb() {
   };
 
   const moveSceneToDeleted = (scene: Scene) => {
-    setData((old) => ({
-      ...old,
-      scenes: old.scenes.filter((item) => item.id !== scene.id).map((item) => ({
-        ...item,
-        nextSceneId: item.nextSceneId === scene.id ? undefined : item.nextSceneId,
-        previousSceneId: item.previousSceneId === scene.id ? undefined : item.previousSceneId,
-        extenderSceneId: item.extenderSceneId === scene.id ? undefined : item.extenderSceneId,
-      })),
-      deletedScenes: [...(old.deletedScenes ?? []), scene],
-      assignments: old.assignments.map((assignment) => ({
-        ...assignment,
-        sceneId: assignment.sceneId === scene.id ? undefined : assignment.sceneId,
-        secondSceneId: assignment.secondSceneId === scene.id ? undefined : assignment.secondSceneId,
-      })),
-    }));
+    setData((old) => {
+      const content = deleteConfigEntity(snapshotContent(old), "scene", scene.id);
+      return {
+        ...old,
+        ...content,
+        deletedScenes: [...content.deletedScenes, scene],
+      };
+    });
     setSelectedScene(0);
     notify(`${scene.name} moved to Deleted scenes`, "warn");
   };
@@ -1877,9 +2047,9 @@ export default function FlexiDimWeb() {
         stringifyConfiguration(
           {
             format: "FlexiDim Web Configuration",
-            version: 1,
+            version: 2,
             exportedAt: new Date().toISOString(),
-            data,
+            data: workspace,
           },
           2,
         ),
@@ -1909,6 +2079,32 @@ export default function FlexiDimWeb() {
     URL.revokeObjectURL(url);
     notify("Hardware CSV exported", "ok");
   };
+  const exportUserKeys = () => {
+    const payload = {
+      format: "FlexiDim Web User Keys",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      siteId: data.site.id,
+      users: data.users.map((user) => ({
+        id: user.id,
+        name: user.name,
+        securityCode: user.securityCode ?? user.key,
+        profileVersion: user.profileVersion ?? 0,
+        profileData: user.profileData ?? buildUserProfileData(user),
+      })),
+    };
+    const url = URL.createObjectURL(
+      new Blob([stringifyConfiguration(payload, 2)], {
+        type: "application/json",
+      }),
+    );
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${data.site.name.replace(/\s+/g, "-").toLowerCase()}-user-keys.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    notify("User security keys exported", "ok");
+  };
 
   const flashChannel = (channel: Channel) => {
     const original = channel.level;
@@ -1919,6 +2115,23 @@ export default function FlexiDimWeb() {
   const importConfig = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
+    const reportImportEvent = (
+      status: "started" | "succeeded" | "failed",
+      details: Record<string, unknown> = {},
+    ) => {
+      void fetch("/api/events", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          event: "configuration-import",
+          status,
+          fileName: file.name,
+          fileSize: file.size,
+          ...details,
+        }),
+      }).catch(() => undefined);
+    };
+    reportImportEvent("started");
     try {
       let imported: AppData;
       const legacyFile = /\.fd4(cfg|xlt)$/i.test(file.name);
@@ -1926,9 +2139,33 @@ export default function FlexiDimWeb() {
         imported = parseLegacyFd4Config(await file.arrayBuffer());
       else {
         const parsed = JSON.parse(await file.text());
-        imported = restoreAreaHierarchy(parsed.data ?? parsed);
+        const value = parsed.data ?? parsed;
+        if (isFlexiDimWorkspace(value)) {
+          for (const site of value.sites) {
+            for (const configuration of site.configurations) {
+              const issues = validateConfigContent(configuration.content);
+              if (issues.length) {
+                throw new Error(
+                  `Configuration contains invalid references: ${issues[0]}`,
+                );
+              }
+            }
+          }
+          imported = materializeAppData(value);
+        } else {
+          if (!looksLikeAppData(value))
+            throw new Error("Invalid web configuration");
+          imported = value;
+        }
+        imported = restoreAreaHierarchy(imported);
       }
       imported = restoreAreaHierarchy(imported);
+      const integrityIssues = validateConfigContent(snapshotContent(imported));
+      if (integrityIssues.length) {
+        throw new Error(
+          `Configuration contains invalid references: ${integrityIssues[0]}`,
+        );
+      }
       if (legacyFile) {
         const sites = data.sites?.length ? data.sites : [data.site];
         const sameId = sites.find((site) => site.id === imported.site.id);
@@ -2018,9 +2255,22 @@ export default function FlexiDimWeb() {
       setSceneButtonRoom(null);
       setEquipmentSection("areas");
       setEquipmentSelection(null);
+      reportImportEvent("succeeded", {
+        rooms: imported.rooms.length,
+        channels: imported.channels.length,
+        switches: imported.switches.length,
+        scenes: imported.scenes.length,
+        periods: imported.periods.length,
+        users: imported.users.length,
+      });
       notify(`Imported configuration from ${file.name}`, "ok");
-    } catch {
-      notify("That configuration file could not be read", "warn");
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unknown configuration import error";
+      reportImportEvent("failed", { message });
+      notify(`Configuration import failed: ${message}`, "warn");
     }
     event.target.value = "";
   };
@@ -2081,7 +2331,9 @@ export default function FlexiDimWeb() {
     setEquipmentSelection({ type: "switch", id });
   };
   const connectionLabel =
-    connection === "connected"
+    !storageLoaded
+      ? "Loading…"
+      : connection === "connected"
       ? "Connected"
       : connection === "connecting"
         ? "Connecting…"
@@ -2201,6 +2453,7 @@ export default function FlexiDimWeb() {
           <Field label="Scene Controller IP">
             <input
               value={data.site.ip}
+              disabled={!storageLoaded}
               onChange={(e) => updateSite({ ip: e.target.value })}
               inputMode="decimal"
             />
@@ -2209,10 +2462,11 @@ export default function FlexiDimWeb() {
             <input
               type="number"
               value={data.site.port}
+              disabled={!storageLoaded}
               onChange={(e) => updateSite({ port: Number(e.target.value) })}
             />
           </Field>
-          <button className="primary" onClick={connect}>
+          <button className="primary" disabled={!storageLoaded} onClick={connect}>
             {connection === "connected" ? "Reconnect" : "Connect"}
           </button>
         </div>
@@ -2330,7 +2584,7 @@ export default function FlexiDimWeb() {
             </select>
           </Field>
         </div>
-        <div className="button-row compact">
+        <div className="button-row compact site-location-actions">
           <button disabled={!installer} onClick={locateSite}>Use current location</button>
           <span className="version">
             Sunrise {formatSiteTime(todaySolar.sunrise)} · Sunset {formatSiteTime(todaySolar.sunset)}
@@ -2364,7 +2618,7 @@ export default function FlexiDimWeb() {
             />
           </Field>
           <Field label="Local bridge address" help="Use loopback on the bridge computer, or an authenticated wss:// companion address from an iPad.">
-            <input value={data.site.bridgeUrl ?? "ws://127.0.0.1:8765"} disabled={!installer} onChange={(event) => updateSite({ bridgeUrl: event.target.value })} />
+            <input value={data.site.bridgeUrl ?? "/bridge"} disabled={!installer} onChange={(event) => updateSite({ bridgeUrl: event.target.value })} />
           </Field>
           <Field label="Bridge pairing token" help="Required when the bridge is intentionally exposed through an authenticated LAN/WSS companion.">
             <input type="password" value={data.site.bridgeToken ?? ""} disabled={!installer} onChange={(event) => updateSite({ bridgeToken: event.target.value })} />
@@ -2409,14 +2663,14 @@ export default function FlexiDimWeb() {
               onChange={(e) => updateSite({ securityCode: e.target.value })}
             />
           </Field>
+          <Field label="Controller site type" help="The protocol generation used by this Scene Controller.">
+            <select value={data.site.siteType ?? 0} disabled={!installer} onChange={(event) => updateSite({ siteType: Number(event.target.value) })}>
+              <option value="0">Type 0 — local plaintext</option>
+              <option value="1">Type 1 — remote (not yet available)</option>
+              <option value="2">Type 2 — encrypted remote (not yet available)</option>
+            </select>
+          </Field>
         </div>
-        <Field label="Controller site type" help="The protocol generation used by this Scene Controller.">
-          <select value={data.site.siteType ?? 0} disabled={!installer} onChange={(event) => updateSite({ siteType: Number(event.target.value) })}>
-            <option value="0">Type 0 — local plaintext</option>
-            <option value="1">Type 1 — remote (not yet available)</option>
-            <option value="2">Type 2 — encrypted remote (not yet available)</option>
-          </select>
-        </Field>
         <Toggle label="Router inbound enabled" help="Use the configured router-forwarded port for supported remote access." checked={data.site.routerInbound ?? false} disabled={!installer} onChange={(routerInbound) => updateSite({ routerInbound })} />
         <Toggle
           label="Enable remote access"
@@ -5058,7 +5312,11 @@ export default function FlexiDimWeb() {
                 onClick={() =>
                   setData((old) => ({
                     ...old,
-                    periods: old.periods.filter((p) => p.id !== period.id),
+                    ...deleteConfigEntity(
+                      snapshotContent(old),
+                      "period",
+                      period.id,
+                    ),
                   }))
                 }
               >
@@ -5070,6 +5328,25 @@ export default function FlexiDimWeb() {
       </section>
     </div>
   );
+
+  const moveUserAccess = (
+    userId: number,
+    field: "roomIds" | "switchIds",
+    accessId: number,
+    direction: -1 | 1,
+  ) =>
+    setData((old) => ({
+      ...old,
+      users: old.users.map((user) => {
+        if (user.id !== userId) return user;
+        const ordered = [...(user[field] ?? [])];
+        const from = ordered.indexOf(accessId);
+        const to = from + direction;
+        if (from < 0 || to < 0 || to >= ordered.length) return user;
+        [ordered[from], ordered[to]] = [ordered[to], ordered[from]];
+        return updateUserProfile(user, { [field]: ordered });
+      }),
+    }));
 
   const usersPanel = (
     <div className="content-grid users-grid">
@@ -5083,23 +5360,24 @@ export default function FlexiDimWeb() {
             className="primary"
             disabled={!installer}
             onClick={() => {
-              setData((old) => ({
-                ...old,
-                users: [
-                  ...old.users,
+              setData((old) => {
+                const key = generateSecurityKey();
+                const user = updateUserProfile(
                   {
                     id: newId(old.users),
                     name: "New user",
                     remote: false,
                     changes: false,
-                    key: generateSecurityKey(),
-                    securityCode: "",
+                    key,
+                    securityCode: key,
                     roomIds: [],
                     switchIds: [],
-                    profileVersion: 1,
+                    profileVersion: 0,
                   },
-                ],
-              }));
+                  {},
+                );
+                return { ...old, users: [...old.users, user] };
+              });
               notify("New user created", "ok");
             }}
           >
@@ -5117,17 +5395,23 @@ export default function FlexiDimWeb() {
                   setData((old) => ({
                     ...old,
                     users: old.users.map((u) =>
-                      u.id === user.id ? { ...u, name: e.target.value } : u,
+                      u.id === user.id
+                        ? updateUserProfile(u, { name: e.target.value })
+                        : u,
                     ),
                   }))
                 }
               />
               <code>{user.key}</code>
+              <small>
+                Profile v{user.profileVersion ?? 0} ·{" "}
+                {user.profileStatus ?? (user.profileData ? "current" : "not generated")}
+              </small>
               <button disabled={!installer} onClick={() => {
                 const key = generateSecurityKey();
                 setData((old) => ({
                   ...old, users: old.users.map((item) => item.id === user.id
-                    ? { ...item, key, securityCode: key, profileVersion: (item.profileVersion ?? 0) + 1 }
+                    ? updateUserProfile(item, { key, securityCode: key })
                     : item),
                 }));
               }}>Generate security key</button>
@@ -5139,7 +5423,7 @@ export default function FlexiDimWeb() {
                   setData((old) => ({
                     ...old,
                     users: old.users.map((u) =>
-                      u.id === user.id ? { ...u, remote } : u,
+                      u.id === user.id ? updateUserProfile(u, { remote }) : u,
                     ),
                   }))
                 }
@@ -5152,7 +5436,7 @@ export default function FlexiDimWeb() {
                   setData((old) => ({
                     ...old,
                     users: old.users.map((u) =>
-                      u.id === user.id ? { ...u, changes } : u,
+                      u.id === user.id ? updateUserProfile(u, { changes }) : u,
                     ),
                   }))
                 }
@@ -5163,7 +5447,11 @@ export default function FlexiDimWeb() {
                 onClick={() =>
                   setData((old) => ({
                     ...old,
-                    users: old.users.filter((u) => u.id !== user.id),
+                    ...deleteConfigEntity(
+                      snapshotContent(old),
+                      "user",
+                      user.id,
+                    ),
                   }))
                 }
               >
@@ -5171,33 +5459,84 @@ export default function FlexiDimWeb() {
               </button>
               <div className="user-access-editor">
                 <strong>Rooms</strong>
-                {data.rooms.map((room) => (
+                {orderUserAccess(data.rooms, user.roomIds).map((room) => (
                   <label key={room.id}>
                     <input type="checkbox" disabled={!installer} checked={user.roomIds?.includes(room.id) ?? false} onChange={(event) => setData((old) => ({
                       ...old, users: old.users.map((item) => item.id === user.id ? {
-                        ...item,
-                        roomIds: event.target.checked
-                          ? [...(item.roomIds ?? []), room.id]
-                          : (item.roomIds ?? []).filter((id) => id !== room.id),
-                        profileVersion: (item.profileVersion ?? 0) + 1,
+                        ...updateUserProfile(item, {
+                          roomIds: event.target.checked
+                            ? [...(item.roomIds ?? []), room.id]
+                            : (item.roomIds ?? []).filter((id) => id !== room.id),
+                        }),
                       } : item),
                     }))} />
                     {room.name}
+                    {user.roomIds?.includes(room.id) && (
+                      <span>
+                        <button
+                          type="button"
+                          disabled={!installer || user.roomIds.indexOf(room.id) === 0}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            moveUserAccess(user.id, "roomIds", room.id, -1);
+                          }}
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!installer || user.roomIds.indexOf(room.id) === user.roomIds.length - 1}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            moveUserAccess(user.id, "roomIds", room.id, 1);
+                          }}
+                        >
+                          ↓
+                        </button>
+                      </span>
+                    )}
                   </label>
                 ))}
                 <strong>Switches</strong>
-                {data.switches.filter((wallSwitch) => !user.roomIds?.length || user.roomIds.includes(wallSwitch.roomId)).map((wallSwitch) => (
+                {orderUserAccess(
+                  data.switches.filter((wallSwitch) => !user.roomIds?.length || user.roomIds.includes(wallSwitch.roomId)),
+                  user.switchIds,
+                ).map((wallSwitch) => (
                   <label key={wallSwitch.id}>
                     <input type="checkbox" disabled={!installer} checked={user.switchIds?.includes(wallSwitch.id) ?? false} onChange={(event) => setData((old) => ({
                       ...old, users: old.users.map((item) => item.id === user.id ? {
-                        ...item,
-                        switchIds: event.target.checked
-                          ? [...(item.switchIds ?? []), wallSwitch.id]
-                          : (item.switchIds ?? []).filter((id) => id !== wallSwitch.id),
-                        profileVersion: (item.profileVersion ?? 0) + 1,
+                        ...updateUserProfile(item, {
+                          switchIds: event.target.checked
+                            ? [...(item.switchIds ?? []), wallSwitch.id]
+                            : (item.switchIds ?? []).filter((id) => id !== wallSwitch.id),
+                        }),
                       } : item),
                     }))} />
                     {wallSwitch.name}
+                    {user.switchIds?.includes(wallSwitch.id) && (
+                      <span>
+                        <button
+                          type="button"
+                          disabled={!installer || user.switchIds.indexOf(wallSwitch.id) === 0}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            moveUserAccess(user.id, "switchIds", wallSwitch.id, -1);
+                          }}
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!installer || user.switchIds.indexOf(wallSwitch.id) === user.switchIds.length - 1}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            moveUserAccess(user.id, "switchIds", wallSwitch.id, 1);
+                          }}
+                        >
+                          ↓
+                        </button>
+                      </span>
+                    )}
                   </label>
                 ))}
               </div>
@@ -5222,8 +5561,11 @@ export default function FlexiDimWeb() {
         >
           Copy all keys
         </button>
-        <button disabled={connection !== "connected"} onClick={() => send({ type: "userProfiles" })}>
-          Send user profiles
+        <button onClick={exportUserKeys}>
+          Export keys and profiles
+        </button>
+        <button disabled title="Controller user-profile transfer is not protocol-verified.">
+          Send user profiles — not available
         </button>
       </section>
     </div>
@@ -5292,7 +5634,11 @@ export default function FlexiDimWeb() {
           <span>{data.site.name}</span>
           <small>{data.site.id}</small>
         </div>
-        <button className={`connection-chip ${connection}`} onClick={connect}>
+        <button
+          className={`connection-chip ${connection}`}
+          disabled={!storageLoaded}
+          onClick={connect}
+        >
           <i />
           {connectionLabel}
         </button>
@@ -5303,6 +5649,7 @@ export default function FlexiDimWeb() {
             role="switch"
             aria-label="Allow configuration changes"
             aria-checked={installer}
+            disabled={!storageLoaded}
             className={`ios-toggle ${installer ? "on" : ""}`}
             onClick={() => setChangesAllowed(!installer)}
           >
@@ -5338,7 +5685,7 @@ export default function FlexiDimWeb() {
       </section>
       <footer>
         <span>FlexiDim Web</span>
-        <span>Local-first · Configuration saved on this device</span>
+        <span>Configuration saves automatically</span>
         <span>Recovered from iOS v2.97</span>
       </footer>
       <div className="toast-stack" role="status" aria-live="polite">

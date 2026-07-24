@@ -3,13 +3,23 @@ import test from "node:test";
 import { parseDstRuleFile, dstTransition, isDstActive } from "../app/dst-rules.ts";
 import { solarTimes } from "../app/solar.ts";
 import {
+  buildUserProfileData,
+  canonicalizeAppData,
+  controllerConnectionRequest,
   convertLegacyArchive,
+  deleteConfigEntity,
+  isFlexiDimWorkspace,
+  materializeAppData,
+  mergeLegacyBrowserConnectionState,
+  orderUserAccess,
   mergeImportedSite,
   normalizeSiteTimeZone,
   stringifyConfiguration,
   isStarterSite,
   upsertImportedConfiguration,
+  updateUserProfile,
   siteImportDetailsEqual,
+  validateConfigContent,
 } from "../app/fd4cfg.ts";
 
 test("parses recovered FlexiDim DST table semantics", () => {
@@ -34,36 +44,182 @@ test("calculates plausible sunrise and sunset", () => {
 });
 
 test("imports controller-significant hardware, period and user fields", () => {
+  // Archive keys here are the real iOS coder keys recovered from the binary and
+  // validated against a genuine `.fd4cfg` (see PROTOCOL.md): hardware limits
+  // mi/mx/mp/df, accessory ac, dimmable di, changed ch, rank ra; user security
+  // key sk, access count rc, access entries rm0..rmN, profile version ve.
   const objects = [
     "$null",
     { $classname: "JCLFDHardware" },
-    { $class: { CF$UID: 1 }, ky: 100, ty: 0, nm: "Ground", sn: "G", dr: 3, hw: 0, ix: 1, ri: 0 },
-    { $class: { CF$UID: 1 }, ky: 200, pr: 100, ty: 2, nm: "Lamp", sn: "L", dr: 4, hw: 12, ix: 2, md: 7000, mn: 5, mx: 90, mp: 95, df: 60, at: 1, am: "7001", dm: 1, hc: 1 },
+    { $class: { CF$UID: 1 }, ky: 100, ty: 0, nm: "Ground", sn: "G", ra: 3, hw: 0, ix: 1, ri: 0 },
+    { $class: { CF$UID: 1 }, ky: 200, pr: 100, ty: 2, nm: "Lamp", sn: "L", ra: 4, hw: 12, ix: 2, md: 7000, mi: 5, mx: 90, mp: 95, df: 60, ac: 1, di: 1, ch: 1 },
     { $classname: "JCLFDPeriod" },
     { $class: { CF$UID: 4 }, ix: 2, nm: "Night", st: 60, et: 120, sm: 1, em: 4 },
     { $classname: "JCLFDUser" },
-    { $class: { CF$UID: 6 }, ky: 9, nm: "Owner", sc: "0123456789abcdef", rm0: 100, ud: "profile", ve: 3 },
+    { $class: { CF$UID: 6 }, ky: 9, nm: "Owner", sk: "0123456789abcdef", rc: 2, rm0: "access-entry-a", rm1: "access-entry-b", ve: 3 },
+    { $classname: "JCLFDScene" },
+    { ky: 200, br: 72, t1: 6, de: 4, fl: 0x90 },
+    { $class: { CF$UID: 8 }, ky: 300, nm: "Evening", sn: "Eve", dr: 7, fl: 0xa0, lk: 1, ty: 4, ch0: { CF$UID: 9 } },
   ];
   const archive = {
     $archiver: "NSKeyedArchiver",
     $objects: objects,
     $top: {
-      room: { CF$UID: 2 }, channel: { CF$UID: 3 }, period: { CF$UID: 5 }, user: { CF$UID: 7 },
+      room: { CF$UID: 2 }, channel: { CF$UID: 3 }, period: { CF$UID: 5 }, user: { CF$UID: 7 }, scene: { CF$UID: 10 },
       $1: "Test", $9: "FD4-TEST", $10: "0123456789abcdef", $11: "192.168.1.2",
-      $12: 1, $17: "0.0", $18: 15273, $19: "UK-Europe", modc: 1, $30: "7000",
+      $2: "Line one", $3: "Line two", $4: "Line three", $5: "Line four",
+      $12: 1, $13: 2, $14: "2026-07-24T10:30:00.000Z", $17: "0.0",
+      $18: 16000, $19: "UK-Europe", $20: "42", $21: 3,
+      $28: "10", $29: "controller.example.test",
+      modc: 1, modcB: 0, $30: "7000",
     },
   };
   const data = convertLegacyArchive(archive);
   assert.equal(data.site.securityCode, "0123456789abcdef");
   assert.equal(data.site.timezone, "Europe/London");
-  assert.equal(data.channels[0].minimum, 5);
-  assert.equal(data.channels[0].maximum, 90);
-  assert.equal(data.channels[0].maximumPermissible, 95);
-  assert.equal(data.channels[0].controllerChannel, 2);
+  assert.deepEqual(data.site.addressLines, [
+    "Line one", "Line two", "Line three", "Line four",
+  ]);
+  assert.equal(data.site.siteType, 2);
+  assert.equal(data.site.routerInbound, true);
+  assert.equal(data.site.routerPort, 16000);
+  assert.equal(data.site.remote, true);
+  assert.equal(data.site.remoteServer, "controller.example.test");
+  assert.deepEqual(controllerConnectionRequest({
+    ...data.site,
+    siteType: 0,
+    autoDetect: false,
+  }), {
+    type: "connect",
+    host: "192.168.1.2",
+    port: 15273,
+    securityCode: "0123456789abcdef",
+  });
+  assert.deepEqual(data.site.wirelessGateways, [{ address: "42", count: 3 }]);
+  assert.deepEqual(data.site.moduleOrderA, [7000]);
+  assert.deepEqual(data.site.moduleOrderB, []);
+  assert.equal(data.site.updatedAt, "2026-07-24T10:30:00.000Z");
+  const lamp = data.channels[0];
+  assert.equal(lamp.minimum, 5);
+  assert.equal(lamp.maximum, 90);
+  assert.equal(lamp.maximumPermissible, 95);
+  assert.equal(lamp.defaultLevel, 60);
+  assert.equal(lamp.accessoryType, 1);
+  assert.equal(lamp.dimmable, true);
+  assert.equal(lamp.hardwareChanged, true);
+  assert.equal(lamp.displayRank, 4);
+  assert.equal(lamp.controllerChannel, 2);
   assert.equal(data.periods[0].start, "01:00");
   assert.equal(data.periods[0].startMode, 1);
-  assert.equal(data.users[0].key, "0123456789abcdef");
-  assert.deepEqual(data.users[0].roomIds, [1]);
+  const owner = data.users[0];
+  assert.equal(owner.key, "0123456789abcdef");
+  assert.equal(owner.securityCode, "0123456789abcdef");
+  assert.equal(owner.profileVersion, 3);
+  assert.equal(owner.accessCount, 2);
+  assert.deepEqual(owner.roomAccess, ["access-entry-a", "access-entry-b"]);
+  const evening = data.scenes[0];
+  assert.equal(evening.shortName, "Eve");
+  assert.equal(evening.flags, 0xa0);
+  assert.equal(evening.locked, true);
+  assert.equal(evening.sceneType, 4);
+  assert.equal(evening.displayRank, 7);
+  assert.deepEqual(evening.channelSettings[1], {
+    brightness: 72,
+    fadeTime: 3,
+    relativePercent: true,
+    use100PercentTime: true,
+    delay: 2,
+    flags: 0x90,
+  });
+});
+
+test("does not interpret real archive router flags and gateway counts as a target", () => {
+  const objects = [
+    "$null",
+    { $classname: "JCLFDHardware" },
+    { $class: { CF$UID: 1 }, ky: 1, ty: 0, nm: "Area", ix: 0, ri: 0 },
+  ];
+  const data = convertLegacyArchive({
+    $archiver: "NSKeyedArchiver",
+    $objects: objects,
+    $top: {
+      room: { CF$UID: 2 },
+      $1: "Remote site",
+      $9: "FD4-REMOTE",
+      $10: "0123456789abcdef",
+      $11: "192.168.1.2",
+      $12: 1,
+      $13: 0,
+      $18: "1",
+      $19: "1",
+      $28: "10",
+      $29: "controller.example.test",
+    },
+  });
+  assert.equal(data.site.routerInbound, true);
+  assert.equal(data.site.routerPort, 15273);
+  assert.equal(data.site.remoteServer, "controller.example.test");
+  assert.equal(data.site.remote, false);
+  assert.deepEqual(controllerConnectionRequest(data.site), {
+    type: "discover",
+    host: "192.168.1.2",
+    port: 15273,
+    securityCode: "0123456789abcdef",
+  });
+});
+
+test("addresses channels by stored module order, not sorted module ID", () => {
+  // Modules are stored in controller-address order and must not be re-sorted by
+  // ID. Here module 7010 is stored before 7000; a channel on the first-stored
+  // module (7010) must address as position 0, the second (7000) as position 1.
+  const objects = [
+    "$null",
+    { $classname: "JCLFDHardware" },
+    { $class: { CF$UID: 1 }, ky: 1, ty: 0, nm: "Area", ix: 0, ri: 0 },
+    { $class: { CF$UID: 1 }, ky: 10, pr: 1, ty: 2, nm: "First", hw: 12, ix: 1, md: 7010 },
+    { $class: { CF$UID: 1 }, ky: 20, pr: 1, ty: 2, nm: "Second", hw: 12, ix: 1, md: 7000 },
+  ];
+  const archive = {
+    $archiver: "NSKeyedArchiver",
+    $objects: objects,
+    $top: {
+      room: { CF$UID: 2 }, first: { CF$UID: 3 }, second: { CF$UID: 4 },
+      $1: "Order", $9: "FD4-ORDER", $12: 1, $17: "0.0", $19: "UK-Europe",
+      modc: 2, $30: "7010", $31: "7000",
+    },
+  };
+  const data = convertLegacyArchive(archive);
+  assert.deepEqual(data.site.moduleOrderA, [7010, 7000]);
+  const first = data.channels.find((c) => c.name === "First");
+  const second = data.channels.find((c) => c.name === "Second");
+  // First-stored module → position 0 → address 0*8+1 = 1.
+  assert.equal(first.controllerChannel, 1);
+  // Second-stored module → position 1 → address 1*8+1 = 9 (would be 1 if sorted).
+  assert.equal(second.controllerChannel, 9);
+});
+
+test("ranks switch hardware by `ra` and scenes by `dr`", () => {
+  // JCLFDHardware (channels, switches) stores rank in `ra`; JCLFDScene stores
+  // its rank/fade in `dr`. Reading the wrong key silently defaults the rank.
+  const objects = [
+    "$null",
+    { $classname: "JCLFDHardware" },
+    { $class: { CF$UID: 1 }, ky: 1, ty: 0, nm: "Area", ix: 0, ri: 0 },
+    { $class: { CF$UID: 1 }, ky: 30, pr: 1, ty: 1, nm: "Plate", hw: 15, ix: 5, ra: 6 },
+    { $classname: "JCLFDScene" },
+    { $class: { CF$UID: 4 }, ky: 40, pr: 1, nm: "Evening", dr: 9 },
+  ];
+  const archive = {
+    $archiver: "NSKeyedArchiver",
+    $objects: objects,
+    $top: {
+      room: { CF$UID: 2 }, plate: { CF$UID: 3 }, scene: { CF$UID: 5 },
+      $1: "Ranks", $9: "FD4-RANK", $12: 1, $17: "0.0", $19: "UK-Europe",
+    },
+  };
+  const data = convertLegacyArchive(archive);
+  assert.equal(data.switches[0].displayRank, 6);
+  assert.equal(data.scenes[0].displayRank, 9);
 });
 
 test("normalizes legacy timezone stepper values to safe IANA zones", () => {
@@ -138,14 +294,15 @@ test("unchanged site imports ignore timestamps and browser-local bridge settings
 
 test("restores an imported controller key while retaining local bridge settings", () => {
   const current = {
-    name: "Saved site", id: "FD4-TEST", ip: "192.168.1.2", port: 15273,
+    name: "Saved site", id: "FD4-TEST", ip: "192.168.1.10", port: 16000,
     description: "Saved", address: "", timezone: "Europe/London",
-    dst: "UK / Europe", remote: false, securityCode: "",
+    dst: "UK / Europe", remote: false, autoDetect: false, securityCode: "",
     bridgeUrl: "ws://127.0.0.1:9000", bridgeToken: "paired-locally",
   };
   const imported = {
     ...current, name: "Imported site", description: "Imported",
-    securityCode: "0123456789abcdef", bridgeUrl: "ws://127.0.0.1:8765",
+    ip: "192.168.1.20", port: 15273, autoDetect: true,
+    securityCode: "0123456789abcdef", bridgeUrl: "/bridge",
     bridgeToken: "",
   };
 
@@ -158,5 +315,382 @@ test("restores an imported controller key while retaining local bridge settings"
   const usedImport = mergeImportedSite(current, imported, true);
   assert.equal(usedImport.name, "Imported site");
   assert.equal(usedImport.securityCode, "0123456789abcdef");
+  assert.equal(usedImport.ip, "192.168.1.10");
+  assert.equal(usedImport.port, 16000);
+  assert.equal(usedImport.autoDetect, false);
   assert.equal(usedImport.bridgeUrl, "ws://127.0.0.1:9000");
+});
+
+function integrityFixture() {
+  return {
+    rooms: [
+      { id: 1, name: "Floor", floor: "FlexiDim", icon: "" },
+      { id: 2, name: "Room", floor: "Floor", icon: "", parentId: 1 },
+      { id: 3, name: "Empty", floor: "FlexiDim", icon: "" },
+    ],
+    modules: [
+      { id: 7000, name: "Module 7000", bus: "A", enabled: true, pending: false },
+      { id: 7001, name: "Spare", bus: "A", enabled: true, pending: false },
+    ],
+    channels: [{
+      id: 10, name: "Lamp", roomId: 2, module: "Module 7000 / Ch1",
+      moduleId: 7000, kind: "Dimmer", level: 50,
+    }],
+    switches: [{
+      id: 20, name: "Plate", roomId: 2, kind: "4 scene", buttons: 7,
+      basic: {
+        channelIds: [10], assignOn: true, assignOff: true,
+        assignDimming: true, assignChannelDimming: false,
+        onTime: 0, offTime: 0, offPriority: 0,
+        channelSettings: {
+          10: {
+            assignOn: true, assignOff: true, assignDimming: true,
+            assignChannelDimming: false, onPriority: false,
+            offPriority: false, onFade: 0, offFade: 0,
+          },
+        },
+      },
+    }],
+    sceneGroups: [],
+    scenes: [
+      {
+        id: 30, name: "First", group: "Room", levels: { 10: 75 },
+        channelSettings: {
+          10: {
+            brightness: 75, fadeTime: 2, relativePercent: false,
+            use100PercentTime: false, delay: 0, flags: 0,
+          },
+        },
+        fade: 2, enabled: true, days: [], time: "",
+        nextSceneId: 31, period1: 40,
+      },
+      {
+        id: 31, name: "Second", group: "Room", levels: {},
+        fade: 2, enabled: true, days: [], time: "",
+        previousSceneId: 30, extenderSceneId: 30, period2: 40,
+      },
+    ],
+    deletedScenes: [],
+    periods: [{
+      id: 40, name: "Evening", start: "18:00", end: "23:00",
+      days: [], enabled: true,
+    }],
+    users: [{
+      id: 50, name: "Owner", remote: false, changes: true, key: "test",
+      roomIds: [2, 3], switchIds: [20],
+    }],
+    assignments: [{
+      switchId: 20, button: 1, sceneId: 30, secondSceneId: 31,
+      channelId: 10,
+    }],
+    deletedItems: [],
+  };
+}
+
+test("validates hierarchy and all cross-object configuration references", () => {
+  const valid = integrityFixture();
+  assert.deepEqual(validateConfigContent(valid), []);
+  valid.scenes[0].period1 = 0;
+  valid.scenes[1].period2 = 0;
+  assert.deepEqual(
+    validateConfigContent(valid),
+    [],
+    "legacy period value 0 means no condition, not a missing period",
+  );
+
+  const invalid = structuredClone(valid);
+  invalid.rooms[0].parentId = 2;
+  invalid.channels[0].roomId = 999;
+  invalid.channels[0].moduleId = 999;
+  invalid.switches[0].roomId = 999;
+  invalid.scenes[0].levels[999] = 1;
+  invalid.scenes[0].nextSceneId = 999;
+  invalid.scenes[0].period1 = 999;
+  invalid.assignments[0].switchId = 999;
+  invalid.users[0].roomIds.push(999);
+  invalid.users[0].switchIds.push(999);
+  const issues = validateConfigContent(invalid);
+  assert.ok(issues.some((issue) => issue.includes("cyclic parent hierarchy")));
+  assert.ok(issues.some((issue) => issue.includes("missing room 999")));
+  assert.ok(issues.some((issue) => issue.includes("missing module 999")));
+  assert.ok(issues.some((issue) => issue.includes("missing channel 999")));
+  assert.ok(issues.some((issue) => issue.includes("missing next scene 999")));
+  assert.ok(issues.some((issue) => issue.includes("missing period 1 999")));
+  assert.ok(issues.some((issue) => issue.includes("missing switch 999")));
+});
+
+test("deletion cascades channel, switch, scene, period, room and user references", () => {
+  let content = deleteConfigEntity(integrityFixture(), "channel", 10);
+  assert.deepEqual(content.scenes[0].levels, {});
+  assert.deepEqual(content.switches[0].basic.channelIds, []);
+  assert.deepEqual(content.switches[0].basic.channelSettings, {});
+  assert.deepEqual(content.assignments, []);
+
+  content = deleteConfigEntity(content, "switch", 20);
+  assert.deepEqual(content.users[0].switchIds, []);
+  content = deleteConfigEntity(content, "scene", 30);
+  assert.equal(content.scenes[0].previousSceneId, undefined);
+  assert.equal(content.scenes[0].extenderSceneId, undefined);
+  content = deleteConfigEntity(content, "period", 40);
+  assert.equal(content.scenes[0].period2, undefined);
+  content = deleteConfigEntity(content, "room", 2);
+  assert.deepEqual(content.users[0].roomIds, [3]);
+  content = deleteConfigEntity(content, "user", 50);
+  assert.deepEqual(content.users, []);
+  assert.deepEqual(validateConfigContent(content), []);
+});
+
+test("refuses to delete rooms or modules that still own equipment", () => {
+  const content = integrityFixture();
+  assert.throws(
+    () => deleteConfigEntity(content, "room", 2),
+    /Move the child rooms, channels and switches/,
+  );
+  assert.throws(
+    () => deleteConfigEntity(content, "module", 7000),
+    /Move this module's channels/,
+  );
+  const withoutSpare = deleteConfigEntity(content, "module", 7001);
+  assert.deepEqual(withoutSpare.modules.map((module) => module.id), [7000]);
+});
+
+function ownershipContent(label) {
+  return {
+    rooms: [{ id: 1, name: `${label} room`, floor: "FlexiDim", icon: "" }],
+    channels: [],
+    switches: [],
+    sceneGroups: [],
+    scenes: [],
+    deletedScenes: [],
+    periods: [],
+    users: [],
+    assignments: [],
+    modules: [],
+    deletedItems: [],
+  };
+}
+
+test("canonical workspace nests configuration content beneath its owning site", () => {
+  const firstSite = {
+    name: "First", id: "SITE-1", ip: "", port: 15273, description: "",
+    address: "", timezone: "Europe/London", dst: "UK / Europe", remote: false,
+  };
+  const secondSite = { ...firstSite, name: "Second", id: "SITE-2" };
+  const activeContent = ownershipContent("first");
+  const secondContent = ownershipContent("second");
+  const legacyProjection = {
+    site: firstSite,
+    sites: [firstSite, secondSite],
+    configurations: [
+      {
+        id: 1, siteId: firstSite.id, name: "First config",
+        description: "", lastUpdated: "",
+      },
+      {
+        id: 2, siteId: secondSite.id, name: "Second config",
+        description: "", lastUpdated: "", content: secondContent,
+      },
+    ],
+    activeConfigId: 1,
+    ...activeContent,
+  };
+
+  const workspace = canonicalizeAppData(legacyProjection);
+  assert.equal(isFlexiDimWorkspace(workspace), true);
+  assert.equal(workspace.sites[0].configurations[0].content.rooms[0].name, "first room");
+  assert.equal(workspace.sites[1].configurations[0].content.rooms[0].name, "second room");
+  assert.equal("siteId" in workspace.sites[0].configurations[0], false);
+
+  const secondView = materializeAppData({
+    ...workspace, activeSiteId: "SITE-2", activeConfigId: 2,
+  });
+  assert.equal(secondView.site.id, "SITE-2");
+  assert.equal(secondView.rooms[0].name, "second room");
+});
+
+test("editing one materialized configuration cannot leak into another site", () => {
+  const site = {
+    name: "First", id: "SITE-1", ip: "", port: 15273, description: "",
+    address: "", timezone: "Europe/London", dst: "UK / Europe", remote: false,
+  };
+  const workspace = canonicalizeAppData({
+    site,
+    sites: [site, { ...site, name: "Second", id: "SITE-2" }],
+    configurations: [
+      {
+        id: 1, siteId: "SITE-1", name: "First", description: "",
+        lastUpdated: "",
+      },
+      {
+        id: 2, siteId: "SITE-2", name: "Second", description: "",
+        lastUpdated: "", content: ownershipContent("second"),
+      },
+    ],
+    activeConfigId: 1,
+    ...ownershipContent("first"),
+  });
+  const secondView = materializeAppData({
+    ...workspace, activeSiteId: "SITE-2", activeConfigId: 2,
+  });
+  secondView.rooms = [{ ...secondView.rooms[0], name: "edited second room" }];
+  const editedWorkspace = canonicalizeAppData(secondView);
+
+  assert.equal(
+    editedWorkspace.sites[0].configurations[0].content.rooms[0].name,
+    "first room",
+  );
+  assert.equal(
+    editedWorkspace.sites[1].configurations[0].content.rooms[0].name,
+    "edited second room",
+  );
+});
+
+test("legacy projections without inactive content migrate to an empty owner", () => {
+  const site = {
+    name: "First", id: "SITE-1", ip: "", port: 15273, description: "",
+    address: "", timezone: "Europe/London", dst: "UK / Europe", remote: false,
+  };
+  const workspace = canonicalizeAppData({
+    site,
+    sites: [site, { ...site, name: "Second", id: "SITE-2" }],
+    configurations: [
+      { id: 1, siteId: "SITE-1", name: "First", description: "", lastUpdated: "" },
+      { id: 2, siteId: "SITE-2", name: "Second", description: "", lastUpdated: "" },
+    ],
+    activeConfigId: 1,
+    ...ownershipContent("first"),
+  });
+  assert.deepEqual(
+    workspace.sites[1].configurations[0].content.rooms,
+    [],
+  );
+});
+
+test("canonical migration gives every site at least one owned configuration", () => {
+  const site = {
+    name: "First", id: "SITE-1", ip: "", port: 15273, description: "",
+    address: "", timezone: "Europe/London", dst: "UK / Europe", remote: false,
+  };
+  const workspace = canonicalizeAppData({
+    site,
+    sites: [site, { ...site, name: "Second", id: "SITE-2" }],
+    configurations: [
+      { id: 1, siteId: "SITE-1", name: "First", description: "", lastUpdated: "" },
+    ],
+    activeConfigId: 1,
+    ...ownershipContent("first"),
+  });
+  assert.equal(workspace.sites[1].configurations.length, 1);
+  assert.deepEqual(workspace.sites[1].configurations[0].content.rooms, []);
+  assert.notEqual(workspace.sites[1].configurations[0].id, 1);
+});
+
+test("server migration preserves the browser connection that previously worked", () => {
+  const server = canonicalizeAppData({
+    site: {
+      name: "Home", id: "SITE-1", ip: "192.168.1.10", port: 15273,
+      description: "Server metadata", address: "", timezone: "Europe/London",
+      dst: "UK / Europe", remote: false, autoDetect: true,
+      securityCode: "0123456789abcdef",
+    },
+    configurations: [{
+      id: 1, siteId: "SITE-1", name: "Server configuration",
+      description: "", lastUpdated: "",
+    }],
+    activeConfigId: 1,
+    ...ownershipContent("server"),
+  });
+  const browser = canonicalizeAppData({
+    site: {
+      ...materializeAppData(server).site,
+      ip: "192.168.1.77",
+      port: 15274,
+      autoDetect: false,
+      securityCode: "fedcba9876543210",
+      description: "Stale browser metadata",
+    },
+    configurations: [{
+      id: 1, siteId: "SITE-1", name: "Browser configuration",
+      description: "", lastUpdated: "",
+    }],
+    activeConfigId: 1,
+    ...ownershipContent("browser"),
+  });
+  const merged = mergeLegacyBrowserConnectionState(server, browser);
+  assert.equal(merged.sites[0].ip, "192.168.1.77");
+  assert.equal(merged.sites[0].port, 15274);
+  assert.equal(merged.sites[0].autoDetect, false);
+  assert.equal(merged.sites[0].securityCode, "fedcba9876543210");
+  assert.equal(merged.sites[0].description, "Server metadata");
+  assert.equal(
+    merged.sites[0].configurations[0].content.rooms[0].name,
+    "server room",
+  );
+});
+
+test("user profile edits preserve explicit access order and version their data", () => {
+  const user = {
+    id: 7,
+    name: "Operator",
+    remote: true,
+    changes: false,
+    key: "0123456789abcdef",
+    securityCode: "0123456789abcdef",
+    roomIds: [3, 1],
+    switchIds: [20, 10],
+    profileVersion: 4,
+    profileStatus: "current",
+  };
+  const updated = updateUserProfile(user, {
+    roomIds: [1, 3],
+    switchIds: [10, 20],
+  });
+  assert.equal(updated.profileVersion, 5);
+  assert.equal(updated.profileStatus, "pending");
+  assert.deepEqual(JSON.parse(updated.profileData).user.roomIds, [1, 3]);
+  assert.deepEqual(JSON.parse(updated.profileData).user.switchIds, [10, 20]);
+  assert.equal(updated.profileData, buildUserProfileData(updated));
+
+  const items = [{ id: 1 }, { id: 2 }, { id: 3 }];
+  assert.deepEqual(
+    orderUserAccess(items, [3, 1]).map((item) => item.id),
+    [3, 1, 2],
+  );
+});
+
+test("resolves type-0 targets exactly as the committed local connection path", () => {
+  const site = {
+    name: "Test", id: "SITE", ip: "192.168.1.50", port: 15273,
+    description: "", address: "", timezone: "Europe/London",
+    dst: "UK / Europe", remote: false, autoDetect: true,
+    securityCode: "0123456789abcdef",
+  };
+  assert.deepEqual(controllerConnectionRequest(site), {
+    type: "discover",
+    host: "192.168.1.50",
+    port: 15273,
+    securityCode: "0123456789abcdef",
+  });
+  assert.deepEqual(controllerConnectionRequest({ ...site, autoDetect: false }), {
+    type: "connect",
+    host: "192.168.1.50",
+    port: 15273,
+    securityCode: "0123456789abcdef",
+  });
+  assert.deepEqual(controllerConnectionRequest({
+    ...site,
+    remote: true,
+    remoteServer: "10",
+    routerPort: 1,
+    autoDetect: false,
+  }), {
+    type: "connect",
+    host: "192.168.1.50",
+    port: 15273,
+    securityCode: "0123456789abcdef",
+  });
+  assert.throws(
+    () => controllerConnectionRequest({ ...site, siteType: 1 }),
+    /encrypted controller sessions are not enabled/,
+  );
 });

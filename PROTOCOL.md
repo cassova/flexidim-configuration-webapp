@@ -10,7 +10,7 @@ its Objective-C metadata and ARM64 machine code, the archived configuration,
 and tests against a real controller. Treat the confidence labels below as part
 of the specification:
 
-- **Hardware verified** — observed working against the Chequers End controller.
+- **Hardware verified** — observed working against the reference controller.
 - **Binary verified** — directly recovered from the iOS executable, but not yet
   exercised against hardware in this project.
 - **Observed** — inferred from repeatable controller traffic.
@@ -60,7 +60,7 @@ iOS app before connecting the bridge.
 ### 2. Site type — binary verified
 
 The iOS app derives a site type from the fifth character of the site ID. The
-Chequers End site ID selects type `0`, the plaintext local protocol documented
+reference site's ID selects type `0`, the plaintext local protocol documented
 here. The executable also contains type `1` and type `2` paths, including AES
 operations for remote/encrypted sessions. Those paths are not implemented or
 hardware verified in FlexiDim Web.
@@ -297,10 +297,35 @@ FlexiDim Web validates the binary-plist signature, parses the property list,
 dereferences UIDs, groups objects by archived class name, and then converts the
 graph into its typed `AppData` model. Parsing happens locally in the browser.
 
+The archived model uses six application classes, plus `NSDate` and
+`NSMutableString`:
+
+| Class | Role |
+| --- | --- |
+| `JCLFDHardware` | A physical output channel or switch plate. Identity anchor. |
+| `JCLFDChannel` | A reusable per-channel *setting* (level + timing). Referenced by scenes and switch Basic Assignments; never stored at the top level. |
+| `JCLFDScene` | A scene, or a folder/group of scenes. |
+| `JCLFDSwitch` | A switch's button-to-scene map and Basic Assignment. |
+| `JCLFDPeriod` | A time period (schedule row). |
+| `JCLFDUser` | A user account and its access rights. |
+
+Object relationships are expressed by an integer identity, not by `CF$UID`:
+every model object carries a random ~24-bit `ky`, and references to it are
+stored as plain integers. The field tables below mark these `→ ky` references.
+
+> Field semantics below are **binary verified** (recovered from the iOS
+> executable's Objective-C metadata and coder methods) and **archive
+> validated** against one real reference `.fd4cfg` (42 hardware objects, 3
+> modules, 11 switches, 98 scenes, 35 periods, 2 users). Fields still lacking a
+> confirmed meaning are marked **unconfirmed** and must not be relied on for a
+> whole-controller transfer.
+
 ### Positional site fields
 
 The site's top-level scalar fields use archive positions recovered from the iOS
-encode order:
+encode order. Object arrays occupy contiguous position ranges (hardware, then
+switches, then scenes, then periods, then users), each length-prefixed by the
+matching count scalar.
 
 | Archive key | Meaning |
 | --- | --- |
@@ -313,44 +338,70 @@ encode order:
 | `$10` | 16-character controller security code |
 | `$11` | Saved controller IP |
 | `$12` | Automatic discovery flag |
-| `$14` | Last-updated value |
+| `$14` | Last-updated value (`NSDate`) |
 | `$15`, `$16` | Longitude, latitude |
 | `$17` | Time zone |
-| `$18` | Router inbound port |
+| `$18` | Router-inbound enabled flag (`0`/`1` in the reference archive) |
 | `$19` | Daylight-saving rule |
-| `$28` | Remote-server setting |
-| `modc` | Number of stored controller modules |
-| `$30...` | Module IDs in controller-address order |
+| `$28` | Fourth wireless-gateway count in the reference archive |
+| `$29` | Remote-server hostname |
+| `hwc` | Number of stored `JCLFDHardware` objects |
+| `modc` | Number of stored bus-A modules |
+| `modcB` | Number of stored bus-B modules |
+| `$30...` | Bus-A module IDs in controller-address order |
 
-### Hardware objects
+Modules are stored in two ordered buses, A then B, counted by `modc` and
+`modcB`. The order within each bus is the controller-address order and must be
+preserved on import — it is not re-sorted by module ID (see channel addressing
+above). The reference archive has no bus-B modules (`modcB = 0`), so the exact
+positional slots of the bus-B array are not yet validated against a real file.
 
-Important `JCLFDHardware` fields include:
+### `JCLFDHardware` — physical channels and switches
 
-| Field | Meaning |
-| --- | --- |
-| `ky` | Stable object key used by other archive objects |
-| `pr` | Parent hardware key |
-| `ty` | Object category: 0 area, 1 switch, 2 channel |
-| `nm`, `sn` | Name and short name |
-| `hw` | Hardware/type code |
-| `ix` | Hardware index; channel index or controller switch number |
-| `md` | Module ID for a channel |
-| `ri` | Room-image identifier |
+The identity object for every addressable output. `ty` distinguishes the role.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ky` | int | Stable object key referenced by other objects |
+| `pr` | int → `ky` | Parent object (rebuilds the area/room hierarchy); `0` at a root |
+| `ty` | int | Category: `0` area, `1` switch, `2` channel |
+| `hw` | int | Hardware/type code |
+| `ix` | int | Hardware index — the channel index, or the controller switch number used for switch addressing |
+| `md` | int | Module ID for a channel (`-1` = none) |
+| `mi` | int | Minimum level |
+| `mx` | int | Maximum level |
+| `mp` | int | Maximum permissible level |
+| `df` | int | Default level |
+| `di` | int (bool) | Dimmable |
+| `ac` | int | Accessory type |
+| `ra` | int | Rank (display/order) |
+| `nm` | string | Name |
+| `sn` | string | Short name |
+| `fn` | string | Fitting/function name |
+| `ri` | int | Room-image identifier |
+| `ch` | int (bool) | Changed-since-transfer flag |
+| `ad` | nil | Present but unused in the reference archive (**unconfirmed**) |
 
 Parent keys rebuild the floor/area hierarchy. Channel `md` and `ix`, together
 with the stored module array, produce the wire address described above.
 
-### Switch settings and assignments
+### `JCLFDChannel` — a per-channel setting
 
-`JCLFDSwitch.ky` associates settings with its `JCLFDHardware` switch. Important
-dynamic keys are:
+Not a top-level object: scenes hold up to 19 of these (`ch0`…`ch18`) and each
+switch holds 8 (`bs0`…`bs7`). It is the level + timing a scene or button applies
+to one physical hardware channel.
 
-- `buN` — logical button slot `N`; its value references a scene key;
-- `bsN` — Basic Assignment channel record `N`;
-- `op` — on-priority selection.
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ky` | int → `JCLFDHardware.ky` | The physical channel this setting drives (100% resolved in the reference archive) |
+| `br` | int | Brightness/level; negative encodes a relative percentage |
+| `t1` | int | Fade time, half-second ticks |
+| `t2` | int | Second timing value (delay / 100%-time), half-second ticks |
+| `de` | int | Delay before applying |
+| `fl` | int | Option flags (see below) |
+| `ch` | int (bool) | Changed-since-transfer flag |
 
-A Basic Assignment channel record references hardware through `ky`. Its `fl`
-bits are interpreted as:
+`fl` bits, as used in a switch Basic Assignment record:
 
 | Bit | Meaning |
 | --- | --- |
@@ -358,36 +409,78 @@ bits are interpreted as:
 | `02` | Assigned off |
 | `04` | Assigned dimming |
 | `08` | Assigned channel dimming |
+| `80` | Relative percentage |
+| `10` | Use 100%-time |
 
-`t1` and `t2` store half-second on/off fade ticks. Consecutive logical `buN`
-slots represent first and second presses of a physical scene button; they must
-not be sent directly as physical wire button numbers.
+### `JCLFDSwitch` — button and Basic Assignment map
 
-### Scenes
+`JCLFDSwitch.ky` associates settings with its `JCLFDHardware` switch.
 
-`JCLFDScene` represents both folders/groups and leaf scenes. Important fields
-include:
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ky` | int | Stable object key |
+| `bu0`…`bu23` | string → scene | Logical button slots; each references a scene |
+| `bs0`…`bs7` | `JCLFDChannel` | Basic Assignment channel records |
+| `bs` | int | Button/slot count |
+| `op` | int (bool) | On-priority selection (**unconfirmed**) |
 
-- `ky`, `pr`, `nm`, `sn` — key, parent, name, short name;
-- `gr` — group/folder marker;
-- `dr` — display rank or scene fade value, depending on object role;
-- `chN` — per-channel scene records;
-- `fl` — scene flags;
-- `ns`, `nsm`, `nt`, `nd` — next-scene sequencing;
-- `ps`, `es`, `re1` — previous/extender relationships;
-- `p1`, `p2`, `sf` — period and state-flag settings.
+Consecutive logical `buN` slots represent the first and second presses of one
+physical scene button; they must not be sent directly as physical wire button
+numbers.
 
-Each `chN` record links to channel hardware with `ky`. `br` is brightness,
-`t1` and `de` are half-second fade/delay ticks, and `fl` contains options such
-as relative percentage (`80`) and use-100%-time (`10`). A parent chain reaching
-the deleted-scenes root is imported into the deleted list.
+### `JCLFDScene` — scenes and folders
 
-### Periods and users
+`JCLFDScene` represents both folders/groups and leaf scenes.
 
-`JCLFDPeriod` contributes its name and start/end minutes. `JCLFDUser` contributes
-the user's name, remote/change permissions, and security key. The current
-importer preserves the fields represented in the web model; undocumented
-archive fields are not round-tripped back to `.fd4cfg`.
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ky` | int | Stable object key |
+| `pr` | int → `JCLFDScene.ky` | Parent folder / hierarchy link (100% resolved; `0` at a root) |
+| `nm`, `sn` | string | Name, short name |
+| `gr` | int (bool) | Group/folder marker |
+| `rm` | int | Room number (a logical ordinal, **not** a `ky` reference) |
+| `dr` | int | Display rank or scene fade value, depending on object role |
+| `ch0`…`ch18` | `JCLFDChannel` | Per-channel scene records |
+| `cc` | int | Count of channel records in use |
+| `fl` | int | Scene flags |
+| `ns` | int → `JCLFDScene.ky` | Next scene in a sequence |
+| `nsm` | int | Next-scene mode |
+| `nt`, `nd` | int | Next-scene timing |
+| `ps`, `es`, `re1` | int | Previous / extender relationship and relative flag |
+| `p1`, `p2` | int | Period inversion / operator |
+| `sf` | int | State-flag set/clear |
+| `lk` | int | Lock |
+| `ty` | int | Type |
+
+A parent chain reaching the deleted-scenes root is imported into the deleted
+list.
+
+### `JCLFDPeriod` — schedule rows
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `nm` | string | Period name |
+| `ix` | int | Index / order |
+| `st`, `et` | int | Start and end value |
+| `sm`, `em` | int | Start and end mode: absolute, sunrise, or sunset |
+
+Start/end are interpreted according to their independent modes; older builds
+mistakenly treated the mode values as clock minutes.
+
+### `JCLFDUser` — accounts and access
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `nm` | string | User name |
+| `ky` | int | Stable object key |
+| `sk` | string | Security key |
+| `rm0`…`rm6` | string | Room/switch access entries |
+| `rc` | int | Access-entry count |
+| `ve` | int | Profile version |
+
+The current importer preserves the fields represented in the web model;
+archive fields it does not yet model are retained in the `.fd4web.json` backup
+rather than silently discarded.
 
 ### FlexiDim Web JSON
 
@@ -396,15 +489,28 @@ archive fields are not round-tripped back to `.fd4cfg`.
 ```json
 {
   "format": "FlexiDim Web Configuration",
-  "version": 1,
+  "version": 2,
   "exportedAt": "ISO-8601 timestamp",
-  "data": { "site": {}, "rooms": [], "channels": [] }
+  "data": {
+    "activeSiteId": "site-id",
+    "activeConfigId": 1,
+    "sites": [
+      {
+        "configurations": [
+          { "id": 1, "content": { "rooms": [], "channels": [] } }
+        ]
+      }
+    ]
+  }
 }
 ```
 
-It preserves the webapp model and is not the binary controller image. FlexiDim
-Web currently imports `.fd4cfg` but exports `.fd4web.json`; it does not attempt
-to regenerate an original keyed archive.
+The Site → Configuration → ConfigContent tree is the canonical owner of editable
+data. Version 2 preserves every site's configurations without duplicating the
+active configuration at the top level. Version 1 flat projections are migrated
+on import. This remains a webapp backup, not the binary controller image;
+FlexiDim Web currently imports `.fd4cfg` but does not attempt to regenerate an
+original keyed archive.
 
 ## Comparing and transferring a whole configuration
 

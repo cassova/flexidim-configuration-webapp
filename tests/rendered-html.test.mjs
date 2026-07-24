@@ -24,6 +24,8 @@ test("configuration picker accepts original iOS backups", async () => {
   const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.match(source, /accept="[^"]*\.fd4cfg/i);
   assert.match(source, /parseLegacyFd4Config\(await file\.arrayBuffer\(\)\)/);
+  assert.match(source, /Configuration import failed: \$\{message\}/);
+  assert.match(source, /fetch\("\/api\/events"/);
   assert.doesNotMatch(
     source,
     /className="config-import"\s+disabled=/,
@@ -116,6 +118,8 @@ test("uses the iOS-style site list and header changes switch", async () => {
   assert.doesNotMatch(sitesPanel, /<small>AREAS<\/small>|room-strip/);
   assert.match(page, /role="switch"/);
   assert.match(page, /Allow configuration changes/);
+  assert.match(sitesPanel, /button-row compact site-location-actions/);
+  assert.match(sitesPanel, /Controller site type/);
   assert.doesNotMatch(page, /className="more-button"/);
 });
 
@@ -194,4 +198,55 @@ test("converted IPA artwork is present", async () => {
     const info = await stat(new URL(`../public/flexidim/${asset}`, import.meta.url));
     assert.ok(info.size > 100, `${asset} should contain converted artwork`);
   }
+});
+
+test("uses the server workspace API instead of browser storage", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /fetch\("\/api\/workspace"/);
+  assert.match(page, /expectedRevision: serverRevision\.current/);
+  assert.match(page, /localStorage\.removeItem\("flexidim-web-data"\)/);
+  assert.doesNotMatch(page, /localStorage\.setItem\("flexidim-web-data"/);
+  assert.doesNotMatch(page, /Configuration saved to the server/);
+  assert.match(page, /Configuration loaded from the server/);
+});
+
+test("cannot connect with starter credentials before server storage loads", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const connect = page.slice(
+    page.indexOf("const connect = () =>"),
+    page.indexOf("// A range slider"),
+  );
+  assert.match(
+    connect,
+    /if \(!storageLoaded\)[\s\S]*saved configuration is still loading/,
+  );
+  assert.match(
+    page,
+    /<button className="primary" disabled=\{!storageLoaded\} onClick=\{connect\}>/,
+  );
+  assert.match(
+    page,
+    /className=\{`connection-chip \$\{connection\}`\}[\s\S]*disabled=\{!storageLoaded\}[\s\S]*onClick=\{connect\}/,
+  );
+});
+
+test("retires the offline worker so rebuilt clients cannot retain old connection logic", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const worker = await readFile(new URL("../public/sw.js", import.meta.url), "utf8");
+  assert.match(page, /register\("\/sw\.js", \{ updateViaCache: "none" \}\)/);
+  assert.match(worker, /self\.registration\.unregister\(\)/);
+  assert.match(worker, /client\.navigate\(client\.url\)/);
+  assert.doesNotMatch(worker, /addEventListener\("fetch"/);
+  assert.doesNotMatch(worker, /cache\.put|cache\.addAll/);
+});
+
+test("keeps background autosaves silent and reports save failures", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(page, /storage-chip|Server saved/);
+  assert.doesNotMatch(
+    page,
+    /lastSyncedWorkspace\.current = serialized;\s*showToast/,
+  );
+  assert.match(page, /Configuration not saved:/);
+  assert.match(page, /Configuration saves automatically/);
 });

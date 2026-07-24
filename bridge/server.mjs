@@ -246,5 +246,40 @@ server.on("error", (error) => {
 });
 
 server.listen(BRIDGE_PORT, BRIDGE_HOST, () => console.log(`FlexiDim local bridge ready at ws://${BRIDGE_HOST}:${BRIDGE_PORT}`));
-function shutdown() { for (const socket of sockets) socket.destroy(); for (const controller of controllers.values()) controller.destroy(); server.close(); }
-process.on("SIGINT", shutdown); process.on("SIGTERM", shutdown);
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`FlexiDim local bridge received ${signal}; shutting down`);
+
+  for (const socket of sockets) {
+    if (!socket.destroyed) {
+      socket.write(Buffer.from([0x88, 0x02, 0x03, 0xe9]));
+      socket.end();
+    }
+  }
+  for (const controller of controllers.values()) controller.end();
+
+  const deadline = setTimeout(() => {
+    for (const socket of sockets) socket.destroy();
+    for (const controller of controllers.values()) controller.destroy();
+    server.closeAllConnections?.();
+    console.error("FlexiDim local bridge shutdown deadline reached");
+    process.exit(1);
+  }, 4000);
+
+  server.close((error) => {
+    clearTimeout(deadline);
+    if (error) {
+      console.error(`FlexiDim local bridge shutdown failed: ${error.message}`);
+      process.exit(1);
+    }
+    console.log("FlexiDim local bridge stopped cleanly");
+    process.exit(0);
+  });
+  server.closeIdleConnections?.();
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));

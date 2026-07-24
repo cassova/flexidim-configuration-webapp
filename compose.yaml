@@ -1,0 +1,51 @@
+services:
+  flexidim-web:
+    build: .
+    image: flexidim-web:local
+    environment:
+      FLEXIDIM_BRIDGE_UPSTREAM_HOST: flexidim-bridge
+      FLEXIDIM_BRIDGE_UPSTREAM_PORT: 8765
+      FLEXIDIM_BRIDGE_TOKEN: ${FLEXIDIM_BRIDGE_TOKEN:-flexidim-compose-local}
+    ports:
+      - "3000:3000"
+    volumes:
+      - flexidim-config:/config
+    depends_on:
+      flexidim-bridge:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    stop_grace_period: 5s
+    restart: unless-stopped
+
+  flexidim-bridge:
+    build: .
+    image: flexidim-web:local
+    command: ["node", "bridge/server.mjs"]
+    environment:
+      FLEXIDIM_BRIDGE_HOST: 0.0.0.0
+      FLEXIDIM_BRIDGE_PORT: 8765
+      FLEXIDIM_BRIDGE_TOKEN: ${FLEXIDIM_BRIDGE_TOKEN:-flexidim-compose-local}
+    expose:
+      - "8765"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8765').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    stop_grace_period: 5s
+    restart: unless-stopped
+
+volumes:
+  flexidim-config:

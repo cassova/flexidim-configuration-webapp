@@ -337,6 +337,10 @@ button.primary,
 .button-row.compact button {
   min-height: 34px;
 }
+.site-location-actions {
+  align-items: center;
+  margin: 0 23px 19px;
+}
 .hint {
   color: var(--muted);
   font-size: 12px;

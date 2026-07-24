@@ -167,8 +167,14 @@ export type FlexUser = {
   securityCode?: string;
   roomIds?: number[];
   switchIds?: number[];
+  // Raw room/switch access entries (archive keys rm0..rmN). Their internal
+  // encoding is not yet decoded, so they are preserved verbatim rather than
+  // resolved to room IDs. accessCount mirrors the archive `rc` field.
+  roomAccess?: string[];
+  accessCount?: number;
   profileData?: string;
   profileVersion?: number;
+  profileStatus?: "current" | "pending" | "imported";
   legacy?: Record<string, unknown>;
 };
 export type Assignment = {
@@ -215,6 +221,51 @@ export type Site = {
   bridgeUrl?: string;
   bridgeToken?: string;
 };
+
+export type ControllerConnectionRequest = {
+  type: "discover" | "connect";
+  host: string;
+  port: number;
+  securityCode?: string;
+};
+
+/**
+ * Resolve the actual controller target from the site's connection mode.
+ * Type-0 is the local controller protocol. Preserve the committed connection
+ * behavior: Auto Detect chooses discovery versus a direct connection, but
+ * archived remote/router metadata never changes the local target.
+ */
+export function controllerConnectionRequest(
+  site: Site,
+): ControllerConnectionRequest {
+  if ((site.siteType ?? 0) !== 0) {
+    throw new Error(
+      "Remote and encrypted controller sessions are not enabled until their protocol profile is verified",
+    );
+  }
+  const host = site.ip.trim();
+  const port = site.port;
+  if (!host)
+    throw new Error("Enter the controller IP address or enable Auto Detect");
+  if (!Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error("Enter a controller port between 1 and 65535");
+
+  if (site.autoDetect !== false) {
+    return {
+      type: "discover",
+      host,
+      port,
+      securityCode: site.securityCode,
+    };
+  }
+
+  return {
+    type: "connect",
+    host,
+    port,
+    securityCode: site.securityCode,
+  };
+}
 
 function isIanaTimeZone(value: string) {
   try {
@@ -266,6 +317,17 @@ export function mergeImportedSite(
   useImportedDetails: boolean,
 ): Site {
   const merged = useImportedDetails ? { ...imported } : { ...current };
+  // The running app may have learned a newer controller address through
+  // discovery than the archived backup contains. Re-importing configuration
+  // content must not discard that known-working local endpoint.
+  if (current.ip?.trim()) merged.ip = current.ip.trim();
+  if (
+    Number.isInteger(current.port) &&
+    current.port >= 1 &&
+    current.port <= 65535
+  )
+    merged.port = current.port;
+  merged.autoDetect = current.autoDetect;
   if (!validControllerSecurityCode(merged.securityCode)) {
     const fallback = useImportedDetails ? current.securityCode : imported.securityCode;
     if (validControllerSecurityCode(fallback)) merged.securityCode = fallback;
@@ -322,6 +384,249 @@ export type ConfigContent = {
   deletedItems: DeletedItem[];
 };
 
+export type ConfigEntityType =
+  | "room"
+  | "channel"
+  | "switch"
+  | "module"
+  | "scene"
+  | "period"
+  | "user";
+
+/**
+ * Report every dangling or cyclic reference in one configuration. This is
+ * deliberately independent of the UI so imports, migrations and destructive
+ * editor actions can all apply the same rules.
+ */
+export function validateConfigContent(content: ConfigContent): string[] {
+  const issues: string[] = [];
+  const ids = <T extends { id: number }>(items: T[]) =>
+    new Set(items.map((item) => item.id));
+  const roomIds = ids(content.rooms);
+  const channelIds = ids(content.channels);
+  const switchIds = ids(content.switches);
+  const moduleIds = ids(content.modules);
+  const sceneIds = ids(content.scenes);
+  const periodIds = ids(content.periods);
+
+  const duplicateIds = <T extends { id: number }>(label: string, items: T[]) => {
+    const seen = new Set<number>();
+    for (const item of items) {
+      if (seen.has(item.id)) issues.push(`${label} ${item.id} has a duplicate ID`);
+      seen.add(item.id);
+    }
+  };
+  duplicateIds("Room", content.rooms);
+  duplicateIds("Channel", content.channels);
+  duplicateIds("Switch", content.switches);
+  duplicateIds("Module", content.modules);
+  duplicateIds("Scene", content.scenes);
+  duplicateIds("Period", content.periods);
+  duplicateIds("User", content.users);
+
+  const roomById = new Map(content.rooms.map((room) => [room.id, room]));
+  for (const room of content.rooms) {
+    if (room.parentId != null && !roomIds.has(room.parentId))
+      issues.push(`Room ${room.id} references missing parent room ${room.parentId}`);
+    const ancestors = new Set([room.id]);
+    let parentId = room.parentId;
+    while (parentId != null) {
+      if (ancestors.has(parentId)) {
+        issues.push(`Room ${room.id} has a cyclic parent hierarchy`);
+        break;
+      }
+      ancestors.add(parentId);
+      parentId = roomById.get(parentId)?.parentId;
+    }
+  }
+
+  for (const channel of content.channels) {
+    if (!roomIds.has(channel.roomId))
+      issues.push(`Channel ${channel.id} references missing room ${channel.roomId}`);
+    if (channel.moduleId != null && !moduleIds.has(channel.moduleId))
+      issues.push(`Channel ${channel.id} references missing module ${channel.moduleId}`);
+  }
+  for (const wallSwitch of content.switches) {
+    if (!roomIds.has(wallSwitch.roomId))
+      issues.push(`Switch ${wallSwitch.id} references missing room ${wallSwitch.roomId}`);
+    for (const channelId of wallSwitch.basic?.channelIds ?? []) {
+      if (!channelIds.has(channelId))
+        issues.push(`Switch ${wallSwitch.id} references missing basic channel ${channelId}`);
+    }
+    for (const channelId of Object.keys(wallSwitch.basic?.channelSettings ?? {})) {
+      if (!channelIds.has(Number(channelId)))
+        issues.push(`Switch ${wallSwitch.id} has settings for missing channel ${channelId}`);
+    }
+  }
+  for (const scene of content.scenes) {
+    for (const channelId of new Set([
+      ...Object.keys(scene.levels),
+      ...Object.keys(scene.channelSettings ?? {}),
+    ])) {
+      if (!channelIds.has(Number(channelId)))
+        issues.push(`Scene ${scene.id} references missing channel ${channelId}`);
+    }
+    for (const [field, targetId] of [
+      ["next", scene.nextSceneId],
+      ["previous", scene.previousSceneId],
+      ["extender", scene.extenderSceneId],
+    ] as const) {
+      if (targetId != null && !sceneIds.has(targetId))
+        issues.push(`Scene ${scene.id} references missing ${field} scene ${targetId}`);
+    }
+    for (const [field, periodId] of [
+      ["period 1", scene.period1],
+      ["period 2", scene.period2],
+    ] as const) {
+      if (periodId != null && periodId !== 0 && !periodIds.has(periodId))
+        issues.push(`Scene ${scene.id} references missing ${field} ${periodId}`);
+    }
+  }
+  for (const assignment of content.assignments) {
+    if (!switchIds.has(assignment.switchId))
+      issues.push(`Assignment references missing switch ${assignment.switchId}`);
+    for (const sceneId of [assignment.sceneId, assignment.secondSceneId]) {
+      if (sceneId != null && !sceneIds.has(sceneId))
+        issues.push(`Assignment references missing scene ${sceneId}`);
+    }
+    for (const channelId of [
+      assignment.channelId,
+      assignment.secondChannelId,
+      ...(assignment.channelIds ?? []),
+    ]) {
+      if (channelId != null && !channelIds.has(channelId))
+        issues.push(`Assignment references missing channel ${channelId}`);
+    }
+  }
+  for (const user of content.users) {
+    for (const roomId of user.roomIds ?? []) {
+      if (!roomIds.has(roomId))
+        issues.push(`User ${user.id} references missing room ${roomId}`);
+    }
+    for (const switchId of user.switchIds ?? []) {
+      if (!switchIds.has(switchId))
+        issues.push(`User ${user.id} references missing switch ${switchId}`);
+    }
+  }
+  return issues;
+}
+
+/**
+ * Delete one model entity and clean every dependent reference. Rooms and
+ * modules with owned children are refused because silently re-homing physical
+ * equipment would change controller semantics.
+ */
+export function deleteConfigEntity(
+  content: ConfigContent,
+  type: ConfigEntityType,
+  id: number,
+): ConfigContent {
+  if (
+    type === "room" &&
+    (content.rooms.some((room) => room.parentId === id) ||
+      content.channels.some((channel) => channel.roomId === id) ||
+      content.switches.some((wallSwitch) => wallSwitch.roomId === id))
+  ) {
+    throw new Error("Move the child rooms, channels and switches before deleting this area.");
+  }
+  if (
+    type === "module" &&
+    content.channels.some((channel) => channel.moduleId === id)
+  ) {
+    throw new Error("Move this module's channels before deleting it.");
+  }
+
+  const withoutChannel = (values: number[] | undefined) =>
+    values?.filter((value) => value !== id);
+  const assignments = content.assignments.flatMap((assignment) => {
+    if (type === "switch" && assignment.switchId === id) return [];
+    if (type === "channel") {
+      if (
+        assignment.channelId === id ||
+        assignment.secondChannelId === id ||
+        assignment.channelIds?.includes(id)
+      ) return [];
+    }
+    return [{
+      ...assignment,
+      sceneId:
+        type === "scene" && assignment.sceneId === id
+          ? undefined
+          : assignment.sceneId,
+      secondSceneId:
+        type === "scene" && assignment.secondSceneId === id
+          ? undefined
+          : assignment.secondSceneId,
+    }];
+  });
+
+  return {
+    ...content,
+    rooms: type === "room" ? content.rooms.filter((item) => item.id !== id) : content.rooms,
+    channels: type === "channel" ? content.channels.filter((item) => item.id !== id) : content.channels,
+    switches: (type === "switch"
+      ? content.switches.filter((item) => item.id !== id)
+      : content.switches).map((wallSwitch) =>
+        type === "channel" && wallSwitch.basic
+          ? {
+              ...wallSwitch,
+              basic: {
+                ...wallSwitch.basic,
+                channelIds: withoutChannel(wallSwitch.basic.channelIds) ?? [],
+                channelSettings: Object.fromEntries(
+                  Object.entries(wallSwitch.basic.channelSettings ?? {})
+                    .filter(([channelId]) => Number(channelId) !== id),
+                ),
+              },
+            }
+          : wallSwitch,
+      ),
+    modules: type === "module" ? content.modules.filter((item) => item.id !== id) : content.modules,
+    scenes: (type === "scene"
+      ? content.scenes.filter((item) => item.id !== id)
+      : content.scenes).map((scene) => {
+        if (type === "channel") {
+          const levels = { ...scene.levels };
+          const channelSettings = { ...scene.channelSettings };
+          delete levels[id];
+          delete channelSettings[id];
+          return { ...scene, levels, channelSettings };
+        }
+        if (type === "scene") {
+          return {
+            ...scene,
+            nextSceneId: scene.nextSceneId === id ? undefined : scene.nextSceneId,
+            previousSceneId: scene.previousSceneId === id ? undefined : scene.previousSceneId,
+            extenderSceneId: scene.extenderSceneId === id ? undefined : scene.extenderSceneId,
+          };
+        }
+        if (type === "period") {
+          return {
+            ...scene,
+            period1: scene.period1 === id ? undefined : scene.period1,
+            period2: scene.period2 === id ? undefined : scene.period2,
+          };
+        }
+        return scene;
+      }),
+    periods: type === "period" ? content.periods.filter((item) => item.id !== id) : content.periods,
+    users: type === "user"
+      ? content.users.filter((item) => item.id !== id)
+      : content.users.map((user) => {
+          if (type === "room" && user.roomIds?.includes(id))
+            return updateUserProfile(user, {
+              roomIds: withoutChannel(user.roomIds),
+            });
+          if (type === "switch" && user.switchIds?.includes(id))
+            return updateUserProfile(user, {
+              switchIds: withoutChannel(user.switchIds),
+            });
+          return user;
+        }),
+    assignments,
+  };
+}
+
 export type Configuration = {
   id: number;
   siteId: string;
@@ -330,6 +635,21 @@ export type Configuration = {
   lastUpdated: string;
   content?: ConfigContent;
   legacy?: Record<string, unknown>;
+};
+
+export type OwnedConfiguration = Omit<Configuration, "siteId" | "content"> & {
+  content: ConfigContent;
+};
+
+/** Canonical persisted owner: configuration content is nested beneath its site. */
+export type OwnedSite = Site & {
+  configurations: OwnedConfiguration[];
+};
+
+export type FlexiDimWorkspace = {
+  activeSiteId: string;
+  activeConfigId: number;
+  sites: OwnedSite[];
 };
 
 export const CONFIG_CONTENT_KEYS = [
@@ -363,6 +683,263 @@ export type AppData = {
   modules?: FlexModule[];
   deletedItems?: DeletedItem[];
 };
+
+export function emptyConfigContent(): ConfigContent {
+  return {
+    rooms: [],
+    channels: [],
+    switches: [],
+    sceneGroups: [],
+    scenes: [],
+    deletedScenes: [],
+    periods: [],
+    users: [],
+    assignments: [],
+    modules: [],
+    deletedItems: [],
+  };
+}
+
+export function snapshotConfigContent(source: AppData): ConfigContent {
+  return Object.fromEntries(
+    CONFIG_CONTENT_KEYS.map((key) => [key, source[key] ?? []]),
+  ) as unknown as ConfigContent;
+}
+
+/** Build the versioned web-native representation of an editable user profile. */
+export function buildUserProfileData(user: FlexUser): string {
+  return stringifyConfiguration({
+    format: "FlexiDim Web User Profile",
+    version: 1,
+    user: {
+      id: user.id,
+      name: user.name,
+      securityCode: user.securityCode ?? user.key,
+      remote: user.remote,
+      changes: user.changes,
+      roomIds: user.roomIds ?? [],
+      switchIds: user.switchIds ?? [],
+    },
+  });
+}
+
+/** Apply a profile-significant edit and mark the local profile for transfer. */
+export function updateUserProfile(
+  user: FlexUser,
+  patch: Partial<FlexUser>,
+): FlexUser {
+  const next = {
+    ...user,
+    ...patch,
+    profileVersion: (user.profileVersion ?? 0) + 1,
+    profileStatus: "pending" as const,
+  };
+  return { ...next, profileData: buildUserProfileData(next) };
+}
+
+/** Selected access entries first in their explicit user-defined order. */
+export function orderUserAccess<T extends { id: number }>(
+  items: T[],
+  selectedIds: number[] = [],
+): T[] {
+  const itemById = new Map(items.map((item) => [item.id, item]));
+  const selected = selectedIds.flatMap((id) => {
+    const item = itemById.get(id);
+    return item ? [item] : [];
+  });
+  const selectedSet = new Set(selected.map((item) => item.id));
+  return [...selected, ...items.filter((item) => !selectedSet.has(item.id))];
+}
+
+export function isFlexiDimWorkspace(value: unknown): value is FlexiDimWorkspace {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<FlexiDimWorkspace>;
+  const structurallyValid =
+    typeof candidate.activeSiteId === "string" &&
+    Number.isInteger(candidate.activeConfigId) &&
+    Array.isArray(candidate.sites) &&
+    candidate.sites.length > 0 &&
+    candidate.sites.every(
+      (site) =>
+        site &&
+        typeof site === "object" &&
+        typeof site.id === "string" &&
+        Array.isArray(site.configurations) &&
+        site.configurations.length > 0 &&
+        site.configurations.every(
+          (configuration) =>
+            configuration &&
+            typeof configuration === "object" &&
+            Number.isInteger(configuration.id) &&
+            configuration.content &&
+            typeof configuration.content === "object" &&
+            CONFIG_CONTENT_KEYS.every((key) =>
+              Array.isArray(configuration.content[key]),
+            ),
+        ),
+    );
+  if (!structurallyValid) return false;
+  const workspace = candidate as FlexiDimWorkspace;
+  const siteIds = workspace.sites.map((site) => site.id);
+  const configurationIds = workspace.sites.flatMap((site) =>
+    site.configurations.map((configuration) => configuration.id),
+  );
+  if (
+    new Set(siteIds).size !== siteIds.length ||
+    new Set(configurationIds).size !== configurationIds.length
+  )
+    return false;
+  const activeSite = workspace.sites.find(
+    (site) => site.id === workspace.activeSiteId,
+  );
+  return Boolean(
+    activeSite?.configurations.some(
+      (configuration) => configuration.id === workspace.activeConfigId,
+    ),
+  );
+}
+
+/**
+ * Carry forward only the connection details proven by the browser-local app.
+ * Configuration content and site metadata remain authoritative on the server.
+ */
+export function mergeLegacyBrowserConnectionState(
+  server: FlexiDimWorkspace,
+  browser: FlexiDimWorkspace,
+): FlexiDimWorkspace {
+  const browserSites = new Map(browser.sites.map((site) => [site.id, site]));
+  return {
+    ...server,
+    sites: server.sites.map((site) => {
+      const local = browserSites.get(site.id);
+      if (!local) return site;
+      const ip = local.ip?.trim();
+      const port = local.port;
+      return {
+        ...site,
+        ...(ip ? { ip } : {}),
+        ...(Number.isInteger(port) && port >= 1 && port <= 65535
+          ? { port }
+          : {}),
+        autoDetect: local.autoDetect,
+        ...(validControllerSecurityCode(local.securityCode)
+          ? { securityCode: local.securityCode }
+          : {}),
+      };
+    }),
+  };
+}
+
+/**
+ * Migrate the editor's legacy active-content projection into the canonical
+ * Site → Configuration → ConfigContent ownership tree.
+ */
+export function canonicalizeAppData(data: AppData): FlexiDimWorkspace {
+  const sourceSites = data.sites?.length ? data.sites : [data.site];
+  const sites = sourceSites.some((site) => site.id === data.site.id)
+    ? sourceSites
+    : [...sourceSites, data.site];
+  const configurations = data.configurations?.length
+    ? [...data.configurations]
+    : [{
+        id: data.activeConfigId ?? 1,
+        siteId: data.site.id,
+        name: data.site.name,
+        description: data.site.description,
+        lastUpdated: data.site.updatedAt ?? "",
+      }];
+  let nextConfigurationId =
+    Math.max(0, ...configurations.map((configuration) => configuration.id)) + 1;
+  for (const site of sites) {
+    if (
+      !configurations.some((configuration) => configuration.siteId === site.id)
+    ) {
+      configurations.push({
+        id: nextConfigurationId++,
+        siteId: site.id,
+        name: `${site.name} configuration`,
+        description: site.description,
+        lastUpdated: site.updatedAt ?? "",
+        content: emptyConfigContent(),
+      });
+    }
+  }
+  const activeConfigId =
+    data.activeConfigId &&
+    configurations.some(
+      (configuration) =>
+        configuration.id === data.activeConfigId &&
+        configuration.siteId === data.site.id,
+    )
+      ? data.activeConfigId
+      : configurations.find(
+          (configuration) => configuration.siteId === data.site.id,
+        )?.id ?? configurations[0].id;
+  const activeContent = snapshotConfigContent(data);
+
+  const ownedSites: OwnedSite[] = sites.map((site) => {
+    const ownedConfigurations = configurations
+      .filter((configuration) => configuration.siteId === site.id)
+      .map((configuration) => {
+        const owned = { ...configuration } as Partial<Configuration>;
+        delete owned.siteId;
+        delete owned.content;
+        return {
+          ...owned,
+          content:
+            site.id === data.site.id && configuration.id === activeConfigId
+              ? activeContent
+              : (configuration.content ?? emptyConfigContent()),
+        } as OwnedConfiguration;
+      });
+    return { ...site, configurations: ownedConfigurations };
+  });
+
+  return {
+    activeSiteId: data.site.id,
+    activeConfigId,
+    sites: ownedSites,
+  };
+}
+
+/**
+ * Materialize the active configuration for the existing editor controls. The
+ * returned top-level arrays are a view; the workspace remains the owner.
+ */
+export function materializeAppData(workspace: FlexiDimWorkspace): AppData {
+  const activeSite =
+    workspace.sites.find((site) => site.id === workspace.activeSiteId) ??
+    workspace.sites[0];
+  if (!activeSite) throw new Error("The workspace has no sites");
+  const activeConfiguration =
+    activeSite.configurations.find(
+      (configuration) => configuration.id === workspace.activeConfigId,
+    ) ?? activeSite.configurations[0];
+  if (!activeConfiguration)
+    throw new Error(`Site ${activeSite.id} has no configurations`);
+  const sites: Site[] = workspace.sites.map((ownedSite) => {
+    const site = { ...ownedSite } as Partial<OwnedSite>;
+    delete site.configurations;
+    return site as Site;
+  });
+  const configurations: Configuration[] = workspace.sites.flatMap((site) =>
+    site.configurations.map(({ content, ...configuration }) => ({
+      ...configuration,
+      siteId: site.id,
+      content:
+        site.id === activeSite.id && configuration.id === activeConfiguration.id
+          ? undefined
+          : content,
+    })),
+  );
+  return {
+    site: sites.find((site) => site.id === activeSite.id)!,
+    sites,
+    configurations,
+    activeConfigId: activeConfiguration.id,
+    ...activeConfiguration.content,
+  };
+}
 
 /** True only for the untouched demo site created before a real import. */
 export function isStarterSite(
@@ -525,7 +1102,7 @@ export function convertLegacyArchive(archive: unknown): AppData {
           ? (roomIdByKey.get(number(parent.ky)) ?? null)
           : null,
       shortName: string(item.sn) || string(item.nm) || `Area ${index + 1}`,
-      displayRank: number(item.dr, index),
+      displayRank: number(item.ra, index),
       hardwareType: number(item.hw),
       hardwareIndex: number(item.ix),
       legacyKey: number(item.ky),
@@ -579,17 +1156,21 @@ export function convertLegacyArchive(archive: unknown): AppData {
       moduleIndex: channelIndex,
       channelIndex,
       controllerChannel,
-      accessoryModule: string(item.am) || "None",
-      accessoryType: number(item.at),
-      minimum: number(item.mn),
+      // Archive keys recovered from the iOS binary and validated against a real
+      // archive: ac accessory type, mi/mx min/max, mp max-permissible, df
+      // default, di dimmable, ch changed, ra rank. (Earlier guesses at/mn/dm/hc
+      // /dr do not exist in a real `.fd4cfg` and silently defaulted.)
+      accessoryModule: "None",
+      accessoryType: number(item.ac),
+      minimum: number(item.mi),
       maximum: number(item.mx, 100),
       maximumPermissible: number(item.mp, 100),
       defaultLevel: number(item.df, 100),
       shortName: string(item.sn) || string(item.nm),
-      displayRank: number(item.dr, index),
+      displayRank: number(item.ra, index),
       hardwareType: number(item.hw),
-      dimmable: item.dm === true || number(item.dm) > 0,
-      hardwareChanged: item.hc === true || number(item.hc) > 0,
+      dimmable: item.di === true || number(item.di) > 0,
+      hardwareChanged: item.ch === true || number(item.ch) > 0,
       legacyKey: number(item.ky),
       legacy: { ...item },
     };
@@ -688,7 +1269,9 @@ export function convertLegacyArchive(archive: unknown): AppData {
       // position in the configuration's logical list.
       number: number(item.ix, index + 1),
       shortName: string(item.sn) || string(item.nm),
-      displayRank: number(item.dr, index),
+      // Switch hardware is a JCLFDHardware object: rank is `ra` (not the `dr`
+      // used by JCLFDScene).
+      displayRank: number(item.ra, index),
       hardwareType: type,
       legacyKey: number(item.ky),
       legacy: { hardware: { ...item }, settings: settings ? { ...settings } : undefined },
@@ -866,24 +1449,31 @@ export function convertLegacyArchive(archive: unknown): AppData {
   });
 
   const users: FlexUser[] = instances("JCLFDUser").map((item, index) => {
-    const roomKeys = Object.keys(item)
+    // Archive keys recovered from the iOS binary and validated against a real
+    // archive: sk 16-character security key, ve profile version, rc access-entry
+    // count, rm0..rmN the access entries (strings, not room-key references).
+    const accessCount = number(item.rc);
+    const roomAccess = Object.keys(item)
       .filter((key) => /^rm\d+$/.test(key))
-      .map((key) => number(item[key]));
+      .sort((a, b) => Number(a.slice(2)) - Number(b.slice(2)))
+      .map((key) => string(item[key]))
+      .filter((entry) => entry.length > 0);
     return {
       id: index + 1,
       name: string(item.nm) || `User ${index + 1}`,
       remote: false,
       changes: true,
-      key: string(item.sc),
-      securityCode: string(item.sc),
+      key: string(item.sk),
+      securityCode: string(item.sk),
       legacyKey: number(item.ky),
-      roomIds: roomKeys.flatMap((key) => {
-        const roomId = roomIdByKey.get(key);
-        return roomId ? [roomId] : [];
-      }),
+      // The rm entries are not room-key references, so no room IDs are resolved
+      // until their encoding is decoded; the raw entries are preserved instead.
+      roomIds: [],
       switchIds: [],
-      profileData: string(item.ud),
+      roomAccess,
+      accessCount,
       profileVersion: number(item.ve),
+      profileStatus: "imported",
       legacy: { ...item },
     };
   });
@@ -892,8 +1482,8 @@ export function convertLegacyArchive(archive: unknown): AppData {
   // the app's encode order, recovered from the iOS binary:
   //   $1 name  $2-$5 address lines  $6 contact  $7 phone  $8 email
   //   $9 siteID  $10 security code  $11 IP  $12 auto-detect  $14 last updated
-  //   $15 longitude  $16 latitude  $17 time zone  $18 router inbound
-  //   $19 DST rules  $28 remote server
+  //   $15 longitude  $16 latitude  $17 time zone  $18 router-inbound flag
+  //   $19 DST rules  $29 remote server
   const addressLines = ["$2", "$3", "$4", "$5"].map((key) => topString(key));
   const address = addressLines
     .filter(Boolean)
@@ -908,6 +1498,10 @@ export function convertLegacyArchive(archive: unknown): AppData {
         ? "No daylight saving"
         : dstByIndex[topNumber("$19")] ?? "UK / Europe";
   const routerRaw = topString("$18");
+  const routerPortValue = /^\d+$/.test(routerRaw)
+    ? Number(routerRaw)
+    : topNumber("$18");
+  const remoteServer = topString("$29");
   const updatedRaw = topString("$14");
   const updatedDate = new Date(updatedRaw);
   const lastUpdated =
@@ -919,7 +1513,10 @@ export function convertLegacyArchive(archive: unknown): AppData {
     id: topString("$9") || "FD4",
     ip: topString("$11") || "192.168.1.50",
     port: 15273,
-    routerPort: /^\d+$/.test(routerRaw) ? Number(routerRaw) : 15273,
+    // Real archives store a boolean-like router setting at $18. Preserve a
+    // plausible legacy port from older fixtures, but never turn 0/1 into a TCP
+    // destination.
+    routerPort: routerPortValue >= 1024 ? routerPortValue : 15273,
     description: "Imported from FlexiDim Configuration for iOS",
     address,
     contact: topString("$6"),
@@ -929,13 +1526,15 @@ export function convertLegacyArchive(archive: unknown): AppData {
     longitude: topString("$15"),
     timezone: normalizeSiteTimeZone(topString("$17"), dst),
     dst,
-    remote: Boolean(topString("$28")),
-    remoteServer: topString("$28"),
+    // A remembered remote server is present even on local type-0 sites. Only
+    // non-local site types should select that transport automatically.
+    remote: topNumber("$13") !== 0 && Boolean(remoteServer),
+    remoteServer,
     securityCode: topString("$10"),
     autoDetect: topString("$12") !== "0" && topNumber("$12") !== 0,
     addressLines,
     siteType: topNumber("$13"),
-    routerInbound: Boolean(routerRaw) && routerRaw !== "0",
+    routerInbound: Boolean(routerPortValue),
     wirelessGateways: [0, 1, 2, 3].flatMap((index) => {
       const address = topString(`$${20 + index * 2}`);
       const count = topNumber(`$${21 + index * 2}`);

@@ -31,7 +31,7 @@ The original app was organized into ten sections, all represented in this migrat
 
 The migrated interface preserves the original configuration hierarchy. Basic Assignments, Scenes, Scene to Button, and Equipment first show only the top-level locations from the iOS configuration (for example, Ground Floor, First Floor, and Exterior Front). Selecting a location replaces that menu with its child areas (for example, Hall, Snug, Lounge, and Kitchen), with a Back control to return to the location list. Their ordering and nesting come from the `.fd4cfg` archive rather than being alphabetically rearranged. The main navigation follows the iOS order: Configurations, Basic Assignments, Scenes, Scene to Button, Users, Periods, Equipment, and Trace, with Sites retained above them.
 
-The Sites section follows the original app's site-picker model: it lists the sites saved on this device, lets you select one to edit its controller and location details, and provides a **Create site** button. Configuration editing is unlocked with the **Allow changes** switch in the top-right header.
+The Sites section follows the original app's site-picker model: it lists the sites saved on the server, lets you select one to edit its controller and location details, and provides a **Create site** button. Configuration editing is unlocked with the **Allow changes** switch in the top-right header.
 
 With changes allowed, Basic Assignments uses the original floor → room → switch flow and exposes the recovered switch controls for assigned channels, on/dimming behavior, timing, and off priority. Its add utility can automatically give every unassigned switch all channels in that switch's room. Scenes exposes the original extractor, security, and simple sequence creation utilities. Scene to Button also uses floor → room → switch navigation and provides a visual switch face whose buttons show separate first-press and second-press assignment indicators. Equipment exposes add controls for floors, switches, and lights only while changes are allowed.
 
@@ -51,22 +51,28 @@ The migration was reconstructed by:
 4. Inspecting Objective-C runtime metadata to recover controller and model class names, properties, and method selectors.
 5. Disassembling the ARM64 networking methods to identify the legacy Scene Controller message layouts.
 6. Reimplementing the recovered packet framing, CRC-16/X25 calculation, and reserved-byte escaping in a small Node.js bridge.
-7. Rebuilding the application model and interactions in React, TypeScript, and CSS with browser-local persistence.
+7. Rebuilding the application model and interactions in React, TypeScript, and CSS with server-side file persistence.
 8. Adding responsive layouts, an offline application shell, a web manifest, import/export, and automated protocol/rendering tests.
 
 The original app used raw TCP and UDP sockets, which browsers cannot open directly. FlexiDim Web therefore separates the system into two local pieces:
 
 ```text
 Browser / installed PWA
-        │ WebSocket on 127.0.0.1:8765
+        │ HTTP + WebSocket on port 3000
         ▼
-FlexiDim local bridge
+FlexiDim web server
+        │ private Compose network
+        ▼
+FlexiDim local bridge :8765
         │ legacy TCP on the home LAN
         ▼
 FlexiDim Scene Controller :15273
 ```
 
-The bridge listens on loopback only. It is not exposed to other devices on the LAN and does not route lighting data through a cloud service.
+With Compose, the bridge is private to the container network and the web server
+proxies the browser's `/bridge` WebSocket connection to it. Port `8765` is not
+published on the host, and lighting data is not routed through a cloud service.
+When launched directly with `npm run bridge`, it listens on loopback only.
 
 Type-0 controllers require the site's 16-character ASCII security code before
 they accept a session. Importing the original `.fd4cfg` file restores this value.
@@ -93,7 +99,7 @@ and whole-controller-transfer details, including confidence and safety limits.
 - Live switch/button commands
 - Scene playback by sending the scene's channel levels
 - Scene-to-button assignment and testing
-- Browser-local automatic configuration persistence
+- Server-side automatic configuration persistence with atomic file replacement
 - Portable JSON configuration backup and restore
 - Recovered DST rule-table parsing and sunrise/sunset calculation
 - Installer-access warning and explicit `FLEXIDIM` unlock flow
@@ -145,6 +151,11 @@ Run the web application in one terminal:
 npm run dev
 ```
 
+Development data is written to `./config/workspace.json`. Override the location
+with `CONFIG_DIR` when required. This command performs a production build before
+starting the local Node server so its filesystem behavior matches the container;
+restart it after changing source files.
+
 Run the Scene Controller bridge in a second terminal:
 
 ```bash
@@ -160,7 +171,9 @@ In **Sites**:
 3. Select **Connect**.
 4. Open **Trace** if you need to inspect connection attempts or controller replies.
 
-The bridge reports itself at `http://127.0.0.1:8765`. Visiting that address should return a small JSON status response when the bridge is running.
+The bridge reports itself at `http://127.0.0.1:8765`. Visiting that address
+should return a small JSON status response when the directly launched bridge is
+running. The web app connects through `/bridge` by default.
 
 ## Finding the Scene Controller
 
@@ -179,7 +192,15 @@ For a reliable installation, reserve the controller's address in the router so i
 
 ## Configuration data and backups
 
-FlexiDim Web saves edits automatically in the current browser's local storage. Data stays on that device and is not uploaded by the application.
+FlexiDim Web saves edits automatically on the web server. By default a local
+development run writes `./config/workspace.json`; a container writes
+`/config/workspace.json`. Writes use a temporary file followed by an atomic
+rename, and revision checks prevent one browser from silently overwriting a
+newer save from another browser.
+
+On the first run after upgrading from the browser-only version, an existing
+browser workspace is migrated to the server if the server has no workspace yet.
+After a successful migration, the old browser copy is removed.
 
 To make a durable backup:
 
@@ -189,11 +210,13 @@ To make a durable backup:
 
 Use **Import configuration** to restore that file on the same computer or move the logical configuration to another browser.
 
-The importer also accepts the original `.fd4cfg` files exported or emailed from FlexiDim Configuration for iOS. These are Apple binary property-list archives, not JSON files. FlexiDim Web decodes the archived site, areas, hardware channels, switches, scenes, button assignments, periods, and users locally in the browser and converts them to its web data model. The selected file is read only after you choose it; it is not uploaded to a server. Export a new `.fd4web.json` backup after checking the migrated configuration.
+The importer also accepts the original `.fd4cfg` files exported or emailed from FlexiDim Configuration for iOS. These are Apple binary property-list archives, not JSON files. FlexiDim Web decodes the archived site, areas, hardware channels, switches, scenes, button assignments, periods, and users in the browser and converts them to its web data model. The converted workspace is then saved to the server. Export a new `.fd4web.json` backup after checking the migrated configuration.
 
 The interface artwork and complete room-image set are converted from the IPA's iOS-specific `CgBI` PNG resources into browser-compatible PNG files during this migration. Imported `.fd4cfg` areas retain their original room-image identifiers.
 
-Clearing browser storage removes the working local copy, including locally stored user security keys, unless an exported backup exists.
+Clearing browser storage does not remove the server workspace. Deleting
+`workspace.json` from the configured data directory does, so include that
+directory in host or PVC backups.
 
 ## Production build
 
@@ -209,7 +232,65 @@ Start the built web application with:
 npm run start
 ```
 
-The local bridge is still launched separately with `npm run bridge`.
+The server listens on port `3000` and stores data in `./config` unless
+`CONFIG_DIR` is set.
+
+## Container deployment
+
+Build and run the image with a persistent `/config` mount:
+
+```bash
+docker build -t flexidim-web .
+docker run --rm -p 3000:3000 \
+  -v flexidim-config:/config \
+  flexidim-web
+```
+
+Or use the included Compose configuration:
+
+```bash
+docker compose up --build
+```
+
+This single command builds one image and starts both `flexidim-web` and
+`flexidim-bridge`. Only the web app is published, at
+[http://localhost:3000](http://localhost:3000); the bridge remains private and
+is reached through the web server's `/bridge` WebSocket proxy. Both services
+must become healthy before the web app is considered ready.
+
+Compose supplies an internal development bridge token by default. Set a strong
+deployment-specific value when the stack is reachable by other users:
+
+```bash
+FLEXIDIM_BRIDGE_TOKEN="$(openssl rand -hex 32)" docker compose up --build
+```
+
+The proxy accepts browser WebSockets only from the web app's own origin. The
+application itself is an installer console, not an internet-facing identity
+system; put TLS and authentication in a trusted reverse proxy before exposing
+port `3000` beyond a trusted network.
+
+The named `flexidim-config` volume is mounted at `/config` in the web service,
+where `workspace.json` is written. The bridge is stateless and does not need
+the volume.
+
+Container networking can prevent UDP broadcast discovery from reaching the
+physical LAN, especially under Docker Desktop. If **Auto Detect** does not find
+the controller, disable it and enter the controller's reserved IP address; the
+bridge can make the outbound TCP connection through the container network.
+
+For Kubernetes, mount a ReadWriteOnce PVC at `/config` and expose container
+port `3000`. A single-replica PVC, Deployment, and Service example is provided
+in `deploy/kubernetes.yaml`:
+
+```bash
+kubectl apply -f deploy/kubernetes.yaml
+```
+
+Replace `flexidim-web:latest` with the image reference in your registry. Run a
+single replica: the revision lock is process-local and the workspace is a
+single shared file, so multiple replicas must not write the same PVC
+concurrently.
 
 ## Validation
 
@@ -259,7 +340,9 @@ These details are documented for maintenance and interoperability. Do not send e
 
 ## Privacy and network safety
 
-- The working configuration is stored in browser local storage.
+- The working configuration is stored in `/config/workspace.json` on the host.
+- The file includes controller and user security keys; keep the deployment
+  private and restrict access to the mounted volume.
 - The bridge binds to `127.0.0.1`, not `0.0.0.0`.
 - The bridge accepts only a controller hostname/IP and TCP port from the web app.
 - No defunct JCL/FlexiDim remote service is required for local commands.

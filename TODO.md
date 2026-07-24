@@ -5,30 +5,30 @@ This checklist tracks functional parity with the recovered iOS 2.97 application.
 ## Current baseline
 
 - [x] All ten recovered sections are represented: Sites, Configurations, Equipment, Switches, Basic Assignments, Scenes, Scene to Button, Periods, Users, and Trace.
-- [x] Browser edits persist locally.
+- [x] Browser edits persist to revisioned server-side storage.
 - [x] UDP discovery, type-0 TCP authentication, CRC-16/X25 framing, dim commands, raw switch commands, and passive `f2` level feedback work through the local bridge.
 - [x] Enforce the installer/change locks consistently across every editor.
 - [x] Replace cosmetic actions with working behavior or an explicit “not available” state.
 
 ## Phase 1 — trustworthy data model
 
-- [ ] Make Site → Configuration → ConfigContent the canonical ownership hierarchy.
+- [x] Make Site → Configuration → ConfigContent the canonical ownership hierarchy.
 - [x] Fix site creation/selection so configuration content cannot leak between sites.
 - [x] Preserve stable iOS archive keys separately from web display IDs.
-- [ ] Add site type, four address lines, router-inbound enable, gateway values/counts, A/B module arrays, and update timestamp.
-- [ ] Add hardware rank, exact type/index/module, min/max/max-permissible/default, accessory, dimmable, and changed fields.
-- [ ] Add complete scene flags/type/lock/rank and exact channel settings.
+- [x] Add site type, four address lines, router-inbound enable, gateway values/counts, A/B module arrays, and update timestamp.
+- [x] Add hardware rank, exact type/index/module, min/max/max-permissible/default, accessory, dimmable, and changed fields.
+- [x] Add complete scene flags/type/lock/rank and exact channel settings.
 - [x] Add period start/end modes and offsets.
-- [ ] Replace simplified users with security code, room/switch access, profile data, and profile version.
-- [ ] Add referential-integrity validation for moving/deleting rooms, channels, switches, modules, scenes, periods, and users.
+- [x] Replace simplified users with security code, room/switch access, profile data, and profile version.
+- [x] Add referential-integrity validation for moving/deleting rooms, channels, switches, modules, scenes, periods, and users.
 - [x] Version and validate local-storage data migrations.
 
 ## Phase 2 — legacy document compatibility
 
-- [ ] Recover and document every `encodeWithCoder:`/`initWithCoder:` field mapping.
+- [x] Recover and document every `encodeWithCoder:`/`initWithCoder:` field mapping.
 - [ ] Import both module buses without changing controller-address order.
-- [ ] Import exact output/accessory types and hardware limits.
-- [ ] Import complete periods, users, scene rules, ranks, and flags.
+- [x] Import exact output/accessory types and hardware limits.
+- [x] Import complete periods, users, scene rules, ranks, and flags.
 - [x] Implement the iOS site-name/site-ID/timestamp conflict workflow.
 - [ ] Support `.fd4xlt` translation documents if their archive semantics differ.
 - [ ] Export a valid binary `.fd4cfg` and prove import → export → import equivalence.
@@ -50,7 +50,7 @@ This checklist tracks functional parity with the recovered iOS 2.97 application.
 ### Sites and configurations
 
 - [ ] Add geolocation, exact time-zone/DST settings, site type, router flag, and gateway editors.
-- [ ] Respect Auto Detect and local/remote connection mode.
+- [x] Respect Auto Detect and local/remote connection mode.
 - [x] Implement the recovered `FLEXIDIM` equipment-change unlock.
 - [ ] Add local CRC, controller comparison state, deleted-item warnings, and honest transfer readiness.
 
@@ -77,7 +77,7 @@ This checklist tracks functional parity with the recovered iOS 2.97 application.
 - [x] Implement absolute/sunrise/sunset start and end modes with offsets.
 - [x] Parse the bundled `.DST` rule files and calculate rule transitions; do not treat DST as a label only.
 - [x] Calculate and display sunrise/sunset using site coordinates, time zone, and DST.
-- [ ] Implement user room/switch access ordering, security-key generation/export, and profile status.
+- [x] Implement user room/switch access ordering, security-key generation/export, and profile status.
 - [ ] Implement user-profile-only controller transfer after protocol verification.
 
 ## Phase 5 — evidence-gated controller protocols
@@ -104,14 +104,14 @@ This checklist tracks functional parity with the recovered iOS 2.97 application.
 - [x] Make the bridge endpoint configurable instead of hard-coding browser loopback.
 - [x] Add authenticated pairing, origin checks, and least-privilege LAN binding; WSS is supported through a trusted local TLS terminator.
 - [ ] Verify installed-PWA offline assets, lifecycle reconnects, touch controls, and landscape layouts on iPad.
-- [ ] Document safe desktop-local and iPad-plus-companion deployment modes.
+- [x] Document safe desktop-local, container/PVC, and iPad-plus-companion deployment modes.
 
 ## Phase 8 — verification
 
 - [ ] Add sanitized real `.fd4cfg` golden fixtures and field-by-field snapshots.
 - [ ] Add import/export round-trip and unknown-field preservation tests.
-- [ ] Add multi-site/configuration ownership and storage-migration tests.
-- [ ] Add deletion/move referential-integrity tests.
+- [x] Add multi-site/configuration ownership and storage-migration tests.
+- [x] Add deletion/move referential-integrity tests.
 - [ ] Add scene timing/rule/color/blind packet tests.
 - [ ] Add physical/logical switch mapping tests on every control surface.
 - [ ] Add stateful emulator tests for discovery, authentication, replies, refusal, retries, and disconnects.

@@ -26,7 +26,21 @@ export function isPrivateIpv4(address) {
 
 export function lanCandidates(preferredHost = "", interfaces = os.networkInterfaces()) {
   const candidates = new Set();
-  if (isPrivateIpv4(preferredHost)) candidates.add(preferredHost);
+  if (isPrivateIpv4(preferredHost)) {
+    // In a container, os.networkInterfaces() only exposes the container subnet.
+    // Keep the last-known controller first, then scan its bounded /24 so Auto
+    // Detect can still find a controller whose DHCP address changed.
+    candidates.add(preferredHost);
+    const preferred = ipv4ToNumber(preferredHost);
+    const mask = ipv4ToNumber("255.255.255.0");
+    if (preferred !== undefined && mask !== undefined) {
+      const network = (preferred & mask) >>> 0;
+      const broadcast = (network | (~mask >>> 0)) >>> 0;
+      for (let value = network + 1; value < broadcast; value += 1) {
+        candidates.add(numberToIpv4(value >>> 0));
+      }
+    }
+  }
   for (const records of Object.values(interfaces)) {
     for (const record of records || []) {
       if (record.internal || record.family !== "IPv4" || !isPrivateIpv4(record.address)) continue;

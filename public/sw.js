@@ -1,5 +1,22 @@
-const CACHE = "flexidim-web-v2";
-const ASSETS = ["/", "/manifest.webmanifest", "/flexidim/icon.png", "/flexidim/sites.png", "/flexidim/scenes.png", "/flexidim/switches.png"];
-self.addEventListener("install", (event) => event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS))));
-self.addEventListener("activate", (event) => event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key))))));
-self.addEventListener("fetch", (event) => { if (event.request.method === "GET") event.respondWith(fetch(event.request).then((response) => { const copy = response.clone(); caches.open(CACHE).then((cache) => cache.put(event.request, copy)); return response; }).catch(() => caches.match(event.request))); });
+// Retire the earlier offline worker. Configuration and connection behavior must
+// always come from the currently running server image; caching an old client
+// bundle can make a rebuilt bridge receive obsolete connection fields.
+self.addEventListener("install", (event) => {
+  event.waitUntil(self.skipWaiting());
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(
+      keys
+        .filter((key) => key.startsWith("flexidim-web-"))
+        .map((key) => caches.delete(key)),
+    );
+    const windows = await self.clients.matchAll({ type: "window" });
+    await self.registration.unregister();
+    await Promise.all(
+      windows.map((client) => client.navigate(client.url).catch(() => undefined)),
+    );
+  })());
+});

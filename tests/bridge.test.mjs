@@ -148,6 +148,23 @@ test("builds a bounded controller scan from private LAN interfaces", () => {
   assert.equal(isPrivateIpv4("8.8.8.8"), false);
 });
 
+test("scans the saved controller subnet when running on a Docker subnet", () => {
+  const interfaces = {
+    eth0: [{
+      address: "172.20.0.3",
+      netmask: "255.255.0.0",
+      family: "IPv4",
+      internal: false,
+    }],
+  };
+  const candidates = lanCandidates("192.168.50.27", interfaces);
+  assert.equal(candidates[0], "192.168.50.27");
+  assert.ok(candidates.includes("192.168.50.1"));
+  assert.ok(candidates.includes("192.168.50.254"));
+  assert.ok(candidates.includes("172.20.0.1"));
+  assert.ok(candidates.length <= 508, "discovery must remain bounded to two /24 networks");
+});
+
 test("uses the discovery protocol recovered from the iOS binary", () => {
   assert.equal(FLEXIDIM_DISCOVERY_MESSAGE, "FLEX");
   assert.equal(FLEXIDIM_DISCOVERY_PORT, 15270);
