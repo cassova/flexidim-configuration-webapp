@@ -36,4 +36,7 @@ USER node
 # each rebuild would leak one until the disk fills. The web service's named
 # volume in compose works fine without it.
 EXPOSE 3000 8765
-CMD ["node", "server/host.mjs"]
+# The default command supervises both the web host and the bridge, so a plain
+# `docker run` of this image is a complete single-container deployment. Compose
+# overrides the command per service to keep running them separately.
+CMD ["node", "server/start-all.mjs"]

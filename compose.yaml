@@ -2,6 +2,10 @@ services:
   flexidim-web:
     build: .
     image: flexidim-web:local
+    # The image's default command starts web + bridge together for
+    # single-container deployments; this stack runs them as separate services,
+    # so each service picks its own process explicitly.
+    command: ["node", "server/host.mjs"]
     environment:
       FLEXIDIM_BRIDGE_UPSTREAM_HOST: flexidim-bridge
       FLEXIDIM_BRIDGE_UPSTREAM_PORT: 8765

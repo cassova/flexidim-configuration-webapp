@@ -68,6 +68,70 @@ test("Compose builds and starts both private bridge and persistent web services"
     dockerfile,
     /COPY (?:--chown=node:node )?--from=build \/app\/bridge \.\/bridge/,
   );
+  // The image must default to the all-in-one supervisor so a plain
+  // `docker run` deploys everything, while each compose service must pin its
+  // own single process instead of inheriting that default.
+  assert.match(dockerfile, /CMD \["node", "server\/start-all\.mjs"\]/);
+  assert.match(compose, /command: \["node", "server\/host\.mjs"\]/);
+  assert.match(compose, /command: \["node", "bridge\/server\.mjs"\]/);
+});
+
+test("the all-in-one launcher runs both services and stops cleanly", async (t) => {
+  let bridgePort;
+  let webPort;
+  try {
+    bridgePort = await unusedPort();
+    webPort = await unusedPort();
+  } catch (error) {
+    if (error?.code === "EPERM") {
+      t.skip("This environment does not permit local listening sockets");
+      return;
+    }
+    throw error;
+  }
+  const configDirectory = await mkdtemp(join(tmpdir(), "flexidim-all-"));
+  const launcher = spawn(process.execPath, ["server/start-all.mjs"], {
+    stdio: "pipe",
+    env: {
+      ...process.env,
+      HOST: "127.0.0.1",
+      PORT: String(webPort),
+      CONFIG_DIR: configDirectory,
+      FLEXIDIM_BRIDGE_HOST: "127.0.0.1",
+      FLEXIDIM_BRIDGE_PORT: String(bridgePort),
+      FLEXIDIM_BRIDGE_UPSTREAM_HOST: "127.0.0.1",
+      FLEXIDIM_BRIDGE_UPSTREAM_PORT: String(bridgePort),
+    },
+  });
+  t.after(async () => {
+    launcher.kill("SIGKILL");
+    await rm(configDirectory, { recursive: true, force: true });
+  });
+
+  await waitForHttp(`http://127.0.0.1:${webPort}/api/workspace`, launcher);
+  // The bridge must be reachable through the web proxy without any upstream
+  // configuration beyond the shared port, exactly as inside the container.
+  const firstMessage = await new Promise((resolve, reject) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${webPort}/bridge`);
+    const timeout = setTimeout(() => {
+      socket.close();
+      reject(new Error("Timed out waiting for the proxied bridge"));
+    }, 3000);
+    socket.addEventListener("message", (event) => {
+      clearTimeout(timeout);
+      socket.close();
+      resolve(JSON.parse(String(event.data)));
+    }, { once: true });
+    socket.addEventListener("error", () => {
+      clearTimeout(timeout);
+      reject(new Error("Proxied bridge WebSocket failed"));
+    }, { once: true });
+  });
+  assert.equal(firstMessage.state, "bridge");
+
+  launcher.kill("SIGTERM");
+  const exit = await waitForExit(launcher, 5000);
+  assert.deepEqual(exit, { code: 0, signal: null });
 });
 
 test("the web server proxies an authenticated bridge WebSocket", async (t) => {

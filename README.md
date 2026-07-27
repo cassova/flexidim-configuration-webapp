@@ -108,7 +108,7 @@ sending anything.
 > FlexiDim installer—especially where loss of lighting could create a safety
 > risk.
 
-## Quick start with Docker Compose
+## Quick start
 
 Docker Compose is the simplest deployment because it starts the web server and
 the local controller bridge together.
@@ -150,6 +150,37 @@ Compose creates a named `flexidim-config` volume for persistent configuration
 storage. Normal rebuilds reuse it. `docker compose down` stops the application
 without deleting that volume; do not add `-v` unless you intentionally want to
 remove the saved workspace and already have an external backup.
+
+## Deploying the pre-built container image
+
+Every push to `main` publishes a single image containing both the web server
+and the bridge to GHCR as `ghcr.io/cassova/flexidim-configuration-webapp`,
+tagged `latest` and with a version number (`vX.Y.Z`).
+
+By default the container starts both the web server and the bridge, so a
+single container is a complete deployment:
+
+```bash
+docker run -d --name flexidim \
+  -p 3000:3000 \
+  -v flexidim-config:/config \
+  --restart unless-stopped \
+  ghcr.io/cassova/flexidim-configuration-webapp:latest
+```
+
+- Map a host port to container port `3000` for the web UI. The bridge stays on
+  loopback inside the container and is reached through the web server's proxy;
+  do not publish port `8765`.
+- Mount a persistent volume (or a host directory) at `/config` to keep the
+  workspace across container recreates.
+
+If controller auto-detection fails because container networking blocks UDP
+broadcast, enter the controller's address manually, or on Linux run with
+`--network host` instead of `-p 3000:3000`.
+
+The repository's [compose.yaml](compose.yaml) instead runs the same image as
+two separate services with healthchecks; both layouts store data in the same
+`/config` volume.
 
 ## First-time setup
 
