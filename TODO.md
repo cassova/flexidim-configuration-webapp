@@ -10,6 +10,22 @@ hardware qualification and release may not skip an incomplete prerequisite.
 A plausible frame, a matching checksum, or a successful comparison is not
 enough evidence to enable a configuration write.
 
+## Checklist conventions
+
+Every box is either resolved or open. A ticked box means resolved, which is not
+the same as done — read the strikethrough.
+
+- `- [x]` — **done**, with the closing evidence stated in the item itself.
+- `- [x] ~~struck through~~ **n/a** — reason` — **closed as out of scope, not
+  done.** Ticked so it stops reading as pending work, struck so it can never be
+  mistaken for delivered evidence. Each one names why: either it needs hardware
+  this project does not have and has agreed not to acquire, or it belongs to the
+  deferred non-transfer work listed at the end of this file, or it has been
+  overtaken by events. A struck item must never be counted as evidence for a
+  capability, and reopening one is a deliberate decision to be recorded here.
+- `- [ ]` — genuinely open work that this project still intends to do. These are
+  the only items that gate anything.
+
 ## Current safe state
 
 - [x] The web Send button remains disabled until the same connection has a
@@ -220,8 +236,14 @@ conversation.
       `f2`/`f4` records counted by the misleadingly named `F3MsgCount`.
 - [x] Recover the exact app-side success condition: state 8 observes ten
       `F3` messages and returns to state 0. There is no later sender frame.
-- [ ] Confirm whether the controller resets itself after `ff fa` or receives a
-      separate reset instruction. No reset-specific frame has yet been found.
+- [x] Confirm whether the controller resets itself after `ff fa` or receives a
+      separate reset instruction. The controller resets itself: the sender's
+      frame inventory is closed because every transmit path resolves through
+      `-appendCRC:length:`, and no reset builder exists in it. A complete
+      successful transfer emits only the eight pinned frame families, yet the
+      installed controller rebooted during both the **[IOS-LIVE]** and
+      **[WEB-LIVE]** runs. Which of `ff fa`, `ff f9` or `ff f8` the firmware
+      treats as the trigger cannot be isolated without a Gate 3 capture.
 
 ### 2.2 Acknowledgements, retries, and aborts
 
@@ -236,9 +258,12 @@ conversation.
 - [ ] Prove the meaning of `06` and `15` in non-image transfer states.
 - [x] Recover handshake retry limits for `ff fc`: retry after 32 process ticks,
       five retries after the original attempt, then `ff f8` and stop.
-- [ ] Recover timeout units and maximums for every state:
+- [x] Recover timeout units and maximums for every state. The unit is one 100-ms
+      process tick throughout, and each value below is asserted by a test:
   - initial handshake: **32 ticks and five retries recovered**;
-  - each image block;
+  - post-handshake settle before block 0: **21 ticks recovered**;
+  - each image block: **101 ticks and five retries recovered**, as already
+    established two items above;
   - post-`FA` status: **151 ticks recovered**;
   - post-`F9` reply: **1,201 ticks recovered**;
   - user/profile blocks: **no per-block ACK in the recovered state-7 sender**;
@@ -247,14 +272,30 @@ conversation.
       its exact output and cleanup.
 - [ ] Prove behavior for a short ACK, corrupt ACK, unexpected byte, duplicate
       ACK, late ACK, and data arriving across multiple reads.
-- [ ] Prove whether a failed verification still activates the downloaded image
-      or rolls back.
+- [x] ~~Prove whether a failed verification still activates the downloaded image
+      or rolls back.~~ **n/a** — not knowable from the app. The sender emits
+      `ff f8` on a state-5 rejection and escaped `ff fe` on a state-6 rejection
+      and then stops, so activation is entirely a firmware decision and only a
+      Gate 3 spare could observe it. Mitigated instead by the mandatory
+      post-transfer Compare and physical inspection in Gate 9.
 
 ### 2.3 Conditional branches
 
-- [ ] Recover `sendChannelConfig:` framing and acknowledgement behavior.
-- [ ] Recover `nextModuleMessage:` framing and queue behavior.
-- [ ] Recover `sendWiGWList` framing.
+The first four items below are the module/channel/profile-only transmission
+branches. They are all undecoded, all fail closed today, and all belong to the
+deferred non-transfer work at the end of this file rather than to the full
+type-0 configuration transfer this plan delivers.
+
+- [x] ~~Recover `sendChannelConfig:` framing and acknowledgement behavior.~~
+      **n/a** — deferred branch. Never resolved by the `-appendCRC:length:`
+      frame-builder enumeration, and refused by the transfer session and the
+      `channelProfiles` capability.
+- [x] ~~Recover `nextModuleMessage:` framing and queue behavior.~~ **n/a** —
+      deferred branch, undecoded, refused by the `moduleProfiles` capability.
+- [x] ~~Recover `sendWiGWList` framing.~~ **n/a** — deferred branch, and
+      unreachable rather than merely refused: no bridge message type exists for
+      it, so the deny-by-default registry rejects it. Gateway data is edited and
+      round-tripped locally only.
 - [x] Finish `sendUserData:userOnly:false` framing, per-user chunking, empty
       payload behavior, all-users marker, and multi-user ordering.
 - [x] Finish `initUserData` payload compilation for the complete one-byte
@@ -263,13 +304,34 @@ conversation.
       zero-based room floor indexes, switch family markers and button slots,
       hardware/accessory suffixes, and the original app's display-rank ordering
       with Darwin NSString dictionary order as the exact-tie fallback.
-- [ ] Determine which changed/pending flags select each branch.
-- [ ] Recover site-type 1 behavior separately.
-- [ ] Keep site types greater than 1 disabled until their AES-OFB session,
+- [x] ~~Determine which changed/pending flags select each branch.~~ **n/a** —
+      only needed to select between the three struck branches above. The flags
+      themselves (`modulesChanged`, per-channel `hardwareChanged`, pending
+      module and user-profile status) are decoded and round-tripped, and surface
+      as transfer-readiness warnings. The bridge accepts only the `full`
+      configuration mode, so no branch selection occurs.
+- [x] ~~Recover site-type 1 behavior separately.~~ **n/a** — belongs to the
+      deferred encrypted/remote controller sessions, and would need a type-1
+      installation to observe. Type 1 is hard-refused today, not partially
+      supported: no socket is opened, readiness blocks, and the session throws.
+- [x] Keep site types greater than 1 disabled until their AES-OFB session,
       IV sequencing, and remote authentication paths have independent evidence.
-- [ ] Build a firmware behavior matrix. The installed controller currently
+      Enforced in four independent places and stricter than required, because
+      site type 1 is refused as well: the connection request refuses to open a
+      socket, transfer readiness raises a blocker that disables both the dry-run
+      and Send buttons, the transfer session constructor throws, and the
+      firmware profile lists only site type 0. No AES-OFB, IV-sequencing or
+      remote-authentication code exists in the tree to enable by accident.
+- [x] ~~Build a firmware behavior matrix. The installed controller currently
       reports version 4.0, but that does not prove other versions share its
-      transfer state machine.
+      transfer state machine.~~ **n/a** — the artifact cannot be built without
+      other controllers to observe, and the safety property it was meant to
+      protect is already enforced elsewhere: live transfer requires the
+      qualified version `4.0` exactly, and an unqualified version is rejected
+      with a test pinning it. The existing capability-versus-evidence matrix
+      keeps its three enforced invariants. Worth revisiting only if a second
+      firmware version ever needs to be qualified, at which point the per-version
+      facts should live in that matrix rather than beside the version constant.
 
 ### 2.4 Image-to-block proof
 
@@ -294,28 +356,49 @@ conversation.
 
 ## Gate 3 — Obtain original-app traffic
 
-The offline oracle proves app output under scripted inputs. A packet capture is
-still required to prove what a controller actually returns and when.
+**This entire gate is n/a.** Every item needs an unloaded spare Scene
+Controller, no spare exists, and obtaining extra hardware is explicitly not a
+prerequisite imposed by the user. The gate's own stop rule already applied.
 
-- [ ] Obtain an unloaded spare Scene Controller matching the installed model and
-      firmware 4.0.
-- [ ] Isolate it from lighting loads and the production network.
-- [ ] Save its current configuration and identify a supported recovery route.
-- [ ] Prove the original iOS app can restore that saved configuration to the
-      spare.
-- [ ] Capture one complete, successful original-iOS transfer with:
-  - the exact source `.fd4cfg`;
-  - oracle compiled image and checksum;
-  - raw bidirectional TCP bytes;
-  - timestamps and connection lifecycle;
-  - controller model and firmware;
-  - iOS progress/result text.
-- [ ] Capture one deliberate original-iOS block retry using a controllable proxy
-      or emulator, not by corrupting production traffic.
-- [ ] Capture one original-iOS abort before any image block is accepted.
-- [ ] Compare the original-app capture with the offline oracle transcript.
-      Every difference must be explained and pinned by a regression fixture.
-- [ ] Store only sanitized synthetic captures in Git.
+It has also been partly overtaken by events. The purpose of a capture was to
+prove what a controller actually returns and when, before risking a write; the
+firmware 4.0 controller has since completed a full **[IOS-LIVE]** transfer and a
+full **[WEB-LIVE]** transfer through reset, reconnect and return to normal
+status. That does not give byte-level reply timing, so a capture would still be
+the only route to a handful of residual facts — the exact reset trigger frame,
+`06`/`15` semantics as the *controller* uses them, and whether a failed
+verification activates or rolls back. None of those gate the delivered path,
+and each is recorded as struck or blocked where it appears.
+
+- [x] ~~Obtain an unloaded spare Scene Controller matching the installed model
+      and firmware 4.0.~~ **n/a** — no spare; acquiring hardware is out of scope.
+- [x] ~~Isolate it from lighting loads and the production network.~~ **n/a** —
+      no spare to isolate.
+- [x] ~~Save its current configuration and identify a supported recovery
+      route.~~ **n/a** — no spare.
+- [x] ~~Prove the original iOS app can restore that saved configuration to the
+      spare.~~ **n/a** — no spare.
+- [x] ~~Capture one complete, successful original-iOS transfer with:~~ **n/a** —
+      no spare, and production traffic must not be used as a protocol-development
+      target. The app side of every field below is already **[ORACLE]**-proven
+      offline; only the controller's replies and timing would be new.
+  - ~~the exact source `.fd4cfg`;~~
+  - ~~oracle compiled image and checksum;~~
+  - ~~raw bidirectional TCP bytes;~~
+  - ~~timestamps and connection lifecycle;~~
+  - ~~controller model and firmware;~~
+  - ~~iOS progress/result text.~~
+- [x] ~~Capture one deliberate original-iOS block retry using a controllable
+      proxy or emulator, not by corrupting production traffic.~~ **n/a** — no
+      spare. The app-side retry behaviour is oracle-proven and emulator-tested.
+- [x] ~~Capture one original-iOS abort before any image block is accepted.~~
+      **n/a** — no spare.
+- [x] ~~Compare the original-app capture with the offline oracle transcript.
+      Every difference must be explained and pinned by a regression fixture.~~
+      **n/a** — there is no capture to compare against.
+- [x] ~~Store only sanitized synthetic captures in Git.~~ **n/a** — no capture
+      exists. The equivalent standing rule for fixtures is ticked in Gate 1.1
+      and enforced by the privacy regression, so nothing is unguarded here.
 
 Stop here if no spare and proven restore route are available.
 
@@ -485,27 +568,41 @@ This gate may generate bytes but must not open a socket.
 
 ## Gate 8 — Optional spare-controller qualification
 
-No spare controller is currently available, and obtaining extra hardware is not
-a prerequisite imposed by the user. These remain optional risk-reduction tests:
+**This entire gate is n/a.** No spare controller is available, obtaining extra
+hardware is not a prerequisite imposed by the user, and the gate was already
+labelled optional risk reduction. Its remaining value would be destructive-case
+rehearsal on hardware that can be broken safely, which the installed controller
+is not. Everything below stays struck unless a spare actually appears.
 
-- [ ] If one becomes available, run the web implementation against the isolated
+- [x] ~~If one becomes available, run the web implementation against the
+      isolated spare.~~ **n/a** — no spare.
+- [x] ~~Prove the emitted transcript matches the original iOS capture except for
+      documented dynamic fields.~~ **n/a** — no spare and no capture; Gate 3 is
+      struck for the same reason.
+- [x] ~~Verify the spare returns to service after reset.~~ **n/a** — no spare.
+      The installed controller did return to normal status after its
+      **[WEB-LIVE]** transfer.
+- [x] ~~Verify its installed result using the original iOS app and the web
+      Compare operation.~~ **n/a** — no spare. The equivalent check on the
+      installed controller is the open post-transfer Compare in Gate 9.
+- [x] ~~Power-cycle the spare and verify the new configuration remains
+      installed.~~ **n/a** — no spare, and power-cycling the installed
+      controller to test persistence is not an acceptable substitute.
+- [x] ~~Restore the pre-test configuration with the proven recovery procedure.~~
+      **n/a** — no spare. The iPad recovery route for the installed controller is
+      retained under Gate 9.
+- [x] ~~Repeat:~~ **n/a** — no spare. These destructive rehearsals must not be
+      performed on the installed lighting system. The app side of each is
+      oracle-proven and emulator-tested offline instead.
+  - ~~normal success;~~
+  - ~~one retried block;~~
+  - ~~abort before block 0;~~
+  - ~~disconnect after a middle block;~~
+  - ~~reset timeout;~~
+  - ~~post-transfer verification failure.~~
+- [x] ~~Record controller model, firmware, results, and recovery outcome without
+      including configuration payloads.~~ **n/a** — nothing to record without a
       spare.
-- [ ] Prove the emitted transcript matches the original iOS capture except for
-      documented dynamic fields.
-- [ ] Verify the spare returns to service after reset.
-- [ ] Verify its installed result using the original iOS app and the web Compare
-      operation.
-- [ ] Power-cycle the spare and verify the new configuration remains installed.
-- [ ] Restore the pre-test configuration with the proven recovery procedure.
-- [ ] Repeat:
-  - normal success;
-  - one retried block;
-  - abort before block 0;
-  - disconnect after a middle block;
-  - reset timeout;
-  - post-transfer verification failure.
-- [ ] Record controller model, firmware, results, and recovery outcome without
-      including configuration payloads.
 
 Any unrecoverable or unexplained outcome disables the matching capability and
 returns the project to the relevant oracle/state-machine gate.
@@ -520,7 +617,10 @@ returns the project to the relevant oracle/state-machine gate.
 - [x] Confirm the connected firmware exactly matches qualified version 4.0.
 - [x] Retain the exact configuration and its checksum before confirmation.
 - [x] Run one pre-transfer Compare and retain its result.
-- [ ] Keep live lighting controls idle for the duration.
+- [x] ~~Keep live lighting controls idle for the duration.~~ **n/a** — this was a
+      precondition for a transfer that has already happened, so it can no longer
+      be complied with, only reported. It is not recorded either way. Reinstate
+      it as an open item before any future live transfer.
 - [x] Perform one transfer—never a loop or unattended retry.
 - [x] Observe the web transfer complete successfully through the controller
       reset/reconnect lifecycle.
@@ -566,3 +666,9 @@ These remain outside the current critical path:
 - remaining PWA checks on a physical iPad.
 
 They must follow the same evidence labels and fail-closed capability rules.
+
+The struck items in Gate 2.3 fold into the first two bullets: `sendChannelConfig:`,
+`nextModuleMessage:`, `sendWiGWList` and their branch-selection flags into
+module/channel/user-profile-only transmission, and site-type 1 into
+encrypted/remote controller sessions. Reopening either bullet reopens those
+items with it.

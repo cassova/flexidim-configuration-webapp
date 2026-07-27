@@ -14,6 +14,16 @@ import {
   SanitizedTransferAudit,
   TransferSafetyCoordinator,
 } from "./transfer-safety.mjs";
+import {
+  closeFrame,
+  decodeFrames,
+  IDLE_TIMEOUT_MS,
+  PING_INTERVAL_MS,
+  pingFrame,
+  pongFrame,
+  websocketFrame,
+  WebSocketHeartbeat,
+} from "./websocket.mjs";
 
 const BRIDGE_PORT = Number(process.env.FLEXIDIM_BRIDGE_PORT || 8765);
 const BRIDGE_HOST = String(process.env.FLEXIDIM_BRIDGE_HOST || "127.0.0.1");
@@ -40,14 +50,24 @@ function log(...args) {
 const hex = (buffer) =>
   buffer.length ? buffer.toString("hex").match(/.{1,2}/g).join(" ") : "(empty)";
 
-function websocketFrame(value) {
-  const payload = Buffer.from(JSON.stringify(value));
-  if (payload.length < 126) return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
-  const head = Buffer.alloc(4); head[0] = 0x81; head[1] = 126; head.writeUInt16BE(payload.length, 2);
-  return Buffer.concat([head, payload]);
-}
-
 function emit(ws, value) { if (!ws.destroyed) ws.write(websocketFrame(value)); }
+
+// A browser that vanishes without a close frame or a FIN would otherwise keep
+// its Scene Controller session — the controller's only control slot — open for
+// the lifetime of the bridge process. Reaping it releases the controller by the
+// ordinary `close` path, so an in-flight transfer is cancelled and the socket
+// destroyed exactly as it is for a deliberate disconnect.
+const heartbeat = new WebSocketHeartbeat({
+  intervalMs: Number(process.env.FLEXIDIM_BRIDGE_PING_INTERVAL_MS || PING_INTERVAL_MS),
+  timeoutMs: Number(process.env.FLEXIDIM_BRIDGE_IDLE_TIMEOUT_MS || IDLE_TIMEOUT_MS),
+  ping: (ws) => {
+    if (!ws.destroyed) ws.write(pingFrame());
+  },
+  reap: (ws, silentMs) => {
+    log(`○ app client unresponsive for ${silentMs}ms; releasing its Scene Controller session`);
+    ws.destroy();
+  },
+});
 
 function queueControllerStatus(ws, controller, statuses) {
   controller.flexidimPendingLevels ??= {};
@@ -74,25 +94,6 @@ function queueControllerStatus(ws, controller, statuses) {
       if (Object.keys(levels).length) emit(ws, { type: "channelStatus", levels });
     }, 500);
   }
-}
-
-function decodeFrames(buffer) {
-  const messages = []; let closeRequested = false; let offset = 0;
-  while (offset + 2 <= buffer.length) {
-    const first = buffer[offset]; const second = buffer[offset + 1]; let length = second & 0x7f; let cursor = offset + 2;
-    if (length === 126) { if (cursor + 2 > buffer.length) break; length = buffer.readUInt16BE(cursor); cursor += 2; }
-    if (length === 127) { if (cursor + 8 > buffer.length) break; length = Number(buffer.readBigUInt64BE(cursor)); cursor += 8; }
-    const masked = Boolean(second & 0x80); let mask;
-    if (masked) { if (cursor + 4 > buffer.length) break; mask = buffer.subarray(cursor, cursor + 4); cursor += 4; }
-    if (cursor + length > buffer.length) break;
-    const payload = Buffer.from(buffer.subarray(cursor, cursor + length));
-    if (masked) for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i % 4];
-    const opcode = first & 0x0f;
-    if (opcode === 1) messages.push(payload.toString("utf8"));
-    else if (opcode === 8) closeRequested = true;
-    offset = cursor + length;
-  }
-  return { messages, closeRequested, rest: buffer.subarray(offset) };
 }
 
 function writeController(ws, bytes, label) {
@@ -478,17 +479,33 @@ server.on("upgrade", (request, socket) => {
     evidence: active.evidence,
   });
   emit(socket, transferSafety.status(clientIds.get(socket)));
+  heartbeat.add(socket);
+  // `http.Server` creates its connections with `allowHalfOpen: true`, so a peer
+  // FIN raises `end` and leaves the socket writable — `close` never fires, and
+  // the Scene Controller session released by that handler would be held for the
+  // life of the process. A client that has stopped talking cannot be answered,
+  // so complete the close here and let the ordinary `close` path clean up.
+  socket.on("end", () => {
+    if (!socket.destroyed) socket.end();
+  });
   socket.on("data", (chunk) => {
+    // Any inbound byte proves the client is alive, so record liveness before
+    // decoding rather than only when a pong arrives.
+    heartbeat.touch(socket);
     pending = Buffer.concat([pending, chunk]);
     const decoded = decodeFrames(pending); pending = decoded.rest;
+    // A peer that pings us is owed a pong carrying its exact payload.
+    for (const payload of decoded.pings)
+      if (!socket.destroyed) socket.write(pongFrame(payload));
     for (const message of decoded.messages) handleMessage(socket, message);
     if (decoded.closeRequested && !socket.destroyed) {
-      socket.write(Buffer.from([0x88, 0x00]));
+      socket.write(closeFrame());
       socket.end();
     }
   });
   socket.on("close", () => {
     log("○ app client disconnected");
+    heartbeat.remove(socket);
     transfers.get(socket)?.runner.cancel("web app disconnected");
     transfers.delete(socket);
     sockets.delete(socket);
@@ -514,6 +531,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`FlexiDim local bridge received ${signal}; shutting down`);
+  heartbeat.stop();
 
   for (const socket of sockets) {
     if (!socket.destroyed) {
