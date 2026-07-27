@@ -21,6 +21,29 @@ const bridgeProxySockets = new Set();
 const pendingBridgeRequests = new Set();
 let shuttingDown = false;
 
+/**
+ * How long a proxied peer may take to finish closing gracefully before it is
+ * destroyed. The pair must not outlive each other: the bridge releases the
+ * Scene Controller's single control session when the app socket closes, so a
+ * half-torn-down proxy would hold that session open with no client behind it.
+ */
+const PROXY_TEARDOWN_GRACE_MS = 5_000;
+
+/**
+ * End `peer` and guarantee it is gone. `pipe` forwards `end` but not `error` or
+ * `destroy`, so an abruptly reset browser socket — one that emits `error` and
+ * `close` without ever emitting `end` — would otherwise leave its upstream
+ * bridge socket connected indefinitely. `end()` first rather than `destroy()`
+ * so anything already queued in the other direction still flushes.
+ */
+function closeProxyPeer(peer) {
+  if (!peer || peer.destroyed) return;
+  peer.end();
+  const grace = setTimeout(() => peer.destroy(), PROXY_TEARDOWN_GRACE_MS);
+  grace.unref?.();
+  peer.once("close", () => clearTimeout(grace));
+}
+
 const contentTypes = {
   ".css": "text/css; charset=utf-8",
   ".gif": "image/gif",
@@ -190,12 +213,22 @@ server.on("upgrade", (incoming, clientSocket, clientHead) => {
     pendingBridgeRequests.delete(upstreamRequest);
     bridgeProxySockets.add(clientSocket);
     bridgeProxySockets.add(bridgeSocket);
-    const forgetSockets = () => {
+    // Either half closing tears the other down. Without this, a browser that
+    // dies without a clean FIN leaves the bridge holding a session — and with
+    // it the Scene Controller's only control slot — for a client that is gone.
+    const teardown = () => {
       bridgeProxySockets.delete(clientSocket);
       bridgeProxySockets.delete(bridgeSocket);
+      closeProxyPeer(clientSocket);
+      closeProxyPeer(bridgeSocket);
     };
-    clientSocket.once("close", forgetSockets);
-    bridgeSocket.once("close", forgetSockets);
+    clientSocket.once("close", teardown);
+    bridgeSocket.once("close", teardown);
+    // These raw upgrade sockets have no default error handling, so an
+    // ECONNRESET from either side would otherwise be an unhandled 'error'
+    // event and take the whole web host down with it.
+    clientSocket.on("error", teardown);
+    bridgeSocket.on("error", teardown);
     const headers = Object.entries(response.headers)
       .flatMap(([name, value]) =>
         Array.isArray(value)

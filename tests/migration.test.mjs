@@ -11,6 +11,10 @@ import {
   isFlexiDimWorkspace,
   materializeAppData,
   mergeLegacyBrowserConnectionState,
+  migrateWorkspaceControllerCode,
+  migrateWorkspaceChannelProfileOrder,
+  migrateWorkspaceImportedUserAccess,
+  normalizePeriodTables,
   orderUserAccess,
   mergeImportedSite,
   normalizeSiteTimeZone,
@@ -19,8 +23,30 @@ import {
   upsertImportedConfiguration,
   updateUserProfile,
   siteImportDetailsEqual,
+  siteImportDifferences,
   validateConfigContent,
 } from "../app/fd4cfg.ts";
+
+test("migrates the old web 35-period table into iOS periods and state flags", () => {
+  const oldRows = Array.from({ length: 35 }, (_, index) => ({
+    id: index + 1,
+    name: index < 10 ? `Period ${index + 1}` : `Flag ${index - 9}`,
+    start: "01:00",
+    end: "02:00",
+    days: ["Mon"],
+    enabled: true,
+    startMode: 4,
+    endMode: 4,
+    legacyIndex: index,
+  }));
+
+  const migrated = normalizePeriodTables(oldRows);
+  assert.equal(migrated.periods.length, 10);
+  assert.equal(migrated.periods[9].name, "Period 10");
+  assert.equal(migrated.stateFlags.length, 25);
+  assert.equal(migrated.stateFlags[0].name, "Flag 1");
+  assert.equal(migrated.stateFlags[24].name, "Flag 25");
+});
 
 test("parses recovered FlexiDim DST table semantics", () => {
   const parsed = parseDstRuleFile([
@@ -66,10 +92,14 @@ test("imports controller-significant hardware, period and user fields", () => {
     $objects: objects,
     $top: {
       room: { CF$UID: 2 }, channel: { CF$UID: 3 }, period: { CF$UID: 5 }, user: { CF$UID: 7 }, scene: { CF$UID: 10 },
-      $1: "Test", $9: "FD4-TEST", $10: "0123456789abcdef", $11: "192.168.1.2",
+      // Recovered encode order: $13 modules-changed, $18 router-inbound flag,
+      // $19 router-inbound port, $20 DST rule, $21-$24 gateway addresses,
+      // $25-$28 gateway counts. The site type comes from the site ID's fifth
+      // character, not a stored slot.
+      $1: "Test", $9: "FD4-2EST", $10: "0123456789abcdef", $11: "192.168.1.2",
       $2: "Line one", $3: "Line two", $4: "Line three", $5: "Line four",
-      $12: 1, $13: 2, $14: "2026-07-24T10:30:00.000Z", $17: "0.0",
-      $18: 16000, $19: "UK-Europe", $20: "42", $21: 3,
+      $12: 1, $13: "1", $14: "2026-07-24T10:30:00.000Z", $17: "0.0",
+      $18: "1", $19: 16000, $20: "UK-Europe", $21: "42", $25: 3,
       $28: "10", $29: "controller.example.test",
       modc: 1, modcB: 0, $30: "7000",
     },
@@ -81,6 +111,7 @@ test("imports controller-significant hardware, period and user fields", () => {
     "Line one", "Line two", "Line three", "Line four",
   ]);
   assert.equal(data.site.siteType, 2);
+  assert.equal(data.site.modulesChanged, true);
   assert.equal(data.site.routerInbound, true);
   assert.equal(data.site.routerPort, 16000);
   assert.equal(data.site.remote, true);
@@ -184,7 +215,7 @@ test("addresses channels by stored module order, not sorted module ID", () => {
     $objects: objects,
     $top: {
       room: { CF$UID: 2 }, first: { CF$UID: 3 }, second: { CF$UID: 4 },
-      $1: "Order", $9: "FD4-ORDER", $12: 1, $17: "0.0", $19: "UK-Europe",
+      $1: "Order", $9: "FD4-ORDER", $12: 1, $17: "0.0", $20: "UK-Europe",
       modc: 2, $30: "7010", $31: "7000",
     },
   };
@@ -214,7 +245,7 @@ test("ranks switch hardware by `ra` and scenes by `dr`", () => {
     $objects: objects,
     $top: {
       room: { CF$UID: 2 }, plate: { CF$UID: 3 }, scene: { CF$UID: 5 },
-      $1: "Ranks", $9: "FD4-RANK", $12: 1, $17: "0.0", $19: "UK-Europe",
+      $1: "Ranks", $9: "FD4-RANK", $12: 1, $17: "0.0", $20: "UK-Europe",
     },
   };
   const data = convertLegacyArchive(archive);
@@ -259,12 +290,12 @@ test("recognizes only the untouched starter site", () => {
 
 test("re-import replaces and collapses matching configurations", () => {
   const configurations = [
-    { id: 2, siteId: "07140002", name: "Kitchen", description: "old", lastUpdated: "old" },
-    { id: 3, siteId: "07140002", name: "Kitchen", description: "duplicate", lastUpdated: "old" },
-    { id: 4, siteId: "07140002", name: "Alternative", description: "keep", lastUpdated: "old" },
+    { id: 2, siteId: "TEST0002", name: "Kitchen", description: "old", lastUpdated: "old" },
+    { id: 3, siteId: "TEST0002", name: "Kitchen", description: "duplicate", lastUpdated: "old" },
+    { id: 4, siteId: "TEST0002", name: "Alternative", description: "keep", lastUpdated: "old" },
   ];
   const result = upsertImportedConfiguration(configurations, {
-    id: 0, siteId: "07140002", name: "Kitchen", description: "fresh", lastUpdated: "new",
+    id: 0, siteId: "TEST0002", name: "Kitchen", description: "fresh", lastUpdated: "new",
   }, 3);
   assert.equal(result.configurationId, 3);
   assert.deepEqual(result.configurations.map(({ id, name }) => ({ id, name })), [
@@ -276,7 +307,7 @@ test("re-import replaces and collapses matching configurations", () => {
 
 test("unchanged site imports ignore timestamps and browser-local bridge settings", () => {
   const imported = {
-    name: "Kitchen", id: "07140002", ip: "192.168.1.2", port: 15273,
+    name: "Kitchen", id: "TEST0002", ip: "192.168.1.2", port: 15273,
     description: "Controller", address: "", timezone: "Europe/London",
     dst: "UK / Europe", remote: false, securityCode: "0123456789abcdef",
     updatedAt: "2020-01-01T00:00:00.000Z",
@@ -289,7 +320,85 @@ test("unchanged site imports ignore timestamps and browser-local bridge settings
     legacy: { value: 1n },
   };
   assert.equal(siteImportDetailsEqual(saved, imported), true);
-  assert.equal(siteImportDetailsEqual({ ...saved, ip: "192.168.1.3" }, imported), false);
+  // The live endpoint is NOT part of the comparison: discovery rewrites ip/port
+  // after every connect, so including them made a working site permanently
+  // unequal to its own backup and prompted on every re-import.
+  assert.equal(siteImportDetailsEqual({ ...saved, ip: "192.168.1.3" }, imported), true);
+  assert.equal(siteImportDetailsEqual({ ...saved, port: 15999 }, imported), true);
+  // A real archive field still counts as a difference.
+  assert.equal(siteImportDetailsEqual({ ...saved, name: "Renamed" }, imported), false);
+});
+
+test("import differences name the fields an installer can act on", () => {
+  const base = {
+    name: "Site", id: "FD4-0001", ip: "10.0.0.1", port: 15273,
+    description: "", address: "", timezone: "Europe/London",
+    dst: "UK / Europe", remote: false,
+  };
+  // No differences at all.
+  assert.deepEqual(siteImportDifferences(base, { ...base }), []);
+  // The endpoint is excluded, so it never appears as a difference.
+  assert.deepEqual(
+    siteImportDifferences(base, { ...base, ip: "10.0.0.9", port: 1234 }),
+    [],
+  );
+  // Real fields are reported by their visible label, not their key.
+  assert.deepEqual(
+    siteImportDifferences(base, { ...base, name: "Other" }),
+    ["Site name"],
+  );
+  assert.deepEqual(
+    siteImportDifferences(base, { ...base, remoteServer: "host.example" }),
+    ["Remote server"],
+  );
+  // The gateway corruption case that motivated this: a pre-fix workspace held
+  // the DST rule string in a gateway address slot.
+  assert.deepEqual(
+    siteImportDifferences(
+      { ...base, wirelessGateways: [{ address: "No Daylight Saving", count: 0 }] },
+      { ...base, wirelessGateways: [] },
+    ),
+    ["Wireless gateways"],
+  );
+  // Several at once, in field order.
+  assert.deepEqual(
+    siteImportDifferences(base, { ...base, name: "Other", dst: "USA" }),
+    ["Site name", "Daylight saving rule"],
+  );
+});
+
+test("a differing security code is reported without exposing either value", () => {
+  const base = {
+    name: "Site", id: "FD4-0001", ip: "10.0.0.1", port: 15273,
+    description: "", address: "", timezone: "Europe/London",
+    dst: "UK / Europe", remote: false, securityCode: "SAVEDKEY01234567",
+  };
+  const differences = siteImportDifferences(base, {
+    ...base,
+    securityCode: "IMPORTKEY0123456",
+  });
+  assert.deepEqual(differences, ["Controller security code"]);
+  // The labels go straight into a dialog, so no key material may ride along.
+  for (const label of differences) {
+    assert.equal(label.includes("SAVEDKEY01234567"), false);
+    assert.equal(label.includes("IMPORTKEY0123456"), false);
+  }
+});
+
+test("re-importing the same archive twice never prompts", () => {
+  // The reported symptom: importing one file repeatedly asked every time. After
+  // the first import the stored site carries the discovered endpoint, which is
+  // the only thing that legitimately drifts.
+  const archive = {
+    name: "Site", id: "TEST0002", ip: "203.0.113.9", port: 15273,
+    description: "", address: "", timezone: "UTC",
+    dst: "No daylight saving", remote: false, autoDetect: true,
+  };
+  // First import stores the archive verbatim, then discovery replaces the
+  // endpoint with the live LAN address.
+  const stored = { ...archive, ip: "192.168.77.41" };
+  assert.equal(siteImportDetailsEqual(stored, archive), true);
+  assert.deepEqual(siteImportDifferences(stored, archive), []);
 });
 
 test("restores an imported controller key while retaining local bridge settings", () => {
@@ -625,6 +734,196 @@ test("server migration preserves the browser connection that previously worked",
   assert.equal(
     merged.sites[0].configurations[0].content.rooms[0].name,
     "server room",
+  );
+});
+
+test("a retained archive restores a controller code omitted by an older workspace", () => {
+  const site = {
+    name: "Imported", id: "SITE0001", ip: "", port: 15273, description: "",
+    address: "", timezone: "Europe/London", dst: "UK / Europe", remote: false,
+    moduleOrderA: [7000],
+    moduleOrderB: [],
+    legacy: {
+      hardwareOrder: [101, 102],
+      // extraBase = 30 + one bus-A module + two hardware records = 33;
+      // the controller code is the third post-hardware slot, $35.
+      top: { $35: "CTRL0007" },
+    },
+  };
+  const workspace = canonicalizeAppData({
+    site,
+    configurations: [{
+      id: 1, siteId: site.id, name: "Imported",
+      description: "", lastUpdated: "",
+    }],
+    activeConfigId: 1,
+    ...ownershipContent("imported"),
+  });
+  const migrated = migrateWorkspaceControllerCode(workspace);
+  assert.equal(
+    migrated.sites[0].configurations[0].controllerCode,
+    "CTRL0007",
+  );
+  assert.notEqual(
+    migrated.sites[0].configurations[0].controllerCode,
+    migrated.sites[0].id,
+    "migration must read the retained archive field, not guess from site ID",
+  );
+  assert.equal(
+    migrateWorkspaceControllerCode(migrated),
+    migrated,
+    "the migration should be stable after the field is restored",
+  );
+});
+
+test("controller-code migration refuses a plausible value from the wrong slot", () => {
+  const site = {
+    name: "Imported", id: "SITE0001", ip: "", port: 15273, description: "",
+    address: "", timezone: "Europe/London", dst: "UK / Europe", remote: false,
+    moduleOrderA: [],
+    moduleOrderB: [],
+    legacy: {
+      hardwareOrder: [101],
+      top: { $32: "WRONG001" }, // expected slot is $33
+    },
+  };
+  const workspace = canonicalizeAppData({
+    site,
+    configurations: [{
+      id: 1, siteId: site.id, name: "Imported",
+      description: "", lastUpdated: "",
+    }],
+    activeConfigId: 1,
+    ...ownershipContent("imported"),
+  });
+  assert.equal(migrateWorkspaceControllerCode(workspace), workspace);
+});
+
+test("old imported users recover resolved access from retained legacy paths", () => {
+  const site = {
+    name: "Imported", id: "SITE0001", ip: "", port: 15273, description: "",
+    address: "", timezone: "Europe/London", dst: "UK / Europe", remote: false,
+  };
+  const content = ownershipContent("imported");
+  content.rooms = [
+    { ...content.rooms[0], id: 10, legacyKey: 110 },
+    { ...content.rooms[0], id: 20, legacyKey: 220 },
+  ];
+  content.switches = [
+    { id: 30, name: "First", roomId: 10, type: 1, buttons: 1, number: 1, legacyKey: 330 },
+    { id: 40, name: "Second", roomId: 20, type: 1, buttons: 1, number: 2, legacyKey: 440 },
+  ];
+  content.users = [{
+    id: 1,
+    name: "Imported user",
+    remote: false,
+    changes: true,
+    key: "0123456789abcdef",
+    securityCode: "0123456789abcdef",
+    profileStatus: "imported",
+    roomAccess: ["110|330", "220|440"],
+    roomIds: [],
+    switchIds: [],
+  }];
+  const workspace = canonicalizeAppData({
+    site,
+    configurations: [{
+      id: 1, siteId: site.id, name: "Imported",
+      description: "", lastUpdated: "",
+    }],
+    activeConfigId: 1,
+    ...content,
+  });
+  const migrated = migrateWorkspaceImportedUserAccess(workspace);
+  assert.deepEqual(
+    migrated.sites[0].configurations[0].content.users[0].roomIds,
+    [10, 20],
+  );
+  assert.deepEqual(
+    migrated.sites[0].configurations[0].content.users[0].switchIds,
+    [30, 40],
+  );
+});
+
+test("user-access migration never overwrites a deliberately edited profile", () => {
+  const site = {
+    name: "Imported", id: "SITE0001", ip: "", port: 15273, description: "",
+    address: "", timezone: "Europe/London", dst: "UK / Europe", remote: false,
+  };
+  const content = ownershipContent("edited");
+  content.rooms = [{ ...content.rooms[0], id: 10, legacyKey: 110 }];
+  content.switches = [];
+  content.users = [{
+    id: 1,
+    name: "Edited user",
+    remote: false,
+    changes: true,
+    key: "0123456789abcdef",
+    profileStatus: "pending",
+    roomAccess: ["110"],
+    roomIds: [],
+    switchIds: [],
+  }];
+  const workspace = canonicalizeAppData({
+    site,
+    configurations: [{
+      id: 1, siteId: site.id, name: "Imported",
+      description: "", lastUpdated: "",
+    }],
+    activeConfigId: 1,
+    ...content,
+  });
+  assert.equal(migrateWorkspaceImportedUserAccess(workspace), workspace);
+});
+
+test("old imported channels recover their retained dictionary profile order", () => {
+  const site = {
+    name: "Imported", id: "SITE0001", ip: "", port: 15273, description: "",
+    address: "", timezone: "Europe/London", dst: "UK / Europe", remote: false,
+    legacy: { hardwareOrder: [101, 202, 303] },
+  };
+  const content = ownershipContent("imported");
+  content.channels = [
+    { ...content.channels[0], id: 1, legacyKey: 101, profileOrder: undefined },
+    { ...content.channels[0], id: 2, legacyKey: 202, profileOrder: undefined },
+    { ...content.channels[0], id: 3, legacyKey: 303, profileOrder: undefined },
+  ];
+  const workspace = canonicalizeAppData({
+    site,
+    configurations: [{
+      id: 1, siteId: site.id, name: "Imported",
+      description: "", lastUpdated: "",
+    }],
+    activeConfigId: 1,
+    ...content,
+  });
+  const migrated = migrateWorkspaceChannelProfileOrder(workspace);
+  const ranks = migrated.sites[0].configurations[0].content.channels.map(
+    (channel) => channel.profileOrder,
+  );
+  assert.ok(ranks.every(Number.isInteger));
+  assert.equal(new Set(ranks).size, 3);
+
+  const authoritative = {
+    ...migrated,
+    sites: migrated.sites.map((ownedSite) => ({
+      ...ownedSite,
+      configurations: ownedSite.configurations.map((configuration) => ({
+        ...configuration,
+        content: {
+          ...configuration.content,
+          channels: configuration.content.channels.map((channel, index) => ({
+            ...channel,
+            profileOrder: index + 50,
+          })),
+        },
+      })),
+    })),
+  };
+  assert.equal(
+    migrateWorkspaceChannelProfileOrder(authoritative),
+    authoritative,
+    "existing imported ranks must remain authoritative",
   );
 });
 

@@ -24,14 +24,24 @@ export function isPrivateIpv4(address) {
     || (value >= ipv4ToNumber("192.168.0.0") && value <= ipv4ToNumber("192.168.255.255"));
 }
 
-export function lanCandidates(preferredHost = "", interfaces = os.networkInterfaces()) {
+export function lanCandidates(preferredHost = "", interfaces = os.networkInterfaces(), fallbackHost = "") {
   const candidates = new Set();
-  if (isPrivateIpv4(preferredHost)) {
+  // A freshly imported legacy archive can contain an old public/router address.
+  // In Docker Desktop the container can reach the physical LAN, but its own
+  // interfaces only reveal Docker's private subnet and UDP broadcasts do not
+  // cross that boundary. In that case use the host-provided LAN address as the
+  // bounded /24 scan seed. A learned private controller address always wins.
+  const scanHost = isPrivateIpv4(preferredHost)
+    ? preferredHost
+    : isPrivateIpv4(fallbackHost)
+      ? fallbackHost
+      : "";
+  if (scanHost) {
     // In a container, os.networkInterfaces() only exposes the container subnet.
     // Keep the last-known controller first, then scan its bounded /24 so Auto
     // Detect can still find a controller whose DHCP address changed.
-    candidates.add(preferredHost);
-    const preferred = ipv4ToNumber(preferredHost);
+    if (isPrivateIpv4(preferredHost)) candidates.add(preferredHost);
+    const preferred = ipv4ToNumber(scanHost);
     const mask = ipv4ToNumber("255.255.255.0");
     if (preferred !== undefined && mask !== undefined) {
       const network = (preferred & mask) >>> 0;
@@ -106,10 +116,10 @@ export function discoverControllerUdp({ timeout = 2400 } = {}) {
   });
 }
 
-export async function discoverController({ preferredHost = "", port = 15273, timeout = 450, concurrency = 48, interfaces, udpTimeout = 2400 } = {}) {
+export async function discoverController({ preferredHost = "", fallbackHost = "", port = 15273, timeout = 450, concurrency = 48, interfaces, udpTimeout = 2400 } = {}) {
   const udpHost = await discoverControllerUdp({ timeout: udpTimeout });
   if (udpHost) return udpHost;
-  const candidates = lanCandidates(preferredHost, interfaces);
+  const candidates = lanCandidates(preferredHost, interfaces, fallbackHost);
   let cursor = 0;
   let found;
   await Promise.all(Array.from({ length: Math.min(concurrency, candidates.length) }, async () => {

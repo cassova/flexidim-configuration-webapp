@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 import { discoverController } from "./discovery.mjs";
@@ -6,6 +6,24 @@ import { parseControllerReplies } from "./controller-replies.mjs";
 import { packet } from "./protocol.mjs";
 import { authenticationRecord } from "./session.mjs";
 import { capabilityFor, SAFE_LOCAL_PROFILE } from "./controller-capabilities.mjs";
+import { localResponse } from "./local-responses.mjs";
+import { fallbackFirmwareProfile } from "./firmware-profiles.mjs";
+import { VerifySession } from "./verify-session.mjs";
+import { ConfigurationTransferRunner } from "./transfer-runner.mjs";
+import {
+  SanitizedTransferAudit,
+  TransferSafetyCoordinator,
+} from "./transfer-safety.mjs";
+import {
+  closeFrame,
+  decodeFrames,
+  IDLE_TIMEOUT_MS,
+  PING_INTERVAL_MS,
+  pingFrame,
+  pongFrame,
+  websocketFrame,
+  WebSocketHeartbeat,
+} from "./websocket.mjs";
 
 const BRIDGE_PORT = Number(process.env.FLEXIDIM_BRIDGE_PORT || 8765);
 const BRIDGE_HOST = String(process.env.FLEXIDIM_BRIDGE_HOST || "127.0.0.1");
@@ -18,6 +36,13 @@ if (!LOOPBACK_HOSTS.has(BRIDGE_HOST) && !BRIDGE_TOKEN) {
 }
 const sockets = new Set();
 const controllers = new Map();
+const transfers = new Map();
+const clientIds = new WeakMap();
+const transferSafety = new TransferSafetyCoordinator({
+  audit: new SanitizedTransferAudit(
+    String(process.env.FLEXIDIM_TRANSFER_AUDIT_PATH || ""),
+  ),
+});
 
 function log(...args) {
   console.log(`[${new Date().toISOString().slice(11, 23)}]`, ...args);
@@ -25,14 +50,24 @@ function log(...args) {
 const hex = (buffer) =>
   buffer.length ? buffer.toString("hex").match(/.{1,2}/g).join(" ") : "(empty)";
 
-function websocketFrame(value) {
-  const payload = Buffer.from(JSON.stringify(value));
-  if (payload.length < 126) return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
-  const head = Buffer.alloc(4); head[0] = 0x81; head[1] = 126; head.writeUInt16BE(payload.length, 2);
-  return Buffer.concat([head, payload]);
-}
-
 function emit(ws, value) { if (!ws.destroyed) ws.write(websocketFrame(value)); }
+
+// A browser that vanishes without a close frame or a FIN would otherwise keep
+// its Scene Controller session — the controller's only control slot — open for
+// the lifetime of the bridge process. Reaping it releases the controller by the
+// ordinary `close` path, so an in-flight transfer is cancelled and the socket
+// destroyed exactly as it is for a deliberate disconnect.
+const heartbeat = new WebSocketHeartbeat({
+  intervalMs: Number(process.env.FLEXIDIM_BRIDGE_PING_INTERVAL_MS || PING_INTERVAL_MS),
+  timeoutMs: Number(process.env.FLEXIDIM_BRIDGE_IDLE_TIMEOUT_MS || IDLE_TIMEOUT_MS),
+  ping: (ws) => {
+    if (!ws.destroyed) ws.write(pingFrame());
+  },
+  reap: (ws, silentMs) => {
+    log(`○ app client unresponsive for ${silentMs}ms; releasing its Scene Controller session`);
+    ws.destroy();
+  },
+});
 
 function queueControllerStatus(ws, controller, statuses) {
   controller.flexidimPendingLevels ??= {};
@@ -61,25 +96,6 @@ function queueControllerStatus(ws, controller, statuses) {
   }
 }
 
-function decodeFrames(buffer) {
-  const messages = []; let closeRequested = false; let offset = 0;
-  while (offset + 2 <= buffer.length) {
-    const first = buffer[offset]; const second = buffer[offset + 1]; let length = second & 0x7f; let cursor = offset + 2;
-    if (length === 126) { if (cursor + 2 > buffer.length) break; length = buffer.readUInt16BE(cursor); cursor += 2; }
-    if (length === 127) { if (cursor + 8 > buffer.length) break; length = Number(buffer.readBigUInt64BE(cursor)); cursor += 8; }
-    const masked = Boolean(second & 0x80); let mask;
-    if (masked) { if (cursor + 4 > buffer.length) break; mask = buffer.subarray(cursor, cursor + 4); cursor += 4; }
-    if (cursor + length > buffer.length) break;
-    const payload = Buffer.from(buffer.subarray(cursor, cursor + length));
-    if (masked) for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i % 4];
-    const opcode = first & 0x0f;
-    if (opcode === 1) messages.push(payload.toString("utf8"));
-    else if (opcode === 8) closeRequested = true;
-    offset = cursor + length;
-  }
-  return { messages, closeRequested, rest: buffer.subarray(offset) };
-}
-
 function writeController(ws, bytes, label) {
   const controller = controllers.get(ws);
   if (!controller || controller.destroyed || !controller.writable || !controller.flexidimAuthenticated) {
@@ -92,13 +108,28 @@ function writeController(ws, bytes, label) {
   emit(ws, { type: "trace", message: `${label} · ${hex(bytes)}` });
 }
 
-function connectController(ws, host, port, securityCode) {
+function connectController(
+  ws,
+  host,
+  port,
+  securityCode,
+  { transferRunner, onConnected, onFailed, quiet = false } = {},
+) {
     controllers.get(ws)?.destroy();
     if (!/^([a-z\d-]+\.)*[a-z\d-]+$|^\d{1,3}(\.\d{1,3}){3}$/i.test(host)) return emit(ws, { type: "status", state: "error", message: "Enter a valid Scene Controller address" });
     log(`connect → ${host}:${port}`);
-    emit(ws, { type: "status", state: "connecting", message: `Connecting to ${host}:${port}` });
+    if (!quiet)
+      emit(ws, { type: "status", state: "connecting", message: `Connecting to ${host}:${port}` });
     let connected = false; let failed = false; let connectedAt = 0;
+    let failureReported = false;
+    const reportFailure = () => {
+      if (failureReported) return;
+      failureReported = true;
+      onFailed?.();
+    };
     const controller = net.createConnection({ host, port, timeout: 7000 }); controllers.set(ws, controller);
+    controller.flexidimConnection = { host, port, securityCode };
+    controller.flexidimTransferRunner = transferRunner;
     controller.on("connect", () => {
       // The timeout above is for establishing the TCP connection only. Leaving it
       // enabled disconnects a healthy but idle controller seven seconds later.
@@ -112,6 +143,7 @@ function connectController(ws, host, port, securityCode) {
         log(`✗ controller authentication not sent: ${error.message}`);
         emit(ws, { type: "status", state: "error", message: error.message });
         controller.destroy();
+        reportFailure();
         return;
       }
       connected = true;
@@ -123,15 +155,27 @@ function connectController(ws, host, port, securityCode) {
       controller.flexidimAuthenticated = true;
       log(`→ TX controller authentication [16-byte key redacted + ${login.subarray(16, 22).toString("ascii")} + ff]`);
       log(`✓ controller authenticated: ${host}:${port}`);
-      emit(ws, { type: "trace", message: "Controller authentication sent (security code redacted)" });
-      emit(ws, { type: "status", state: "connected", message: `Authenticated with Scene Controller at ${host}:${port}` });
-      // Do not add an application-level poll here. The iOS app only emits its
-      // period-flag request for encrypted remote sessions, where it is a
-      // different, longer frame. Sending a guessed plaintext 0x05 frame to a
-      // local controller causes real controllers to terminate the TCP stream.
+      if (!quiet) {
+        emit(ws, { type: "trace", message: "Controller authentication sent (security code redacted)" });
+        emit(ws, { type: "status", state: "connected", message: `Authenticated with Scene Controller at ${host}:${port}` });
+      }
+      onConnected?.(controller);
+      // Do not add an application-level poll here. The controller volunteers its
+      // f2 level scan unprompted (confirmed by a 50s passive capture), so no poll
+      // is needed. The period-flag request is `ff f1 00` and stays gated until a
+      // reply has been observed; 0x05 — previously misattributed here as a poll —
+      // is actually the channel-search command, whose payload packing is not
+      // fully traced. Sending either as a guess has already been seen to make a
+      // real controller terminate the stream.
     });
     controller.on("data", (data) => {
-      controller.flexidimRxBuffer = Buffer.concat([controller.flexidimRxBuffer ?? Buffer.alloc(0), data]);
+      const ordinaryData = controller.flexidimTransferRunner?.active
+        ? controller.flexidimTransferRunner.receive(data)
+        : controller.flexidimVerifySession?.active
+          ? controller.flexidimVerifySession.receive(data)
+          : data;
+      if (!ordinaryData.length) return;
+      controller.flexidimRxBuffer = Buffer.concat([controller.flexidimRxBuffer ?? Buffer.alloc(0), ordinaryData]);
       const replies = parseControllerReplies(controller.flexidimRxBuffer);
       controller.flexidimRxBuffer = Buffer.from(replies.rest);
       if (replies.invalid.length) {
@@ -145,9 +189,23 @@ function connectController(ws, host, port, securityCode) {
         emit(ws, { type: "trace", message: `Controller reply · ${hex(visible)}` });
       }
     });
-    controller.on("timeout", () => { failed = true; log(`✗ controller timed out (${host}:${port})`); controller.destroy(); emit(ws, { type: "status", state: "error", message: "Scene Controller connection timed out" }); });
-    controller.on("error", (error) => { failed = true; log(`✗ controller error: ${error.code || ""} ${error.message}`); emit(ws, { type: "status", state: "error", message: `Controller connection failed: ${error.message}` }); });
+    controller.on("timeout", () => {
+      failed = true;
+      log(`✗ controller timed out (${host}:${port})`);
+      controller.destroy();
+      if (!quiet)
+        emit(ws, { type: "status", state: "error", message: "Scene Controller connection timed out" });
+      reportFailure();
+    });
+    controller.on("error", (error) => {
+      failed = true;
+      log(`✗ controller error: ${error.code || ""} ${error.message}`);
+      if (!quiet)
+        emit(ws, { type: "status", state: "error", message: `Controller connection failed: ${error.message}` });
+      reportFailure();
+    });
     controller.on("close", (hadError) => {
+      controller.flexidimVerifySession?.cancel();
       if (controller.flexidimStatusTimer) clearTimeout(controller.flexidimStatusTimer);
       const last = controller.flexidimLastTx;
       const age = last ? Date.now() - last.at : undefined;
@@ -156,12 +214,101 @@ function connectController(ws, host, port, securityCode) {
         ? `; ${age}ms after TX ${last.label} [${hex(last.bytes)}]`
         : `; no command sent during ${lifetime}ms connection`;
       log(`controller connection closed${hadError ? " (after error)" : ""}${connected ? "" : " (never established)"}${diagnostic}`);
-      if (!ws.destroyed && connected && !failed) emit(ws, {
+      if (controller.flexidimTransferRunner?.active)
+        controller.flexidimTransferRunner.disconnected();
+      if (!connected) reportFailure();
+      if (!quiet && !ws.destroyed && connected && !failed) emit(ws, {
         type: "status",
         state: "bridge",
         message: `Scene Controller disconnected${last ? ` after ${last.label}` : ""}`,
       });
     });
+}
+
+function startLiveTransfer(ws, clientId, message) {
+  const controller = controllers.get(ws);
+  if (!controller?.flexidimAuthenticated || controller.destroyed)
+    throw new Error("Scene Controller is not connected");
+  if (controller.flexidimVerifySession?.active)
+    throw new Error("wait for Compare to finish before sending");
+  if (message.confirm !== "Continue")
+    throw new Error("the original-app Continue confirmation was not received");
+
+  const prepared = transferSafety.beginLive(clientId, message);
+  const connection = controller.flexidimConnection;
+  let runner;
+  const write = (bytes, frame) => {
+    const activeController = controllers.get(ws);
+    if (
+      !activeController ||
+      activeController.destroyed ||
+      !activeController.writable ||
+      !activeController.flexidimAuthenticated
+    ) {
+      throw new Error(`Scene Controller disconnected before ${frame.name}`);
+    }
+    activeController.write(bytes);
+    activeController.flexidimLastTx = {
+      at: Date.now(),
+      label: frame.name,
+      bytes: Buffer.alloc(0),
+    };
+    const detail =
+      frame.blockIndex === undefined
+        ? `${frame.name}, ${bytes.length} bytes`
+        : `${frame.name} ${frame.blockIndex + 1}/${runner.session.transfer.blockCount}, ${bytes.length} bytes`;
+    log(`→ TX transfer ${detail}`);
+  };
+
+  runner = new ConfigurationTransferRunner({
+    sessionOptions: prepared.sessionOptions,
+    write,
+    reconnect: ({ connected, failed }) => {
+      connectController(
+        ws,
+        connection.host,
+        connection.port,
+        connection.securityCode,
+        {
+          transferRunner: runner,
+          onConnected: () => connected(),
+          onFailed: () => failed(),
+          quiet: true,
+        },
+      );
+    },
+    close: () => controllers.get(ws)?.destroy(),
+    ordinaryData: (data) => {
+      const activeController = controllers.get(ws);
+      if (!activeController || !data.length) return;
+      activeController.flexidimRxBuffer = Buffer.concat([
+        activeController.flexidimRxBuffer ?? Buffer.alloc(0),
+        data,
+      ]);
+    },
+    progress: (value) => emit(ws, { type: "transferProgress", ...value }),
+    result: (value) => {
+      transfers.delete(ws);
+      transferSafety.finishLive(clientId, value.outcome, {
+        imageChecksum: prepared.imageChecksum,
+        frameCount: value.frameCount,
+      });
+      emit(ws, {
+        type: "transferResult",
+        state: value.outcome === "completed" ? "completed" : "failed",
+        outcome: value.outcome,
+        message:
+          value.outcome === "completed"
+            ? "Download completed successfully. Scene controller running normally."
+            : value.message ?? value.messages.at(-1) ?? `Transfer stopped: ${value.outcome}`,
+        imageChecksum: prepared.imageChecksum,
+        frameCount: value.frameCount,
+      });
+    },
+  });
+  transfers.set(ws, { runner, imageChecksum: prepared.imageChecksum });
+  controller.flexidimTransferRunner = runner;
+  runner.start();
 }
 
 function handleMessage(ws, raw) {
@@ -172,11 +319,71 @@ function handleMessage(ws, raw) {
       (message.type === "dim" ? ` (ch ${message.channel}, ${message.level}%, t=${message.transition})` : "") +
       (message.type === "switch" ? ` (sw ${message.switch}, btn ${message.button})` : ""),
   );
+  // Answered locally, ahead of the capability refusal, so the app gets the
+  // precise reason rather than a generic profile error.
+  const local = localResponse(message);
+  if (local) return emit(ws, local);
   if (!capabilityFor(message.type)) {
     return emit(ws, {
       type: "status", state: "error",
       message: `${message.type} is disabled by controller profile ${SAFE_LOCAL_PROFILE.id}; captured protocol evidence and recoverable hardware validation are required`,
     });
+  }
+  const clientId = clientIds.get(ws);
+  if (message.type === "transferSafetyStatus") {
+    return emit(ws, transferSafety.status(clientId, message.imageChecksum));
+  }
+  if (message.type === "transferAudit") {
+    return emit(ws, {
+      type: "transferAudit",
+      entries: transferSafety.audit.recent(message.limit),
+    });
+  }
+  if (message.type === "transferDryRun") {
+    try {
+      emit(ws, { type: "transferProgress", state: "preflight", message: "Validating compiled bytes offline…" });
+      return emit(ws, transferSafety.dryRun(clientId, message));
+    } catch (error) {
+      return emit(ws, {
+        type: "transferPreflight",
+        state: "failed",
+        message: `Offline dry run failed: ${error.message}`,
+        liveWritesEnabled: false,
+      });
+    }
+  }
+  if (message.type === "transferEmergencyStop") {
+    transferSafety.emergencyStop("operator");
+    for (const controller of controllers.values()) controller.destroy();
+    emit(ws, {
+      type: "transferProgress",
+      state: "stopped",
+      message: "Emergency stop latched. Controller connections were closed; no transfer may run.",
+    });
+    return emit(ws, transferSafety.status(clientId, message.imageChecksum));
+  }
+  if (message.type === "transferSafetyReset") {
+    if (message.confirm !== "RESET OFFLINE SAFETY")
+      return emit(ws, {
+        type: "transferPreflight",
+        state: "failed",
+        message: "Safety reset confirmation was not exact.",
+        liveWritesEnabled: false,
+      });
+    transferSafety.resetEmergencyStop();
+    return emit(ws, transferSafety.status(clientId, message.imageChecksum));
+  }
+  if (message.type === "transferCancel") {
+    const transfer = transfers.get(ws);
+    if (!transfer?.runner.active)
+      return emit(ws, {
+        type: "transferResult",
+        state: "failed",
+        outcome: "not-active",
+        message: "No configuration transfer is active.",
+      });
+    transfer.runner.cancel("operator");
+    return;
   }
   if (message.type === "connect") {
     connectController(ws, String(message.host || ""), Number(message.port || 15273), String(message.securityCode || ""));
@@ -185,7 +392,11 @@ function handleMessage(ws, raw) {
   if (message.type === "discover") {
     const port = Number(message.port || 15273);
     emit(ws, { type: "status", state: "discovering", message: `Searching the local network for a FlexiDim controller on port ${port}…` });
-    discoverController({ preferredHost: String(message.host || ""), port }).then((host) => {
+    discoverController({
+      preferredHost: String(message.host || ""),
+      fallbackHost: String(process.env.FLEXIDIM_DISCOVERY_SEED || ""),
+      port,
+    }).then((host) => {
       if (ws.destroyed) return;
       if (!host) return emit(ws, { type: "status", state: "error", message: `No FlexiDim controller was found on this local network at port ${port}` });
       emit(ws, { type: "discovered", host, port });
@@ -193,12 +404,47 @@ function handleMessage(ws, raw) {
     }).catch((error) => emit(ws, { type: "status", state: "error", message: `Controller discovery failed: ${error.message}` }));
     return;
   }
-  if (message.type === "dim") writeController(ws, packet(0x04, [message.channel, message.level, message.transition]), `Channel ${message.channel} → ${message.level}%`);
+  if (message.type === "verify") {
+    const controller = controllers.get(ws);
+    if (!controller?.flexidimAuthenticated) {
+      emit(ws, {
+        type: "verifyResult",
+        state: "error",
+        message: "Scene Controller is not connected.",
+      });
+      return;
+    }
+    controller.flexidimVerifySession ??= new VerifySession({
+      send: (bytes, label) => writeController(ws, bytes, label),
+      result: (value) => {
+        transferSafety.recordComparison(clientId, value);
+        emit(ws, value);
+      },
+    });
+    if (!controller.flexidimVerifySession.start(message.localChecksum)) {
+      emit(ws, {
+        type: "verifyResult",
+        state: "error",
+        message: "A controller comparison is already in progress.",
+      });
+    }
+  } else if (message.type === "sync") {
+    try {
+      startLiveTransfer(ws, clientId, message);
+    } catch (error) {
+      transferSafety.finishLive(clientId, "failed");
+      emit(ws, {
+        type: "transferResult",
+        state: "failed",
+        outcome: "preflight-failed",
+        message: `Configuration transfer blocked: ${error.message}`,
+      });
+    }
+  } else if (message.type === "dim") writeController(ws, packet(0x04, [message.channel, message.level, message.transition]), `Channel ${message.channel} → ${message.level}%`);
   // The app always sends a 6-byte switch body: ff f3 00 <switch> <button> 00.
   // The trailing 0x00 is part of what the controller's CRC/length check expects.
   else if (message.type === "switch") writeController(ws, packet(0x00, [message.switch, message.button, 0]), `Switch ${message.switch}, button ${message.button}`);
   else if (message.type === "scene") for (const [channel, level] of Object.entries(message.levels || {})) writeController(ws, packet(0x04, [channel, level, message.transition]), `Scene channel ${channel} → ${level}%`);
-  else if (message.type === "periodFlags") emit(ws, { type: "status", state: "error", message: "Period flags are only available through the iOS encrypted remote-session protocol" });
 }
 
 const server = http.createServer((request, response) => {
@@ -222,17 +468,50 @@ server.on("upgrade", (request, socket) => {
   const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
   socket.write(["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade", `Sec-WebSocket-Accept: ${accept}`, "\r\n"].join("\r\n"));
   sockets.add(socket); let pending = Buffer.alloc(0); log("● app client connected"); emit(socket, { type: "status", state: "bridge", message: "Local FlexiDim bridge ready" });
-  emit(socket, { type: "capabilities", profile: SAFE_LOCAL_PROFILE });
+  clientIds.set(socket, randomUUID());
+  // The announced profile comes from the firmware acceptance matrix. No
+  // controller identifies itself yet, so this is always the deny-by-default
+  // fallback; the evidence map travels with it so the UI can explain refusals.
+  const active = fallbackFirmwareProfile();
+  emit(socket, {
+    type: "capabilities",
+    profile: active.capabilities,
+    evidence: active.evidence,
+  });
+  emit(socket, transferSafety.status(clientIds.get(socket)));
+  heartbeat.add(socket);
+  // `http.Server` creates its connections with `allowHalfOpen: true`, so a peer
+  // FIN raises `end` and leaves the socket writable — `close` never fires, and
+  // the Scene Controller session released by that handler would be held for the
+  // life of the process. A client that has stopped talking cannot be answered,
+  // so complete the close here and let the ordinary `close` path clean up.
+  socket.on("end", () => {
+    if (!socket.destroyed) socket.end();
+  });
   socket.on("data", (chunk) => {
+    // Any inbound byte proves the client is alive, so record liveness before
+    // decoding rather than only when a pong arrives.
+    heartbeat.touch(socket);
     pending = Buffer.concat([pending, chunk]);
     const decoded = decodeFrames(pending); pending = decoded.rest;
+    // A peer that pings us is owed a pong carrying its exact payload.
+    for (const payload of decoded.pings)
+      if (!socket.destroyed) socket.write(pongFrame(payload));
     for (const message of decoded.messages) handleMessage(socket, message);
     if (decoded.closeRequested && !socket.destroyed) {
-      socket.write(Buffer.from([0x88, 0x00]));
+      socket.write(closeFrame());
       socket.end();
     }
   });
-  socket.on("close", () => { log("○ app client disconnected"); sockets.delete(socket); controllers.get(socket)?.destroy(); controllers.delete(socket); });
+  socket.on("close", () => {
+    log("○ app client disconnected");
+    heartbeat.remove(socket);
+    transfers.get(socket)?.runner.cancel("web app disconnected");
+    transfers.delete(socket);
+    sockets.delete(socket);
+    controllers.get(socket)?.destroy();
+    controllers.delete(socket);
+  });
   socket.on("error", () => undefined);
 });
 
@@ -252,6 +531,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`FlexiDim local bridge received ${signal}; shutting down`);
+  heartbeat.stop();
 
   for (const socket of sockets) {
     if (!socket.destroyed) {

@@ -14,12 +14,32 @@
 // make the emulator behave like the genuine hardware.
 
 import dgram from 'node:dgram';
+import fs from 'node:fs';
 import net from 'node:net';
 import { describe, decodeFrame } from './decode.mjs';
+import { TransferPrefixEmulator } from './oracle/transfer-prefix-emulator.mjs';
 
 const TCP_PORT = Number(process.env.FLEXIDIM_CONTROLLER_PORT || 15273);
-const DISCOVERY_PORT = 15270;
-const DISCOVERY_REPLY_PORT = 15001;
+const DISCOVERY_PORT = Number(process.env.FLEXIDIM_DISCOVERY_PORT || 15270);
+const DISCOVERY_REPLY_PORT = Number(
+  process.env.FLEXIDIM_DISCOVERY_REPLY_PORT || 15001,
+);
+const SCAN_INTERVAL_MS = Number(process.env.FLEXIDIM_SCAN_INTERVAL_MS || 1000);
+const RESET_DELAY_MS = Number(process.env.FLEXIDIM_RESET_DELAY_MS || 250);
+const EMULATED_CRC = Number.parseInt(
+  String(process.env.FLEXIDIM_EMULATED_CRC || 'd2fc'),
+  16,
+);
+const TRANSFER_ORACLE_PATH = String(
+  process.env.FLEXIDIM_TRANSFER_ORACLE_PATH || '',
+);
+const transferExpectedFrames = TRANSFER_ORACLE_PATH
+  ? JSON.parse(fs.readFileSync(TRANSFER_ORACLE_PATH, 'utf8'))
+      .map((value) => Buffer.from(value, 'hex'))
+  : null;
+let transferCompleted = false;
+/** The single control session a real controller permits. */
+let activeSession = null;
 
 const ts = () => new Date().toISOString().slice(11, 23);
 const hex = (b) => Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join(' ');
@@ -41,10 +61,60 @@ function splitFrames(buf) {
   return { frames, rest };
 }
 
+// Emulated channel levels, so a status scan reports something coherent and a
+// dim command visibly changes what the next scan reports.
+const CHANNEL_COUNT = Number(process.env.FLEXIDIM_EMULATED_CHANNELS || 24);
+const levels = new Map();
+for (let channel = 1; channel <= CHANNEL_COUNT; channel += 1)
+  levels.set(channel, 0);
+
+/**
+ * Controller replies use a seven-bit additive check over the preceding bytes.
+ * Building it here rather than hard-coding bytes keeps the emulator honest: the
+ * bridge's parser rejects a wrong check, so a mistake here shows up as a failed
+ * integrity check instead of passing silently.
+ */
+function checked(bytes) {
+  const record = Buffer.from(bytes);
+  const sum = record.reduce((total, byte) => (total + byte) & 0x7f, 0);
+  return Buffer.concat([record, Buffer.from([sum])]);
+}
+
+/** An `f2` channel-level record. Status addresses are zero-based. */
+function statusRecord(channel, level) {
+  return checked([0xf2, channel - 1, level]);
+}
+
+/** The continuous level scan a real controller emits on an open session. */
+function statusScan() {
+  return Buffer.concat(
+    [...levels.entries()].map(([channel, level]) =>
+      statusRecord(channel, level),
+    ),
+  );
+}
+
 function reply(frame) {
-  // Placeholder: a real controller echoes/acks. Replace with captured replies.
   const r = decodeFrame(Array.from(frame));
+  if (r.ok && frame[1] === 0xfc)
+    return Buffer.from([0x06]);
+  if (r.ok && frame[1] === 0xf5) {
+    const now = new Date();
+    return Buffer.from([
+      0x06, EMULATED_CRC & 0xff, (EMULATED_CRC >>> 8) & 0xff,
+      now.getHours(), now.getMinutes(), now.getSeconds(),
+      1 << now.getDay(), 0x00, 0x04, 0x00,
+    ]);
+  }
   if (r.ok && r.decoded.name === 'PERIOD_FLAGS') return Buffer.from([0xff, 0xf3, 0x05, 0x00]);
+  // A dim command updates the emulated level and is acknowledged with an f4,
+  // then reflected by the next scan — the same order the real controller uses.
+  if (r.ok && r.decoded.name === 'DIM' && frame.length >= 5) {
+    const channel = frame[3];
+    const level = frame[4];
+    if (levels.has(channel)) levels.set(channel, level);
+    return Buffer.concat([checked([0xf4, channel, level, 0x00]), statusRecord(channel, level)]);
+  }
   return null;
 }
 
@@ -53,6 +123,15 @@ const tcp = net.createServer((sock) => {
   console.log(`\n[${ts()}] ● app connected from ${who}`);
   let pending = Buffer.alloc(0);
   let authenticated = false;
+  let scan;
+  let transferOracle = null;
+  // A real Scene Controller accepts only ONE control connection. Refusing the
+  // second is the behaviour the app has to handle, so the emulator refuses too.
+  if (activeSession) {
+    console.log(`[${ts()}] ✗ second connection refused (controller allows one session)`);
+    return sock.destroy();
+  }
+  activeSession = sock;
   sock.on('data', (chunk) => {
     pending = Buffer.concat([pending, chunk]);
     if (!authenticated && pending.length >= 23) {
@@ -62,10 +141,57 @@ const tcp = net.createServer((sock) => {
         authenticated = true;
         pending = pending.subarray(23);
         console.log(`[${ts()}] ← RX AUTH [16-byte key redacted ${nonce} ff]`);
+        // A real controller starts its level scan once the session is open.
+        // Emit one immediately, then keep scanning, so a client sees the same
+        // passive feedback it gets from hardware.
+        sock.write(statusScan());
+        scan = setInterval(() => {
+          if (!sock.destroyed) sock.write(statusScan());
+        }, SCAN_INTERVAL_MS);
+      } else {
+        // Wrong-shaped credentials: the controller drops the connection rather
+        // than answering, which is what the app has to cope with.
+        console.log(`[${ts()}] ✗ authentication rejected; closing`);
+        return sock.destroy();
       }
     }
     if (!authenticated) {
       console.log(`[${ts()}] ← waiting for 23-byte iOS authentication record (${pending.length}/23 bytes)`);
+      return;
+    }
+    if (
+      transferExpectedFrames &&
+      !transferCompleted &&
+      !transferOracle &&
+      pending.length >= transferExpectedFrames[0].length &&
+      pending
+        .subarray(0, transferExpectedFrames[0].length)
+        .equals(transferExpectedFrames[0])
+    ) {
+      transferOracle = new TransferPrefixEmulator({
+        expectedFrames: transferExpectedFrames,
+      });
+      if (scan) {
+        clearInterval(scan);
+        scan = undefined;
+      }
+      console.log(`[${ts()}] ⇣ exact iOS-oracle transfer started`);
+    }
+    if (transferOracle) {
+      while (transferOracle.cursor < transferExpectedFrames.length) {
+        const expected = transferExpectedFrames[transferOracle.cursor];
+        if (pending.length < expected.length) return;
+        const candidate = pending.subarray(0, expected.length);
+        pending = pending.subarray(expected.length);
+        const answer = transferOracle.receive(candidate);
+        if (answer) sock.write(answer);
+      }
+      for (let index = 0; index < 10; index += 1) transferOracle.status();
+      if (!transferOracle.complete)
+        throw new Error('oracle transfer did not reach its complete prefix');
+      transferCompleted = true;
+      console.log(`[${ts()}] ✓ exact iOS-oracle transfer accepted; resetting`);
+      setTimeout(() => sock.destroy(), RESET_DELAY_MS);
       return;
     }
     if (pending.length) console.log(`[${ts()}] ← RX command bytes [${hex(pending)}]`);
@@ -84,7 +210,11 @@ const tcp = net.createServer((sock) => {
       if (answer) { console.log(`[${ts()}]   → reply [${hex(answer)}]`); sock.write(answer); }
     }
   });
-  sock.on('close', () => console.log(`[${ts()}] ○ app disconnected ${who}`));
+  sock.on('close', () => {
+    if (scan) clearInterval(scan);
+    if (activeSession === sock) activeSession = null;
+    console.log(`[${ts()}] ○ app disconnected ${who}`);
+  });
   sock.on('error', (e) => console.log(`[${ts()}] socket error: ${e.message}`));
 });
 tcp.listen(TCP_PORT, () => console.log(`Emulated controller: TCP listening on 0.0.0.0:${TCP_PORT}`));

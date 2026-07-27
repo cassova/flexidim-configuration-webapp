@@ -725,6 +725,151 @@ i.help-icon {
   opacity: 0.5;
   cursor: not-allowed;
 }
+.storage-banner {
+  padding: 10px 16px;
+  background: #fdf1f1;
+  border-bottom: 2px solid var(--red);
+  color: #7d2b2b;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.gated-action {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+  max-width: 260px;
+}
+.gated-action button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.gated-reason {
+  font-size: 11px;
+  line-height: 1.35;
+  color: #8a6100;
+}
+.readiness {
+  padding: 0 23px 8px;
+  font-size: 12px;
+}
+.readiness p {
+  margin: 0 0 6px;
+}
+.readiness code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+}
+.readiness-comparison {
+  padding: 7px 9px;
+  border-left: 3px solid var(--blue);
+  background: #f2f5f8;
+  border-radius: 0 5px 5px 0;
+}
+.transfer-safety {
+  margin-top: 8px;
+  padding: 9px;
+  border: 1px solid #ccd5dd;
+  border-radius: 5px;
+  background: #f8fafb;
+}
+.transfer-safety code {
+  overflow-wrap: anywhere;
+}
+.transfer-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(18 27 35 / 48%);
+}
+.transfer-dialog {
+  width: min(460px, 100%);
+  padding: 22px;
+  border: 1px solid #aebbc6;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 18px 60px rgb(0 0 0 / 28%);
+}
+.transfer-dialog h2 {
+  margin: 0 0 14px;
+  font-size: 18px;
+  line-height: 1.3;
+}
+.transfer-dialog p {
+  margin: 0 0 12px;
+  line-height: 1.5;
+}
+.transfer-dialog progress {
+  width: 100%;
+  height: 16px;
+  accent-color: var(--blue);
+}
+.transfer-phase {
+  font-weight: 650;
+}
+.transfer-count,
+.transfer-wait {
+  color: #626b73;
+  font-size: 12px;
+}
+.transfer-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+.transfer-dialog-actions button {
+  min-width: 92px;
+  padding: 9px 15px;
+  border: 1px solid #aeb8c1;
+  border-radius: 6px;
+  background: #f4f6f8;
+  font-weight: 650;
+}
+.transfer-dialog-actions button.primary {
+  border-color: var(--blue);
+  color: #fff;
+  background: var(--blue);
+}
+.hint-inline {
+  font-weight: 400;
+  color: #6b6f72;
+}
+.readiness h4 {
+  margin: 10px 0 4px;
+  font-size: 12px;
+}
+.readiness ul {
+  margin: 0;
+  padding-left: 18px;
+  line-height: 1.5;
+}
+.readiness-blockers {
+  color: var(--red);
+}
+.readiness-warnings {
+  color: #8a6100;
+}
+.derived-value {
+  display: block;
+  padding: 9px 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+.gateway-editor {
+  padding: 0 23px 14px;
+}
+.gateway-editor h3 {
+  margin: 6px 0 2px;
+  font-size: 13px;
+}
+.gateway-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 12px;
+}
 .sync-card {
   display: flex;
   flex-direction: column;
@@ -2531,28 +2676,31 @@ i.help-icon {
   color: var(--blue);
 }
 .period-list {
-  padding: 8px 22px 24px;
+  padding: 0 22px 24px;
+}
+.period-columns {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(270px, 1fr) minmax(270px, 1fr);
+  gap: 12px;
+  margin: 4px 22px 0 64px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 .period-list > div {
   display: grid;
-  grid-template-columns: 30px minmax(120px, 1fr) auto auto 220px 56px;
+  grid-template-columns: 30px minmax(160px, 1fr) minmax(270px, 1fr) minmax(270px, 1fr);
   align-items: center;
   gap: 12px;
-  padding: 14px 5px;
+  padding: 8px 5px;
   border-bottom: 1px solid #e6e6e3;
 }
-.period-list > div.disabled {
-  opacity: 0.5;
-}
-.period-power {
-  border: 0;
-  background: transparent;
-  color: #aaa;
-  font-size: 20px;
-  cursor: pointer;
-}
-.period-power.on {
-  color: var(--green);
+.period-number {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
 }
 .period-name {
   min-width: 0;
@@ -2565,17 +2713,52 @@ i.help-icon {
   border-color: #ccc;
   background: #fff;
 }
-.period-list label {
+.period-boundary {
   display: flex;
   align-items: center;
   gap: 7px;
-  color: var(--muted);
-  font-size: 11px;
+}
+.period-boundary select {
+  flex: 1;
+  min-width: 135px;
 }
 .period-list input[type="time"] {
   padding: 6px;
   border: 1px solid #c8cbcd;
   border-radius: 6px;
+}
+.state-flags-section {
+  border-top: 1px solid var(--line);
+  padding: 22px 27px 28px;
+}
+.state-flags-section h3 {
+  margin: 0 0 14px;
+}
+.state-flag-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 9px;
+}
+.state-flag-grid label {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.state-flag-grid input {
+  min-width: 0;
+  padding: 7px;
+  border: 1px solid #c8cbcd;
+  border-radius: 4px;
+}
+.state-flag-grid input::placeholder {
+  color: transparent;
+}
+.state-flag-help {
+  max-width: 760px;
+  margin: 16px 0 0 27px;
 }
 .mini-days {
   display: flex;
@@ -2834,10 +3017,16 @@ footer {
     grid-template-columns: 1fr;
   }
   .period-list > div {
-    grid-template-columns: 28px 1fr auto auto;
+    grid-template-columns: 28px 1fr;
   }
-  .period-list .mini-days {
-    grid-column: 2/4;
+  .period-boundary {
+    grid-column: 2;
+  }
+  .period-columns {
+    display: none;
+  }
+  .state-flag-grid {
+    grid-template-columns: repeat(3, minmax(120px, 1fr));
   }
   .user-list > div {
     grid-template-columns: 40px 1fr auto;
@@ -2914,9 +3103,11 @@ footer {
   .period-list > div {
     grid-template-columns: 25px 1fr;
   }
-  .period-list > div > label,
-  .period-list .mini-days {
+  .period-boundary {
     grid-column: 2;
+  }
+  .state-flag-grid {
+    grid-template-columns: 1fr;
   }
   .users-grid .user-list > div {
     grid-template-columns: 35px 1fr;

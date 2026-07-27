@@ -2,6 +2,10 @@ services:
   flexidim-web:
     build: .
     image: flexidim-web:local
+    # The image's default command starts web + bridge together for
+    # single-container deployments; this stack runs them as separate services,
+    # so each service picks its own process explicitly.
+    command: ["node", "server/host.mjs"]
     environment:
       FLEXIDIM_BRIDGE_UPSTREAM_HOST: flexidim-bridge
       FLEXIDIM_BRIDGE_UPSTREAM_PORT: 8765
@@ -26,13 +30,26 @@ services:
     restart: unless-stopped
 
   flexidim-bridge:
-    build: .
+    # The web service builds this shared image. Declaring the same build here
+    # makes Compose build and tag it a second time, leaving duplicate dangling
+    # image records on every rebuild.
     image: flexidim-web:local
     command: ["node", "bridge/server.mjs"]
     environment:
       FLEXIDIM_BRIDGE_HOST: 0.0.0.0
       FLEXIDIM_BRIDGE_PORT: 8765
       FLEXIDIM_BRIDGE_TOKEN: ${FLEXIDIM_BRIDGE_TOKEN:-flexidim-compose-local}
+      # Docker Desktop exposes only its container subnet to the bridge. `task`
+      # supplies the Mac's LAN address so Auto Detect can recover after the
+      # saved last-known controller address has been deleted.
+      FLEXIDIM_DISCOVERY_SEED: ${FLEXIDIM_DISCOVERY_SEED:-}
+      # Sanitized transfer-safety events only: no configuration, user payload,
+      # security code, controller address, or frame bytes are recorded.
+      FLEXIDIM_TRANSFER_AUDIT_PATH: /config/transfer-audit.jsonl
+    volumes:
+      # Explicitly named, shared and reused. This does not recreate the former
+      # anonymous-volume leak caused by a Dockerfile VOLUME instruction.
+      - flexidim-config:/config
     expose:
       - "8765"
     healthcheck:

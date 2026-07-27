@@ -110,16 +110,16 @@ test("provides recovered iOS scene and channel editing controls", async () => {
   assert.doesNotMatch(panel, /currentSceneGroup\?\.name \?\? "Floors"/);
 });
 
-test("uses the iOS-style site list and header changes switch", async () => {
+test("uses the iOS-style site list rather than an area strip", async () => {
+  // Structural claims only. The behaviour these used to grep for — the changes
+  // switch, the derived site type, the gateway slots — is now driven for real in
+  // tests/ui-interaction.test.mjs, where a control that renders but does nothing
+  // fails instead of passing.
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const sitesPanel = page.slice(page.indexOf("const sitesPanel"), page.indexOf("const configPanel"));
   assert.match(sitesPanel, /My FlexiDim sites/);
   assert.match(sitesPanel, /＋ Create site/);
   assert.doesNotMatch(sitesPanel, /<small>AREAS<\/small>|room-strip/);
-  assert.match(page, /role="switch"/);
-  assert.match(page, /Allow configuration changes/);
-  assert.match(sitesPanel, /button-row compact site-location-actions/);
-  assert.match(sitesPanel, /Controller site type/);
   assert.doesNotMatch(page, /className="more-button"/);
 });
 
@@ -131,7 +131,9 @@ test("retains installer assignment, sequence, switch-button, and equipment utili
     "Assign for channel dimming",
     "On fade time",
     "Off fade time",
-    "Off priority",
+    // The archive stores ONE per-switch `op`, so the pair of per-channel
+    // On/Off priority toggles was replaced by a single switch-level control.
+    "On/off priority \\(whole switch\\)",
     "Create extractor sequence",
     "Create security sequence",
     "Create simple sequence",
@@ -156,7 +158,10 @@ test("provides the recovered equipment browser and hardware editors", async () =
     "Room icon",
     "Names for Remote Control app",
     "Channel type explanation",
-    "Accessory module",
+    // "Accessory module" was a web invention. The archive stores an accessory
+    // TYPE (two recovered values), and the output type is a separate field.
+    "Accessory type",
+    "Output type",
     "Test dimming",
     "Detect by button press",
     "Detect switch types",
@@ -175,15 +180,17 @@ test("provides per-channel basic assignment controls and help", async () => {
   const basicPanel = page.slice(page.indexOf("const assignmentsPanel"), page.indexOf("const scenesPanel"));
   for (const label of [
     "Add channels",
-    "Adjust order",
+    // Renamed to say what the order actually controls: the controller
+    // processes basic-assignment channels in exactly this order.
+    "Adjust compiled order",
     "Select all",
     "Deselect all",
     "Assign for on",
     "Assign for off",
     "Assign for dimming",
     "Assign for channel dimming",
-    "On priority",
-    "Off priority",
+    // A single switch-level flag replaces the old per-channel On/Off pair.
+    "On/off priority \\(whole switch\\)",
     "On fade time",
     "Off fade time",
   ]) assert.match(basicPanel, new RegExp(label));
@@ -191,6 +198,10 @@ test("provides per-channel basic assignment controls and help", async () => {
   assert.match(basicPanel, /help="How long this light takes/);
   assert.match(basicPanel, /value=\{selectedBasicChannelSettings\.onFade\}/);
   assert.doesNotMatch(basicPanel, /<Field label="Off priority">\s*<select/);
+  // The archive has one `op` per switch, so a per-channel priority control
+  // would imply a precision the controller never receives.
+  assert.doesNotMatch(basicPanel, /\{ onPriority: event\.target\.checked \}/);
+  assert.doesNotMatch(basicPanel, /\{ offPriority: event\.target\.checked \}/);
 });
 
 test("converted IPA artwork is present", async () => {
@@ -213,7 +224,7 @@ test("uses the server workspace API instead of browser storage", async () => {
 test("cannot connect with starter credentials before server storage loads", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const connect = page.slice(
-    page.indexOf("const connect = () =>"),
+    page.indexOf("const connect = ("),
     page.indexOf("// A range slider"),
   );
   assert.match(
@@ -222,11 +233,17 @@ test("cannot connect with starter credentials before server storage loads", asyn
   );
   assert.match(
     page,
-    /<button className="primary" disabled=\{!storageLoaded\} onClick=\{connect\}>/,
+    /className="primary"\s*disabled=\{!storageLoaded\}\s*onClick=\{\(\) => connect\(\)\}/,
   );
   assert.match(
     page,
-    /className=\{`connection-chip \$\{connection\}`\}[\s\S]*disabled=\{!storageLoaded\}[\s\S]*onClick=\{connect\}/,
+    /className=\{`connection-chip \$\{connection\}`\}[\s\S]*disabled=\{!storageLoaded\}[\s\S]*onClick=\{\(\) => connect\(\)\}/,
+  );
+  // The startup attempt reads the controller address and security code out of
+  // the loaded workspace, so it must wait for the same gate.
+  assert.match(
+    page,
+    /if \(!storageLoaded \|\| autoConnectAttempted\.current\) return;[\s\S]*connect\(\{ auto: true \}\)/,
   );
 });
 

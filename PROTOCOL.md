@@ -186,7 +186,126 @@ The module position is its position in the archive's module array, not the
 numeric sort order of module IDs. For the verified site, the stored modules are
 `7000`, `7010`, and `7020`, producing controller ranges 1–8, 9–16, and 17–24.
 
+### Frame families
+
+Five prefixes exist. Earlier revisions of this document assumed only `ff f3`.
+
+| Prefix | Use | Status |
+| --- | --- | --- |
+| `ff f3 <cmd>` | commands: `04` dim, `00` switch, `05` channel search, `06` switch/dim function | `04`/`00` verified; `05` shape only |
+| `ff f1 <sel>` | status requests: `00` period flags, `01` pending scenes | implemented, gated |
+| `ff fc` | download/verify handshake | oracle verified |
+| `ff f2` | user/profile data during configuration transfer | oracle verified |
+| `f4` | channel-search tick — no `ff` prefix at all, five bytes | shape only |
+| `ff <mode>` | emulation mode (`emulationMode:`), six bytes, byte 1 is the mode | shape only |
+
+**Correction.** This document previously described a "guessed plaintext `0x05`
+frame" that terminated the stream on real controllers, treating `0x05` as a
+period poll. `0x05` is in fact the **channel-search** command, built by
+`startChannelSearch:fullSearch:`, `channelSearchNext` and `chSrchTick:` from the
+template at `0x1000b360c`. The period poll is `ff f1 00`. The observed disconnect
+is consistent with a channel-search frame carrying the wrong payload or arriving
+out of sequence, not with `0x05` being forbidden.
+
+Channel search drives two frames together — the seven-byte `ff f3 05` command and
+a bare five-byte `f4` tick on a timer. Its argument packing is only partially
+traced, so it is deliberately not implemented: the shape is known, the payload is
+not.
+
+### Switch emulation (`ff fd` / `ff fe`) — binary verified, not transmitted
+
+`-emulationMode:` (0x10003ef24). Six bytes, CRC over all six:
+
+```text
+ff fd 00 00 00 00 <crc-lo> <crc-hi>   # enter switch emulation
+ff fe 00 00 00 00 <crc-lo> <crc-hi>   # leave switch emulation
+```
+
+Byte 1 is the only variable, and both values fall in the `fd`–`ff` escape range,
+so byte 1 is transmitted escaped (`1b fd` / `1b fe`). This command is the reason
+the escape mechanism exists.
+
+Valid only for site types 0 and 1. Entering emulation is what makes the
+controller report switch presses — the original app's "identify switch by button
+press" — and the app renews it with a repeating **15-second**
+`refreshEmulationMode` timer, so the mode lapses without refresh.
+
+Implemented as `emulationModeFrame()` and gated off under `switchDetection`.
+
+### User-profile transfer (`ff f2`) — sender-oracle verified, not transmitted
+
+`-sendUserData:userOnly:` (0x10004b0e0) sends each non-empty UTF-8 user payload
+in 256-byte chunks. An unescaped data frame is:
+
+```text
+ff f2 <user-index> <14-bit marker, low 7 bits first>
+   <256 payload bytes> <crc-lo> <crc-hi>
+```
+
+Markers `0`, `1`, … identify non-final chunks. The final data-bearing chunk
+uses marker `7f 7f` and is zero-padded. Empty users produce no per-user frame.
+After every user, the sender writes one global marker:
+
+```text
+ff f2 e0 7f 7f <256 zero bytes> <crc-lo> <crc-hi>
+```
+
+The normal full-transfer position and multi-user order have been executed in
+the offline sender oracle. The pure model implements this framing, but the live
+bridge does not use it. Exact compilation of every hardware-specific user
+profile suffix is still incomplete, so user transfer remains gated.
+
+### Status requests (`ff f1`) — binary verified, not transmitted
+
+A second frame family. Both are nine-byte constants with CRC-16/X25 appended
+over all nine bytes, recovered from `-requestPeriodFlags` (0x100041278) and
+`-requestPendingScenes` (0x1000413e4):
+
+```text
+ff f1 00 00 00 00 00 00 00 <crc-lo> <crc-hi>   # period flags
+ff f1 01 00 00 00 00 00 00 <crc-lo> <crc-hi>   # pending scenes
+```
+
+These are implemented (`statusRequest()`) and unit-tested but **gated off**: no
+reply has been observed on hardware. Their existence corrects an earlier claim
+that period flags were reachable only through the encrypted remote protocol —
+the frame is plaintext, and AES-OFB is applied afterwards only when the session
+type requires it.
+
+### Switch/dim function frame (`06`) — binary verified, not transmitted
+
+`-sendSwDiMessage:value:function:` (0x100041550). CRC over seven bytes:
+
+```text
+ff f3 <flags> <target-1 & 0x7f> <value & 0x7f> <function & 0x7f> 00 <crc-lo> <crc-hi>
+```
+
+Payload bytes are masked to seven bits so none can stray into the `fd`–`ff`
+delimiter range; the dropped high bits are recorded in the flags byte, which is
+`0x06` plus `0x08`/`0x10`/`0x20` for target/value/function respectively. The
+target is transmitted **zero-based**.
+
+Callers are `runScene:`, `brightness:` and `brightnessStep:`, so this is the
+scene/brightness path. The verified live path in this build still expands a scene
+into per-channel `04` dim frames; the individual `function` codes were not
+recovered, so this frame is implemented for parity and never sent.
+
 ## Controller-to-client records
+
+### Unsolicited record set on a type-0 session — hardware verified
+
+A 50-second passive capture on an authenticated site-type-0 local session
+(nothing sent after the authentication record) produced **only** `f2` records:
+312 of them, every additive check valid, no unrecognised record shape. About
+2.4 complete 128-address scans.
+
+So on a local session the controller volunteers the channel-level scan and
+nothing else. `f4`/`f5` appear in response to commands, and no period or
+pending-scene record is emitted unsolicited — obtaining one requires a request
+frame that the recovered binary only ever emits for encrypted remote sessions.
+Captured summary: `tools/oracle/fixtures/type0-record-capture.json`; reproduce with
+`tools/capture-records.mjs` (read-only by construction).
+
 
 Controller replies do not use the `ff f3 ... CRC-16/X25` framing above. The
 following short record types have been observed on an authenticated local
@@ -258,13 +377,20 @@ The browser sends JSON messages over the loopback WebSocket:
 | `dim` | `channel`, `level`, `transition` | Build and send command `04` |
 | `switch` | `switch`, `button` | Build and send command `00` |
 | `scene` | `levels`, `transition` | Send one dim frame per entry |
-| `sync` | configuration data | Currently refused; see below |
+| `verify` | compiled image CRC | Run the recovered read-only comparison |
+| `transferDryRun` | compiled image, user payloads, fixed clock, profile | Replay and self-check the sender entirely in bridge memory; never write to the controller |
+| `transferSafetyStatus` | optional image CRC | Report lock, stop, audit and recent-Compare state |
+| `transferEmergencyStop` | optional image CRC | Latch the safety stop and close controller sockets |
+| `transferAudit` | optional result limit | Return recent sanitized safety events |
+| `sync` | exact compiled image, user payloads, clock, profile, `Continue` confirmation | Run the qualified live sender only after matching same-session Compare and dry-run bindings |
 
 The bridge advertises a deny-by-default controller capability profile. The
-baseline `type-0-live-only` profile permits only verified live dim/switch and
-passive status behavior. Detection, profiles, verification, blind commands,
-remote sessions, and full transfer remain disabled until a hardware-specific
-profile supplies captured and tested evidence.
+baseline `type-0-live-only` profile permits recovered local controls, passive
+status behavior, read-only comparison, and the fully qualified transfer path
+only when Compare reports firmware 4.0. Detection, profile-only writes, blind
+commands, remote sessions, other site types, and other firmware variants remain
+disabled until a hardware-specific profile supplies executed and tested
+evidence.
 
 The bridge sends:
 
@@ -274,6 +400,9 @@ The bridge sends:
 | `discovered` | Controller host and port found |
 | `trace` | Meaningful transmitted frames and non-`f2` replies |
 | `channelStatus` | Batched map of controller channel addresses to levels |
+| `transferPreflight` | Offline frame-validation result and exact-input binding |
+| `transferProgress` | Original-app transfer lifecycle and block progress |
+| `transferResult` | Terminal live-transfer outcome after reset/reconnect gating |
 
 ## `.fd4cfg` configuration format
 
@@ -306,7 +435,7 @@ The archived model uses six application classes, plus `NSDate` and
 | `JCLFDChannel` | A reusable per-channel *setting* (level + timing). Referenced by scenes and switch Basic Assignments; never stored at the top level. |
 | `JCLFDScene` | A scene, or a folder/group of scenes. |
 | `JCLFDSwitch` | A switch's button-to-scene map and Basic Assignment. |
-| `JCLFDPeriod` | A time period (schedule row). |
+| `JCLFDPeriod` | One of 10 time periods, or one of the following 25 state-flag labels. |
 | `JCLFDUser` | A user account and its access rights. |
 
 Object relationships are expressed by an integer identity, not by `CF$UID`:
@@ -316,45 +445,63 @@ stored as plain integers. The field tables below mark these `→ ky` references.
 > Field semantics below are **binary verified** (recovered from the iOS
 > executable's Objective-C metadata and coder methods) and **archive
 > validated** against one real reference `.fd4cfg` (42 hardware objects, 3
-> modules, 11 switches, 98 scenes, 35 periods, 2 users). Fields still lacking a
+> modules, 11 switches, 98 scenes, 35 period-class records (10 timed periods
+> followed by 25 state-flag labels), 2 users). Fields still lacking a
 > confirmed meaning are marked **unconfirmed** and must not be relied on for a
 > whole-controller transfer.
 
 ### Positional site fields
 
-The site's top-level scalar fields use archive positions recovered from the iOS
-encode order. Object arrays occupy contiguous position ranges (hardware, then
-switches, then scenes, then periods, then users), each length-prefixed by the
-matching count scalar.
+The positional `$N` keys are not written with explicit names: the iOS writer
+(`JCLFDConfig getExportFileData`) calls NSKeyedArchiver's non-keyed
+`encodeObject:` repeatedly and Foundation assigns `$0`, `$1`, … in call order.
+Only `modc`, `modcB` and `hwc` use named integer keys. The complete recovered
+encode order is:
+
+1. `$0` format marker (`"29"`) and `$1..$29` site scalars (table below);
+2. bus-A module IDs (`modc` of them, `$30` onward), then bus-B module IDs
+   (`modcB` of them) immediately after;
+3. every `JCLFDHardware` object (`hwc` of them);
+4. four configuration fields: name, description, an eight-character code, and
+   the configuration's update date (`NSDate`);
+5. the switch, scene, period and user sections in that order, each preceded
+   by its count encoded as a decimal string (the decoder reads the object and
+   takes `integerValue`).
 
 | Archive key | Meaning |
 | --- | --- |
+| `$0` | Format marker (`"29"`) |
 | `$1` | Site name |
 | `$2`–`$5` | Address lines |
 | `$6` | Contact |
 | `$7` | Telephone |
 | `$8` | Email |
-| `$9` | Site ID |
+| `$9` | Site ID (its fifth character selects the site type) |
 | `$10` | 16-character controller security code |
 | `$11` | Saved controller IP |
 | `$12` | Automatic discovery flag |
+| `$13` | Modules-changed flag |
 | `$14` | Last-updated value (`NSDate`) |
 | `$15`, `$16` | Longitude, latitude |
 | `$17` | Time zone |
 | `$18` | Router-inbound enabled flag (`0`/`1` in the reference archive) |
-| `$19` | Daylight-saving rule |
-| `$28` | Fourth wireless-gateway count in the reference archive |
+| `$19` | Router-inbound port |
+| `$20` | Daylight-saving rule (`"No Daylight Saving"` in the reference archive) |
+| `$21`–`$24` | Wireless-gateway addresses 1–4 |
+| `$25`–`$28` | Wireless-gateway counts 1–4 |
 | `$29` | Remote-server hostname |
 | `hwc` | Number of stored `JCLFDHardware` objects |
 | `modc` | Number of stored bus-A modules |
 | `modcB` | Number of stored bus-B modules |
-| `$30...` | Bus-A module IDs in controller-address order |
+| `$30...` | Bus-A module IDs, then bus-B module IDs, in controller-address order |
 
 Modules are stored in two ordered buses, A then B, counted by `modc` and
 `modcB`. The order within each bus is the controller-address order and must be
 preserved on import — it is not re-sorted by module ID (see channel addressing
-above). The reference archive has no bus-B modules (`modcB = 0`), so the exact
-positional slots of the bus-B array are not yet validated against a real file.
+above). The reference archive has no bus-B modules (`modcB = 0`); the writer
+only emits a non-zero bus-B section for site types above 1, and
+`moduleForModuleNumber:` indexes bus-B modules from number 16 (`number - 15`),
+so bus-B wire addressing remains unverified against hardware.
 
 ### `JCLFDHardware` — physical channels and switches
 
@@ -439,7 +586,7 @@ numbers.
 | `nm`, `sn` | string | Name, short name |
 | `gr` | int (bool) | Group/folder marker |
 | `rm` | int | Room number (a logical ordinal, **not** a `ky` reference) |
-| `dr` | int | Display rank or scene fade value, depending on object role |
+| `dr` | int | Display rank (`displayRank` in the recovered class metadata) |
 | `ch0`…`ch18` | `JCLFDChannel` | Per-channel scene records |
 | `cc` | int | Count of channel records in use |
 | `fl` | int | Scene flags |
@@ -455,7 +602,12 @@ numbers.
 A parent chain reaching the deleted-scenes root is imported into the deleted
 list.
 
-### `JCLFDPeriod` — schedule rows
+### `JCLFDPeriod` — periods and state-flag labels
+
+The archive stores one 35-object array. The iOS Periods screen and compiler
+assign fixed meanings by position: objects 0–9 are timed Periods; objects 10–34
+are the names of the 25 State Flags shown in a 5×5 grid. The latter are labels,
+not additional schedule rows.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -466,6 +618,10 @@ list.
 
 Start/end are interpreted according to their independent modes; older builds
 mistakenly treated the mode values as clock minutes.
+
+For timed rows, iOS disables the From/To controls until the row has a non-empty
+name. Clearing the name also zeros `st`, `et`, `sm`, and `em`. State-flag rows
+use only `nm`; their other archived values remain zero.
 
 ### `JCLFDUser` — accounts and access
 
@@ -508,9 +664,33 @@ rather than silently discarded.
 The Site → Configuration → ConfigContent tree is the canonical owner of editable
 data. Version 2 preserves every site's configurations without duplicating the
 active configuration at the top level. Version 1 flat projections are migrated
-on import. This remains a webapp backup, not the binary controller image;
-FlexiDim Web currently imports `.fd4cfg` but does not attempt to regenerate an
-original keyed archive.
+on import. This remains a webapp backup, not the binary controller image.
+
+FlexiDim Web also regenerates an original binary `.fd4cfg`
+(`app/fd4cfg-export.ts`): it rebuilds the NSKeyedArchiver object graph in the
+recovered positional encode order, starting from each entity's preserved
+legacy fields and overriding only the values the web editors own, so unknown
+archive fields survive an import → export → import round trip. The round trip
+is proven lossless against the golden fixture (`tests/fixtures/golden.fd4cfg`)
+and, when locally present, a real reference archive
+(`tests/fd4cfg-roundtrip.test.mjs`).
+
+### `.fd4xlt` translation documents
+
+A `.fd4xlt` file is not a keyed archive: it is CRLF-delimited text produced by
+the iOS `getEquipCSVData` and read by `importConfigFD4XLT:`, with three
+sections:
+
+```text
+#SWITCHES <number> <Type> <name/location>
+#CHANNELS <number> <dimmable> <name/location>
+#SWITCH-SCENES <switch number:button number> <scene1 name/location> <scene2 name/location>
+```
+
+The two scene fields on a switch-scene row are the first and second press of
+one physical button. Importing a translation document creates a fresh
+starting-point configuration (no basic assignments, periods or users), exactly
+like the original app; it does not restore a saved configuration.
 
 ## Comparing and transferring a whole configuration
 
@@ -518,8 +698,8 @@ Three different operations are easily confused:
 
 1. **Download configuration** in FlexiDim Web downloads `.fd4web.json` from the
    browser to the computer. It does not contact the Scene Controller.
-2. **Compare with Scene Controller** should compare a compiled local controller
-   image with the controller's installed image.
+2. **Compare with Scene Controller** compiles the local controller image and asks
+   the controller to verify it, returning the controller's verdict and metadata.
 3. **Send configuration to Scene Controller** is an app-to-controller transfer,
    called a “download” by the original iOS code.
 
@@ -528,7 +708,7 @@ The editable `.fd4cfg` object graph is not sent directly. The original app's
 scenes, periods, users, hardware profiles, location/time information, and other
 tables into a controller-specific binary image. It also calculates a local CRC.
 
-### Comparison / verification — binary verified workflow, wire bytes unknown
+### Comparison / verification — recovered read-only workflow
 
 Recovered methods and UI strings show this workflow:
 
@@ -537,15 +717,33 @@ Recovered methods and UI strings show this workflow:
 3. Authenticate a controller session.
 4. Run `startVerify` / `processVerify:` to request the controller's installed
    configuration CRC.
-5. Validate incoming messages with `checkMsgAndCRC:length:`.
-6. Compare local and controller CRC values and report equality/difference.
+5. The controller returns its verdict, CRC, day/time and firmware version.
+6. Exit verification mode.
 
 There is no evidence that comparison downloads the controller's complete image
 or reconstructs an editable `.fd4cfg`; the recovered behavior is CRC-based.
-The exact verification request and response frames still need an original-app
-packet capture and are therefore not implemented.
 
-### App-to-controller transfer — binary verified workflow, unsafe/unimplemented
+The type-0 wire state machine recovered from `processVerify:` is:
+
+1. Send `FF FC 00 00 00 00` plus CRC. Retry after 31 100ms ticks, at most six
+   attempts. `FF F8 00 00 00 00` aborts an unacknowledged handshake.
+2. A reply whose first byte is `06` advances the state.
+3. Send `FF F5 00 00 00 00` plus CRC.
+4. Read ten bytes. Byte 0 is the controller verdict (`06` is verified); bytes
+   1–2 store the displayed CRC low byte first; 3–5 are second/minute/hour; byte 6
+   is a one-hot day-of-week value; byte 7 is unused by the display; and bytes
+   8–9 are the decimal firmware major/minor version.
+5. Send `FF FE 00 00 00 00` plus CRC to leave verification mode on success,
+   failure or result timeout.
+
+The controller's byte-0 verdict remains authoritative for the verification
+exchange. For Send qualification, however, the bridge deliberately applies a
+stronger invariant: the freshly compiled local image CRC and the returned
+controller CRC must both equal the exact image CRC bound to the dry run. This
+was exercised against the installed firmware 4.0 controller before the live
+path was enabled; the private CRC stays in ignored local documentation.
+
+### App-to-controller transfer — iOS sender implemented
 
 Recovered methods (`compileConfig`, `startDownload`, `processDownload:`,
 `sendChannelConfig:`, `nextModuleMessage:`, `sendUserData:userOnly:`,
@@ -565,18 +763,170 @@ high-level state machine:
 
 The binary contains setup command families beginning `ff f6`, `ff f7`, `ff f8`,
 `ff f9`, `ff fa`, `ff fc`, and `ff fe`, plus type-specific AES-OFB paths. Their
-complete lengths, block numbering, acknowledgements, retry rules, compiler
-layout, and firmware variations are not yet hardware verified.
+firmware variations and controller-side behavior are not yet hardware verified.
 
-The current bridge therefore rejects `sync` rather than sending a guessed
-payload. Implementing it safely requires all of the following:
+The original type-0 sender has now also been executed offline with its
+`NSOutputStream` replaced by an in-memory recorder. This proves the following
+app-output format without contacting a controller:
 
-- controller model and firmware identification;
-- an original-app capture of **verify** and one known-good full transfer;
-- the original editable configuration and resulting local CRC;
-- byte-for-byte mapping from compiled sections to transfer blocks;
-- verified acknowledgement, retry, abort, reset, and recovery behavior;
-- physical access and a recovery plan for the installation.
+1. Send CRC-framed `ff f6` BCD time and date records (the time record ORs
+   `0x40` into its BCD hour during daylight saving), then
+   `ff fc 00 00 00 00`.
+2. Compile, send the `ff fc` handshake again, and advance on reply byte `06`.
+3. After 21 100-ms process ticks, send the image as blocks whose unescaped body
+   is `fe <u16-le block index> <256 payload bytes>`. CRC-16/X25 is appended over
+   all 259 bytes and normal `1b` escaping is then applied.
+4. Follow every block with `ff f7 00 00 00 00` plus CRC. Reply `06` accepts the
+   block. Reply `15` rejects it and immediately resends the identical data block
+   and `ff f7` poll. The app allows five retries after the initial attempt
+   (six attempts total); another `15` sends `ff f8` and aborts. No reply for
+   101 process ticks—on the app's 100-ms timer—triggers the same resend.
+5. The committed 36,492-byte synthetic oracle image produces 143 blocks
+   numbered 0 through 142. The payload stream is the byte-identical final
+   image, followed by the first compiler pass's CRC as a little-endian `u16`,
+   then the final image CRC as another little-endian `u16`, then zeros to the
+   next 256-byte boundary. The two CRCs explain the four
+   configuration-dependent nonzero bytes immediately beyond the image's
+   self-declared length.
+6. After the final accepted block, the next process tick sends
+   `ff fa 00 00 00 00`. State 5 accepts at least ten response bytes beginning
+   `06`, sends `ff f9 00 00 00 00`, and enters state 6. Its 151-tick failure
+   path sends `ff f8`.
+7. State 6 accepts at least two bytes beginning `06 00`, sends
+   `ff f8 00 00 00 00`, and enters the user-transfer state.
+8. One process tick sends all chunks for one user. After all users, the sender
+   emits `ff f2 e0 7f 7f` with a zero-filled payload.
+9. The final state completes when the ivar named `F3MsgCount` reaches ten. The
+   type-0 receive parser's validated `f2` and `f4` jump-table branches both
+   increment that counter; the name does not mean the incoming records begin
+   `ff f3`. The recovered state-6 and final-status failure threshold is 1,201
+   ticks.
+
+The last point is binary evidence, not a naming inference: the `f1`–`f6`
+jump table in `stream0:handleEvent:` routes `f2` to `0x10003999c` and `f4` to
+`0x100039b90`; both blocks increment the same ivar before applying bytes 1 and
+2 to the channel-level arrays. End/error events preserve the download state and
+lead through `tcpOpenTimeout:` and `schedTcpOpen`, whose one- and two-second
+delays give the three-second manual-host reconnect cycle used by the runner.
+
+The bridge now accepts `sync` only for the qualified local type-0 profile and
+runs this exact state machine on its authenticated TCP stream. The
+implementation was derived from executed original-app output and recovered
+binary transitions, not a guessed packet design. It handles the recovered
+acknowledgement, retry, abort, permanence, reset-disconnect, three-second
+reconnect and normal-status completion behavior.
+
+### Original iPad live UI sequence — observed 2026-07-26
+
+Evidence level: **user-observed live behavior of FlexiDim iOS 2.97 on the
+installed Scene Controller**. This records what the original app displayed and
+what the room lighting did; it is not a packet capture and does not by itself
+identify which controller reply caused each transition.
+
+Before sending, the original app presents this warning:
+
+> **Ready to send configuration to Scene Controller**
+>
+> Continuing will suspend operation of the switches until the new
+> configuration is completely downloaded. The lighting system will also reset
+> which, depending on the new configuration, may result in the light levels
+> changing or going off. The download process will take several minutes.
+
+The dialog offers **Continue** and **Cancel**. After Continue, the observed
+sequence is:
+
+1. “Reconnecting to the Scene Controller”
+2. “Downloading block X” with a progress bar, ending at the final block
+3. “Verifying Scene”
+4. “Making Scene permanent — this will take up to 60 seconds”
+5. “Download complete — resetting Scene Controller — this takes about 60
+   seconds”
+6. The room lights went off during the reset
+7. “Download completed successfully, Scene Controller running normally.”
+
+The displayed endpoint agreed with the recovered sender’s computed image-block
+count. Binary execution establishes that the UI is one-based while wire block
+indices are zero-based. The web UI now preserves the recovered warning,
+explicit Cancel/Continue choice, lifecycle phase distinctions and one-based
+block progress, and does not report success before the controller reconnects
+and supplies ten valid normal status records.
+
+### First web transfer on installed hardware — succeeded 2026-07-26
+
+The user subsequently ran the qualified web transfer against the installed
+firmware 4.0 Scene Controller and reported that it worked. This is
+**[WEB-LIVE]** evidence for the complete web/bridge/controller path, in addition
+to the executed iOS oracle and emulator transcript.
+
+The run exposed a presentation-only issue. The original state machine emits the
+reset title and duration as two immediate progress events:
+`Download complete - resetting Scene Controller`, then
+`This takes about 60 seconds`. The latter replaced the former before the web UI
+painted. The visible web text now combines their meaning as
+`Restarting Scene Controller — this takes about 60 seconds`; no wire frame,
+timer, transition or recovered protocol string was changed.
+
+`bridge/config-transfer.mjs` is the pure executable model of the
+oracle-proven type-0 sender. It reproduces setup, image blocks, polls, CRC tail,
+ACK/NAK and timeout retries, the FA/F9/F8 exchange, F2 user chunks, global
+marker, and final-status completion. It fails closed for unsupported
+site/firmware modes and module/channel/profile branches.
+`bridge/transfer-runner.mjs` supplies the recovered timer and stream lifecycle,
+and `bridge/server.mjs` connects that runner to the authenticated controller
+socket. A private local comparison matched the complete original-sender
+transcript through every configured user and the global marker, both with
+payloads recovered in memory from the capture and with those payloads
+independently compiled from the imported web model. Public documentation does
+not retain its frame count, user count or configuration fingerprint; the
+transcript remains an external, ignored artifact.
+
+`bridge/transfer-safety.mjs` first wraps that model in an offline preflight. It
+validates base64 canonically, independently checks the compiled image CRC,
+drives the actual `ConfigurationTransferRunner`, reverses escaping and checks
+every frame CRC/body, exercises the binary-recovered three-second reset
+reconnect cycle, and requires ten checksum-valid `f2`/`f4` receive records
+before success. It then returns only counts, CRCs, an exact-input binding hash
+and a transcript hash.
+
+A live request is accepted only when a successful Compare on the same WebSocket
+is no more than five minutes old, both reported CRCs equal the exact image CRC,
+the controller reports the specifically qualified firmware version `4.0`, and
+a successful dry run is bound to the same image plus length-prefixed user
+payload hashes. The literal confirmation value must be `Continue`. A global
+lock prevents concurrent transfers; the overall deadline, cancellation,
+emergency-stop latch and sanitized append-only audit remain active. Audit and
+diagnostic records contain frame names, block numbers and lengths but never
+configuration bytes, user bytes, credentials or controller addresses.
+
+The committed synthetic integration test crosses the real WebSocket bridge and
+a real TCP controller emulator, validates **295/295** oracle frames, simulates
+the controller reset, reauthenticates after the recovered three-second delay and
+supplies ten valid status records. This proves bridge integration without
+writing a controller. The supported profile now advertises
+`fullTransfer: true`; all unsupported profiles remain fail-closed. The
+controlled web-app transfer to the installed firmware 4.0 controller has now
+succeeded. The remaining release evidence is a fresh post-transfer Compare,
+physical functional inspection and retention of the sanitized audit.
+
+`initUserData` ordering has one non-obvious compatibility requirement. The
+original importer inserts hardware under decimal NSString keys in an
+`NSMutableDictionary`, and room channels are sorted by display rank only.
+Equal ranks therefore inherit CoreFoundation bucket order. The web importer
+reproduces Apple's published NSString hash, CFBasicHash capacities, rehashing,
+and linear probing so those ties are byte-exact. Channel index is not a
+secondary profile sort key. The room record's third integer is the zero-based
+index of its floor name in the payload header, not the room hardware type.
+
+A wholly synthetic oracle fixture produces a 36,492-byte image, 143 blocks,
+one user payload, and 295 frames. The test suite reproduces all 295 frames
+byte-for-byte. `tools/oracle/transfer-prefix-emulator.mjs` consumes the complete
+transcript, supplies the oracle-proven replies and final status count, injects
+NAKs and timeouts, and rejects mutated or out-of-order frames.
+
+The imported web model of that deliberately from-scratch synthetic archive
+currently compiles to 36,502 bytes and differs beyond length, so that fixture
+proves sender framing rather than general compiler parity. The private
+reference and five controlled mutations remain byte-identical compiler checks.
 
 Until then, live dim/switch/scene commands and passive `f2` synchronization are
 independent of the full-transfer path and safe to test normally.
@@ -591,6 +941,8 @@ independent of the full-transfer path and safe to test normally.
 | `f2`/`f4`/`f5` receive parsing | `bridge/controller-replies.mjs` |
 | WebSocket/TCP bridge | `bridge/server.mjs` |
 | Deny-by-default controller profile | `bridge/controller-capabilities.mjs` |
+| Offline transfer preflight and safety gate | `bridge/transfer-safety.mjs` |
+| Timed transfer runner and reset reconnect gate | `bridge/transfer-runner.mjs` |
 | `.fd4cfg` conversion | `app/fd4cfg.ts` |
 | Channel address calculation | `app/flexidim-addressing.mjs` |
 | Built-in switch behavior | `app/live-switch.mjs` |

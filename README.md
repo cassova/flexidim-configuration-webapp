@@ -1,378 +1,463 @@
-> [!IMPORTANT]
-> This migration is still work in progress.  This is still very early days as I work on this.
-
 # FlexiDim Web
 
-FlexiDim Web is a local-first web migration of **JCL FlexiDim Configuration for iOS 2.97**. It exists to keep installed FlexiDim home-lighting systems usable now that the original company, mobile app, and supporting services are no longer maintained.
+FlexiDim Web is a local, browser-based replacement for **JCL FlexiDim
+Configuration for iOS 2.97**. It is intended for owners and maintainers of
+existing FlexiDim lighting systems whose original iPad app is no longer
+practical to run.
 
-The project recreates the original landscape iPad configuration console as a responsive, installable web app. It uses visual assets recovered from the original IPA and includes a local network bridge for sending verified legacy lighting commands to a FlexiDim Scene Controller.
+It can import an original `.fd4cfg` backup, edit the installation, connect to a
+Scene Controller on the local network, compare checksums, control lights, and—
+for the specifically qualified controller profile—send a complete
+configuration using the transfer flow recovered from the original app.
+
+The application and bridge run on your own network. They do not require a cloud
+service.
 
 > [!IMPORTANT]
-> Live dimming and switch/button commands are implemented. Destructive whole-controller configuration downloads are intentionally refused until the target controller has a hardware-verified binary profile. The original download process resets the Scene Controller; sending an incorrect payload could leave a lighting installation unavailable or misconfigured.
+> Keep the original iPad app and at least one known-good `.fd4cfg` backup until
+> you have imported, compared, backed up, and tested your own installation.
+> Start with read-only Compare. A full configuration transfer temporarily
+> suspends switches and resets the Scene Controller, so lights may change level
+> or turn off while it restarts.
 
-## What the original application was
+## What is supported
 
-JCL's FlexiDim Configuration app was an iPad-only installer and commissioning tool for FlexiDim lighting systems. It managed the logical model of a property and communicated with a Scene Controller over the local network.
+FlexiDim Web provides:
 
-The original app was organized into ten sections, all represented in this migration:
+- original `.fd4cfg` import and export;
+- a portable whole-workspace JSON backup;
+- site, area, module, channel, switch, assignment, scene, period, state-flag,
+  and user-profile editing;
+- automatic server-side persistence;
+- local controller discovery and authenticated connection;
+- live channel, switch, and scene control;
+- read-only configuration comparison;
+- an offline, byte-level transfer dry run;
+- complete configuration transfer for the qualified local type-0 controller
+  profile reporting firmware `4.0`;
+- desktop, tablet, and installable PWA layouts.
 
-| Original section | Purpose in FlexiDim Web |
-| --- | --- |
-| Sites | Scene Controller address, site identity, location, time zone, and daylight-saving rules |
-| Configurations | Local backups, imports, exports, controller comparison, and transfer status |
-| Equipment | Rooms, lighting channels, modules, channel types, and wall switches |
-| Switches | Wall-control definitions and interactive button testing |
-| Basic Assignments | Mapping switch buttons to scenes and channel behavior |
-| Scenes | Channel levels, fades, schedules, day selection, and live scene playback |
-| Scene to Button | Assigning and testing scenes on physical wall-control buttons |
-| Periods | Named time windows and active days used by scheduled behavior |
-| Users | Local user profiles, remote-access settings, permissions, and security keys |
-| Trace | Connection state, commands, replies, and diagnostic activity |
+Configuration data is not hard-coded for one property. Imports, compilation,
+checksums, block counts, user payloads, and transfer qualification are derived
+from the active configuration.
 
-The migrated interface preserves the original configuration hierarchy. Basic Assignments, Scenes, Scene to Button, and Equipment first show only the top-level locations from the iOS configuration (for example, Ground Floor, First Floor, and Exterior Front). Selecting a location replaces that menu with its child areas (for example, Hall, Snug, Lounge, and Kitchen), with a Back control to return to the location list. Their ordering and nesting come from the `.fd4cfg` archive rather than being alphabetically rearranged. The main navigation follows the iOS order: Configurations, Basic Assignments, Scenes, Scene to Button, Users, Periods, Equipment, and Trace, with Sites retained above them.
+Some recovered controller operations remain disabled because their behavior is
+not sufficiently proven, including unsupported firmware/site types, encrypted
+remote-controller sessions, blind/accessory commissioning, channel search, and
+profile-only writes. The UI should block an unsupported operation instead of
+inventing a packet.
 
-The Sites section follows the original app's site-picker model: it lists the sites saved on the server, lets you select one to edit its controller and location details, and provides a **Create site** button. Configuration editing is unlocked with the **Allow changes** switch in the top-right header.
+## Before you begin
 
-With changes allowed, Basic Assignments uses the original floor → room → switch flow and exposes the recovered switch controls for assigned channels, on/dimming behavior, timing, and off priority. Its add utility can automatically give every unassigned switch all channels in that switch's room. Scenes exposes the original extractor, security, and simple sequence creation utilities. Scene to Button also uses floor → room → switch navigation and provides a visual switch face whose buttons show separate first-press and second-press assignment indicators. Equipment exposes add controls for floors, switches, and lights only while changes are allowed.
+Make recovery possible first:
 
-Equipment also retains the original hardware sections for Floor / areas, Modules, Switch overview, and Deleted items. Area rows have separate open and information controls; the information editor supports the room name, Remote Control name, type, parent, and recovered IPA room icons. Module, switch, and light editors expose the original configuration concepts, including bus and profile operations, switch identification and brightness, and channel module/type/accessory/minimum/maximum/default/test controls. Deleted hardware can be restored or permanently removed.
+1. In the original iPad app, retain or export the current working `.fd4cfg`.
+2. Copy that file to at least two locations, ideally including one outside the
+   computer that will run FlexiDim Web.
+3. Record the controller's current IP address and firmware version if visible.
+4. Keep the iPad charged and available until FlexiDim Web has successfully
+   compared with the controller and representative lights and switches work.
+5. Do not experiment with a full transfer when loss of lighting would be
+   unsafe.
 
-Within Basic Assignments, selecting a switch exposes its ordered assigned-channel list. Channels can be added, removed, selected or deselected as a group, and moved earlier or later. Selecting an assigned channel opens its own On, Off, dimming, priority, and populated On/Off fade-time controls. Priority settings use checkboxes as in the iOS app, and each configuration control includes an explanatory tooltip.
+Importing a backup is safer and more complete than recreating an installation
+from memory. The original archive normally contains the controller identity,
+network details, security code, hardware layout, scenes, periods, and users.
 
-## How the migration was produced
+### If you do not have a `.fd4cfg` backup
 
-The starting point was a decrypted copy of `JCL_Configuration_2.97_iOSGods.com.ipa`. No original Xcode project or source code was available.
+There is currently no supported way to download an editable configuration from
+the Scene Controller. **Compare with Scene Controller** is read-only, but it
+returns only the installed configuration CRC, comparison result, controller
+time, and firmware version. The normal status stream reports channel levels; it
+does not contain the site's rooms, names, equipment definitions, Basic
+Assignments, scenes, periods, state flags, or users.
 
-The migration was reconstructed by:
+The controller stores the flat binary image produced by the configuration app,
+not the original editable `.fd4cfg` object graph. Even if that image could be
+read in full, this project has no evidence-backed way to reconstruct all of the
+lost editing information from it. The original app's use of “download” for a
+configuration transfer means **app to controller**, not controller to app.
 
-1. Unpacking the IPA and cataloguing its application bundle.
-2. Recovering the original icons, room plans, switch images, colour wheel, status graphics, sounds, and FlexiDim branding.
-3. Inspecting the compiled storyboards and NIB archives to recover screen names, controls, field labels, warnings, navigation, and the complete tab structure.
-4. Inspecting Objective-C runtime metadata to recover controller and model class names, properties, and method selectors.
-5. Disassembling the ARM64 networking methods to identify the legacy Scene Controller message layouts.
-6. Reimplementing the recovered packet framing, CRC-16/X25 calculation, and reserved-byte escaping in a small Node.js bridge.
-7. Rebuilding the application model and interactions in React, TypeScript, and CSS with server-side file persistence.
-8. Adding responsive layouts, an offline application shell, a web manifest, import/export, and automated protocol/rendering tests.
+Try these recovery paths before recreating anything:
 
-The original app used raw TCP and UDP sockets, which browsers cannot open directly. FlexiDim Web therefore separates the system into two local pieces:
+1. Check the original iPad, its Files/Documents storage, computer backups,
+   cloud storage, email, and any exported archives.
+2. Ask the original installer or system maintainer for the latest `.fd4cfg`.
+3. Look for a `.fd4xlt` equipment-schedule file. It is not a backup, but it can
+   create a new hardware starting point.
+4. Record the working controller's address, firmware, security code, visible
+   channel behavior, module order, switch behavior, and current CRC before
+   making any changes.
 
-```text
-Browser / installed PWA
-        │ HTTP + WebSocket on port 3000
-        ▼
-FlexiDim web server
-        │ private Compose network
-        ▼
-FlexiDim local bridge :8765
-        │ legacy TCP on the home LAN
-        ▼
-FlexiDim Scene Controller :15273
-```
+FlexiDim Web can create an empty site, so rebuilding the installation manually
+is possible in theory. That would require correctly recreating the site and
+controller codes, module order, channels, switches, Basic Assignments, scenes,
+periods, state flags, users, network settings, and other equipment data before
+sending anything.
 
-With Compose, the bridge is private to the container network and the web server
-proxies the browser's `/bridge` WebSocket connection to it. Port `8765` is not
-published on the host, and lighting data is not routed through a cloud service.
-When launched directly with `npm run bridge`, it listens on loopback only.
+> **Warning: from-scratch recommissioning has not been qualified on real
+> hardware with this web app. Do not treat it as a recovery feature. An
+> incorrect module order or equipment definition can address the wrong output;
+> an incomplete configuration can remove working behavior; and sending it
+> resets the controller and may change or switch off lighting.**
+>
+> Do not overwrite a working controller merely to discover whether a recreated
+> configuration is correct. First preserve every recoverable source, document
+> the installation, validate the model offline, and involve a qualified
+> FlexiDim installer—especially where loss of lighting could create a safety
+> risk.
 
-Type-0 controllers require the site's 16-character ASCII security code before
-they accept a session. Importing the original `.fd4cfg` file restores this value.
-For a manually created site, turn on **Allow changes** and enter it under
-**Sites → Network & Remote → Controller security code**. The user-profile keys
-on the Users tab are separate credentials and cannot replace the site key.
+## Quick start
 
-For an iPad or another computer, the Sites screen can instead use a configurable
-`ws://`/`wss://` companion address and pairing token. Binding the bridge beyond
-loopback requires `FLEXIDIM_BRIDGE_TOKEN`; use `FLEXIDIM_BRIDGE_ORIGINS` to list
-allowed web origins and terminate TLS in a trusted local reverse proxy for
-`wss://`. Unauthenticated non-loopback startup is refused.
+Docker Compose is the simplest deployment because it starts the web server and
+the local controller bridge together.
 
-See [PROTOCOL.md](PROTOCOL.md) for the recovered discovery, authentication,
-framing, live-command, controller-status, configuration-archive, comparison,
-and whole-controller-transfer details, including confidence and safety limits.
+Requirements:
 
-## Implemented functionality
+- Docker with Compose;
+- a computer on the same LAN as the FlexiDim Scene Controller;
+- a modern browser;
+- your original `.fd4cfg` backup, strongly recommended; if it is unavailable,
+  read the recovery limitations above before proceeding.
 
-- Responsive recreation of the original iPad landscape interface
-- Original FlexiDim/JCL imagery and visual language
-- Site, room, channel, switch, scene, period, assignment, and user editing
-- Live channel brightness controls
-- Live switch/button commands
-- Scene playback by sending the scene's channel levels
-- Scene-to-button assignment and testing
-- Server-side automatic configuration persistence with atomic file replacement
-- Portable JSON configuration backup and restore
-- Recovered DST rule-table parsing and sunrise/sunset calculation
-- Installer-access warning and explicit `FLEXIDIM` unlock flow
-- Trace view for connections, commands, packets, and controller responses
-- Installable PWA manifest and offline application shell
-- Local Scene Controller bridge
-- Configurable paired bridge endpoint for an iPad/companion deployment
-- Recovered legacy packet framing and CRC-16/X25 implementation
-- Desktop, tablet, and mobile layouts
-
-## Known boundary: full controller downloads
-
-The original application compiled a large site configuration into a controller-specific binary format, transferred it in multiple stages, verified CRCs, and reset the Scene Controller. That path also supported multiple generations of hardware and encrypted remote-access variants.
-
-This repository preserves the configuration UI and exposes the transfer action, but the bridge refuses an unverified full download. Completing that final hardware-specific operation safely requires:
-
-- the exact Scene Controller model and firmware version;
-- a known-good configuration exported or captured from that controller;
-- packet captures from a successful original-app transfer, if the old app can still be run;
-- physical access to recover the installation if a test download fails.
-
-Live local commands do not depend on the full-download path.
-
-## Requirements
-
-- Node.js **22.13 or newer**
-- npm
-- A computer on the same local network as the FlexiDim Scene Controller
-- The Scene Controller's local IP address
-- A modern browser with WebSocket support
-
-The web interface can be viewed without hardware. Real lighting control requires the local bridge and a reachable Scene Controller.
-
-## Install
-
-Clone the repository and install its dependencies:
+Start the application:
 
 ```bash
-git clone git@github.com:cassova/flexidim-configuration-webapp.git
+git clone <repository-url>
 cd flexidim-configuration-webapp
-npm install
-```
-
-## Launch locally
-
-Run the web application in one terminal:
-
-```bash
-npm run dev
-```
-
-Development data is written to `./config/workspace.json`. Override the location
-with `CONFIG_DIR` when required. This command performs a production build before
-starting the local Node server so its filesystem behavior matches the container;
-restart it after changing source files.
-
-Run the Scene Controller bridge in a second terminal:
-
-```bash
-npm run bridge
-```
-
-Open [http://localhost:3000](http://localhost:3000) in a browser.
-
-In **Sites**:
-
-1. Enter the Scene Controller's local IP address.
-2. Leave the port at `15273` unless the installation uses a different inbound port.
-3. Select **Connect**.
-4. Open **Trace** if you need to inspect connection attempts or controller replies.
-
-The bridge reports itself at `http://127.0.0.1:8765`. Visiting that address
-should return a small JSON status response when the directly launched bridge is
-running. The web app connects through `/bridge` by default.
-
-## Finding the Scene Controller
-
-When **Connect** is selected, the local bridge reproduces the protocol recovered from the iOS binary: it broadcasts `FLEX` to UDP port `15270`, listens for the controller reply from local port `15001`, and then opens the controller connection on TCP port `15273`. If an older controller does not answer the broadcast, the bridge falls back to trying a saved private address and scanning the private LAN. Once found, the current address is saved into the web configuration automatically. The fallback scan is bounded to at most 1,024 local addresses per interface and probes only the configured FlexiDim controller port.
-
-Some Scene Controller generations allow only one control connection. Fully close the iOS application before connecting from FlexiDim Web if discovery succeeds but the TCP connection is refused or times out.
-
-Useful places to find it include:
-
-- the router's DHCP client list;
-- a reservation previously configured for the lighting controller;
-- the original app's Site details, if it can still be opened;
-- a LAN inventory or network scan performed by the homeowner on their own network.
-
-For a reliable installation, reserve the controller's address in the router so it does not change.
-
-## Configuration data and backups
-
-FlexiDim Web saves edits automatically on the web server. By default a local
-development run writes `./config/workspace.json`; a container writes
-`/config/workspace.json`. Writes use a temporary file followed by an atomic
-rename, and revision checks prevent one browser from silently overwriting a
-newer save from another browser.
-
-On the first run after upgrading from the browser-only version, an existing
-browser workspace is migrated to the server if the server has no workspace yet.
-After a successful migration, the old browser copy is removed.
-
-To make a durable backup:
-
-1. Open **Configurations**.
-2. Select **Export configuration**.
-3. Store the generated `.fd4web.json` file somewhere safe.
-
-Use **Import configuration** to restore that file on the same computer or move the logical configuration to another browser.
-
-The importer also accepts the original `.fd4cfg` files exported or emailed from FlexiDim Configuration for iOS. These are Apple binary property-list archives, not JSON files. FlexiDim Web decodes the archived site, areas, hardware channels, switches, scenes, button assignments, periods, and users in the browser and converts them to its web data model. The converted workspace is then saved to the server. Export a new `.fd4web.json` backup after checking the migrated configuration.
-
-The interface artwork and complete room-image set are converted from the IPA's iOS-specific `CgBI` PNG resources into browser-compatible PNG files during this migration. Imported `.fd4cfg` areas retain their original room-image identifiers.
-
-Clearing browser storage does not remove the server workspace. Deleting
-`workspace.json` from the configured data directory does, so include that
-directory in host or PVC backups.
-
-## Production build
-
-Create a production build with:
-
-```bash
-npm run build
-```
-
-Start the built web application with:
-
-```bash
-npm run start
-```
-
-The server listens on port `3000` and stores data in `./config` unless
-`CONFIG_DIR` is set.
-
-## Container deployment
-
-Build and run the image with a persistent `/config` mount:
-
-```bash
-docker build -t flexidim-web .
-docker run --rm -p 3000:3000 \
-  -v flexidim-config:/config \
-  flexidim-web
-```
-
-Or use the included Compose configuration:
-
-```bash
 docker compose up --build
 ```
 
-This single command builds one image and starts both `flexidim-web` and
-`flexidim-bridge`. Only the web app is published, at
-[http://localhost:3000](http://localhost:3000); the bridge remains private and
-is reached through the web server's `/bridge` WebSocket proxy. Both services
-must become healthy before the web app is considered ready.
-
-Compose supplies an internal development bridge token by default. Set a strong
-deployment-specific value when the stack is reachable by other users:
+If you do not have Docker installed, use Node.js 22.13 or newer. From the
+repository directory, run the following commands in two separate command
+windows:
 
 ```bash
-FLEXIDIM_BRIDGE_TOKEN="$(openssl rand -hex 32)" docker compose up --build
+# Run once in either command window:
+npm install
+
+# Command window 1 — start the web server:
+npm run dev
+
+# Command window 2 — start the local controller bridge:
+npm run bridge
 ```
 
-The proxy accepts browser WebSockets only from the web app's own origin. The
-application itself is an installer console, not an internet-facing identity
-system; put TLS and authentication in a trusted reverse proxy before exposing
-port `3000` beyond a trusted network.
+Open [http://localhost:3000](http://localhost:3000).
 
-The named `flexidim-config` volume is mounted at `/config` in the web service,
-where `workspace.json` is written. The bridge is stateless and does not need
-the volume.
+Compose creates a named `flexidim-config` volume for persistent configuration
+storage. Normal rebuilds reuse it. `docker compose down` stops the application
+without deleting that volume; do not add `-v` unless you intentionally want to
+remove the saved workspace and already have an external backup.
 
-Container networking can prevent UDP broadcast discovery from reaching the
-physical LAN, especially under Docker Desktop. If **Auto Detect** does not find
-the controller, disable it and enter the controller's reserved IP address; the
-bridge can make the outbound TCP connection through the container network.
+## Deploying the pre-built container image
 
-For Kubernetes, mount a ReadWriteOnce PVC at `/config` and expose container
-port `3000`. A single-replica PVC, Deployment, and Service example is provided
-in `deploy/kubernetes.yaml`:
+Every push to `main` publishes a single image containing both the web server
+and the bridge to GHCR as `ghcr.io/cassova/flexidim-configuration-webapp`,
+tagged `latest` and with a version number (`vX.Y.Z`).
+
+By default the container starts both the web server and the bridge, so a
+single container is a complete deployment:
 
 ```bash
-kubectl apply -f deploy/kubernetes.yaml
+docker run -d --name flexidim \
+  -p 3000:3000 \
+  -v flexidim-config:/config \
+  --restart unless-stopped \
+  ghcr.io/cassova/flexidim-configuration-webapp:latest
 ```
 
-Replace `flexidim-web:latest` with the image reference in your registry. Run a
-single replica: the revision lock is process-local and the workspace is a
-single shared file, so multiple replicas must not write the same PVC
-concurrently.
+- Map a host port to container port `3000` for the web UI. The bridge stays on
+  loopback inside the container and is reached through the web server's proxy;
+  do not publish port `8765`.
+- Mount a persistent volume (or a host directory) at `/config` to keep the
+  workspace across container recreates.
 
-## Validation
+If controller auto-detection fails because container networking blocks UDP
+broadcast, enter the controller's address manually, or on Linux run with
+`--network host` instead of `-p 3000:3000`.
 
-Run the available checks with:
+The repository's [compose.yaml](compose.yaml) instead runs the same image as
+two separate services with healthchecks; both layouts store data in the same
+`/config` volume.
 
-```bash
-npm run build
-npm run lint
-npm run bridge:test
-```
+## First-time setup
 
-The protocol tests verify the recovered CRC-16/X25 behavior and legacy dimming-packet construction. The rendering test verifies that the production worker returns the FlexiDim application rather than the original project starter.
+### 1. Import your original configuration
 
-## Project structure
+1. Open **Configurations**.
+2. Select **Import**.
+3. Choose your `.fd4cfg` exported from the iPad app.
+4. Review the imported site, rooms, modules, channels, switches, scenes,
+   periods, state flags, and users before enabling changes.
+5. Select **Download configuration** to create a fresh `.fd4cfg` copy.
+6. Select **Back up all sites (JSON)** to create a web-workspace backup as
+   well.
 
-```text
-app/
-  page.tsx             Main FlexiDim application and local data model
-  globals.css          Responsive recreation of the original interface
-  layout.tsx           Metadata, PWA, icons, and social-preview configuration
-bridge/
-  protocol.mjs         Recovered CRC and legacy packet construction
-  server.mjs           Loopback WebSocket-to-TCP Scene Controller bridge
-public/
-  flexidim/             Original application artwork used by the migration
-  manifest.webmanifest Installable PWA metadata
-  sw.js                 Offline application-shell cache
-tests/
-  bridge.test.mjs       Protocol tests
-  rendered-html.test.mjs Production rendering test
-work/
-  ...                   Local reverse-engineering material; ignored by Git
-```
+Keep both formats:
 
-## Recovered legacy control protocol
+- `.fd4cfg` is compatible with the original-app archive model and is the most
+  useful recovery file;
+- the JSON backup preserves multiple sites and web-only settings.
 
-The implemented local command path is based on the behavior of the iOS 2.97 ARM64 binary:
+### 2. Connect to the Scene Controller
 
-- Local Scene Controller TCP port: `15273`
-- Message prefix: `FF F3`
-- Channel dim command: command `04`, followed by channel, brightness, and transition
-- Switch command: command `00`, followed by switch and button
-- CRC: reflected CRC-16/X25, initial value `FFFF`, final XOR `FFFF`
-- Escaping: bytes `1B`, `FD`, `FE`, and `FF` after the initial byte are prefixed with `1B`
+Once a site is saved, the web app tries to reach its controller by itself each
+time the page is opened, using the stored address, port and security code. The
+status chip in the header reports the attempt. Nothing is sent to the
+controller beyond opening the session — configuration is only ever written by
+an explicit transfer.
 
-These details are documented for maintenance and interoperability. Do not send experimental commands to a working installation without a recovery plan.
+If the site has no controller security code or address yet, startup connection
+is skipped quietly and the reason is recorded on the **Trace** page. Only one
+attempt is made per page load; **Connect** in the header or in **Sites** retries
+it.
 
-## Privacy and network safety
+Open **Sites** and select the imported site.
 
-- The working configuration is stored in `/config/workspace.json` on the host.
-- The file includes controller and user security keys; keep the deployment
-  private and restrict access to the mounted volume.
-- The bridge binds to `127.0.0.1`, not `0.0.0.0`.
-- The bridge accepts only a controller hostname/IP and TCP port from the web app.
-- No defunct JCL/FlexiDim remote service is required for local commands.
-- A hosted copy of the UI cannot reach the controller by itself; a bridge must run inside the home network.
-- Do not expose port `8765` or the Scene Controller port to the public internet.
+- **Auto-detect controller** uses the recovered local discovery protocol.
+- If discovery does not work—commonly with Docker Desktop—turn on
+  **Allow changes**, enter the controller's reserved LAN address, and connect
+  directly.
+- The normal controller port is `15273`.
+- Local type-0 controllers require a 16-character controller security code.
+  Importing the original archive normally restores it. This is not the same as
+  a user-profile key.
+
+Some Scene Controllers allow only one control session. Fully close the original
+iPad app if the web app finds the controller but cannot establish a session.
+
+When connected, the **Trace** page shows connection state and sanitized
+diagnostics.
+
+### 3. Compare before changing anything
+
+In **Configurations**, select **Compare with Scene Controller**.
+
+Compare is read-only. It compiles the active web configuration and asks the
+controller for its installed checksum and firmware version.
+
+Before considering a full transfer, verify that:
+
+- the comparison completes successfully;
+- the local and controller checksums match;
+- the reported firmware is the supported version;
+- the configuration you intend to send is the one currently selected.
+
+A mismatch is not a prompt to send immediately. First confirm that you imported
+the correct backup and selected the correct site/configuration.
+
+### 4. Make and back up edits
+
+Editing is locked by default. Enable **Allow changes** only when you intend to
+modify the configuration.
+
+Helpful habits:
+
+- make one logical change at a time;
+- use descriptive configuration names;
+- download a new `.fd4cfg` after meaningful edits;
+- keep dated backups outside the app's data directory;
+- compare again whenever the active configuration changes;
+- test a representative light or scene before making broad changes.
+
+Edits save automatically to the server. If the app shows **Changes are not
+being saved**, stop editing, restore server storage, and reload before
+continuing.
+
+## Sending a complete configuration
+
+Full transfer is deliberately fail-closed. The Send button becomes available
+only when all of these conditions are true:
+
+1. the active configuration compiles without unsupported fields;
+2. the controller is connected through the qualified local type-0 profile;
+3. a fresh Compare from the same connection reports firmware `4.0`;
+4. both Compare checksums equal the exact compiled image checksum;
+5. the offline transfer dry run passes for the exact image and user payloads;
+6. no other transfer or safety stop is active.
+
+Run **Offline transfer dry run** immediately before sending. It writes no bytes
+to the controller. It recompiles the image, generates every transfer frame,
+checks CRCs and escaping, and exercises the transfer runner's retry,
+reset/reconnect, and normal-status completion flow against the local model.
+
+Then:
+
+1. Ensure it is safe for switches and lighting to be interrupted.
+2. Keep the original `.fd4cfg` available in the iPad app.
+3. Select **Send configuration to Scene Controller**.
+4. Read the warning and choose **Continue** once.
+5. Do not refresh, close the browser, use live controls, restart containers, or
+   start a second controller session during the transfer.
+6. Wait for block download, verification, permanence, controller restart,
+   reconnection, and **Scene controller running normally**.
+7. Run Compare again after completion.
+8. Test representative physical switches, lights, and important scenes.
+
+Do not retry blindly after a failure. Record the exact phase and message first.
+If the controller does not return to normal operation, stop using the web
+transfer path and use the original app and known-good backup as the recovery
+route.
+
+## Finding the controller
+
+The bridge broadcasts the recovered discovery request over the local network
+and then opens a TCP connection to the controller. If automatic discovery does
+not work, useful places to find the address include:
+
+- the router's DHCP client or reservation list;
+- the original app's Site details;
+- a LAN inventory performed by the owner on their own network.
+
+Reserve the controller's address in the router once found. Do not expose the
+controller port to the public internet.
+
+## Data storage and backups
+
+The web server stores the canonical workspace at:
+
+- direct Node run: `./config/workspace.json`;
+- container: `/config/workspace.json`;
+- Compose: the named `flexidim-config` volume mounted at `/config`.
+
+Writes use atomic replacement and revision checks. Clearing browser storage
+does not delete the server workspace, but deleting the configured data
+directory or Docker volume does.
+
+A sound backup set contains:
+
+- the last known-good original `.fd4cfg`;
+- a newly downloaded `.fd4cfg` after verified web edits;
+- **Back up all sites (JSON)** output;
+- a backup of the Compose volume or `CONFIG_DIR`.
+
+Do not store these files in a public repository. They may contain the property
+layout, controller address, controller security code, user keys, contact
+details, and location data.
+
+## Network and deployment safety
+
+With Compose, only port `3000` is published. The bridge remains private to the
+Compose network and is reached through the web server's `/bridge` WebSocket
+proxy. When launched directly, the bridge binds to loopback by default.
+
+For access from another computer or an iPad, use a trusted local reverse proxy,
+TLS, authentication, a strong `FLEXIDIM_BRIDGE_TOKEN`, and an explicit
+`FLEXIDIM_BRIDGE_ORIGINS` list. Never publish port `8765` or controller port
+`15273` directly to the internet.
+
+The application is an installer console, not a multi-tenant identity service.
+Use a single application replica and restrict access to trusted maintainers.
 
 ## Troubleshooting
 
-### The web app says “Bridge unavailable”
+### “Bridge unavailable”
 
-Start `npm run bridge` in a separate terminal and confirm that `http://127.0.0.1:8765` returns a ready response.
+With a direct Node installation, confirm `npm run bridge` is running and
+[http://127.0.0.1:8765](http://127.0.0.1:8765) returns a ready response. With
+Compose, check:
 
-### The bridge is ready but the controller does not connect
+```bash
+docker compose ps
+docker compose logs flexidim-web flexidim-bridge
+```
 
-- Confirm the IP address in **Sites**.
-- Confirm that the computer and controller are on the same LAN or VLAN.
-- Check whether the controller's DHCP address changed.
-- Confirm that local firewall rules allow the Node.js process to make LAN connections.
-- Verify the controller port; the recovered default is `15273`.
+### The controller is not found
 
-### A slider moves but the light does not change
+- confirm the computer and controller are on the same LAN or routed VLAN;
+- close the original iPad app so it releases its controller session;
+- check the controller's DHCP reservation;
+- enter the address manually if container networking blocks UDP broadcast;
+- confirm local firewall rules allow outbound LAN TCP connections.
 
-Open **Trace** and look for a connected state and a transmitted packet. Confirm that the logical channel number matches the physical installation's channel allocation.
+### Compare is disabled
 
-### Configuration disappeared
+Connect to the controller first. If connected, check that the bridge announced
+a profile with read-only verification support.
 
-Browser storage may have been cleared or a different browser profile may be in use. Restore an exported `.fd4web.json` backup from **Configurations**.
+### Send is disabled
 
-## Archival and legal note
+Hover or focus the button for the specific reason. Usually you need to:
 
-This is an interoperability and preservation project for owners of existing FlexiDim installations. JCL, FlexiDim, their names, and the recovered artwork belong to their respective rights holders. The repository is not an official continuation of the original product and is not affiliated with the former manufacturer.
+- fix an incomplete or unsupported configuration field;
+- reconnect;
+- run a fresh matching Compare;
+- run the offline dry run again;
+- clear a deliberately latched safety stop by restarting/re-arming the bridge.
 
-Use the software only with equipment and configuration data you own or are authorized to maintain.
+Do not work around these gates by editing the bridge or forging messages.
+
+### Configuration appears missing
+
+Confirm you are using the same server data directory or Compose volume. Restore
+the JSON workspace backup or import the latest `.fd4cfg`. Do not create a new
+empty site over the missing installation until you have checked storage.
+
+### Docker reports “No space left on device”
+
+Inspect Docker disk usage before deleting anything:
+
+```bash
+docker system df
+docker volume ls
+```
+
+The included image does not declare an anonymous `/config` volume; Compose uses
+one named volume for persistent web data. Review every candidate before using a
+Docker prune command, because other projects may own volumes and caches.
+
+## Development and validation
+
+```bash
+npm run build
+npm test
+npm run bridge:test
+npm run lint
+```
+
+The committed regression corpus is wholly synthetic. It covers configuration
+import/export, compilation, CRC and escaping, complete transfer framing,
+failure branches, controller emulation, reset/reconnect behavior, and rendered
+UI interactions without exposing a real installation.
+
+Technical protocol details and evidence boundaries are documented in
+[PROTOCOL.md](PROTOCOL.md). Remaining work and qualification notes are tracked
+in [TODO.md](TODO.md).
+
+## Project layout
+
+```text
+app/             Web interface, import/export, compiler, and data model
+bridge/          Local WebSocket/TCP bridge and transfer state machine
+public/          PWA files and recovered interface artwork
+server/          Web host and persistent workspace storage
+tests/           Synthetic unit, regression, UI, and emulator tests
+tools/           Local diagnostics and controller emulator
+tools/oracle/    Oracle documentation, synthetic evidence, and ignored private harnesses
+```
+
+## Disclaimer and recovery warning
+
+FlexiDim Web is an independent interoperability and preservation project. It is
+not an official JCL product, is not affiliated with the former manufacturer,
+and comes with no guarantee that every FlexiDim hardware or firmware variant is
+supported. JCL, FlexiDim, their names, and original artwork belong to their
+respective rights holders.
+
+Use it only with equipment and configuration data you own or are authorized to
+maintain. Lighting control can be safety-critical. Before relying on this app:
+
+- preserve the working original app and controller configuration;
+- keep multiple offline backups;
+- verify checksums before and after a transfer;
+- test changes while someone has physical access to the installation;
+- avoid transfers during unsafe times or when lighting loss would create risk;
+- never repeatedly retry a failed transfer without understanding its state;
+- do not discard the original recovery method until your own installation has
+  completed import, Compare, dry run, transfer, post-transfer Compare, and
+  physical functional checks successfully.
+
+If you are uncertain whether your controller profile is supported, stop after
+read-only Compare and seek qualified help rather than forcing a write.

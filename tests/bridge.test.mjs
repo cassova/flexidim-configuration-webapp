@@ -165,16 +165,42 @@ test("scans the saved controller subnet when running on a Docker subnet", () => 
   assert.ok(candidates.length <= 508, "discovery must remain bounded to two /24 networks");
 });
 
+test("uses a host LAN seed when an imported archive has no private endpoint", () => {
+  const interfaces = {
+    eth0: [{
+      address: "172.20.0.3",
+      netmask: "255.255.0.0",
+      family: "IPv4",
+      internal: false,
+    }],
+  };
+  const candidates = lanCandidates("203.0.113.10", interfaces, "192.168.50.42");
+  assert.ok(candidates.includes("192.168.50.1"));
+  assert.ok(candidates.includes("192.168.50.254"));
+  assert.ok(!candidates.includes("203.0.113.10"));
+  assert.ok(candidates.length <= 508, "fallback discovery must remain bounded to two /24 networks");
+});
+
+test("a learned private endpoint takes precedence over the host LAN seed", () => {
+  const candidates = lanCandidates("192.168.50.27", {}, "10.20.30.40");
+  assert.equal(candidates[0], "192.168.50.27");
+  assert.ok(candidates.includes("192.168.50.254"));
+  assert.ok(!candidates.includes("10.20.30.40"));
+});
+
 test("uses the discovery protocol recovered from the iOS binary", () => {
   assert.equal(FLEXIDIM_DISCOVERY_MESSAGE, "FLEX");
   assert.equal(FLEXIDIM_DISCOVERY_PORT, 15270);
   assert.equal(FLEXIDIM_DISCOVERY_REPLY_PORT, 15001);
 });
 
-test("keeps unverified commissioning writes denied by default", () => {
+test("enables only the oracle-proven type-0 full transfer commissioning path", () => {
+  assert.equal(capabilityFor("connect"), true);
+  assert.equal(capabilityFor("discover"), true);
   assert.equal(capabilityFor("dim"), true);
   assert.equal(capabilityFor("switch"), true);
-  assert.equal(capabilityFor("sync"), false);
+  assert.equal(capabilityFor("sync"), true);
   assert.equal(capabilityFor("moduleProfiles"), false);
-  assert.equal(SAFE_LOCAL_PROFILE.fullTransfer, false);
+  assert.equal(capabilityFor("unregisteredCommand"), false);
+  assert.equal(SAFE_LOCAL_PROFILE.fullTransfer, true);
 });

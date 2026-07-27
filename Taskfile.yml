@@ -1,0 +1,144 @@
+version: "3"
+
+# Task runner for the FlexiDim configuration webapp.
+#   task up     bring the compose stack up
+#   task down   take it down
+#   task test   run the entire test suite
+#   task        list everything
+
+vars:
+  # Both suites are needed: `npm test` builds and runs the rendered/deployment
+  # and UI tests, but does NOT include the fast suite.
+  COMPOSE: docker compose
+  # Used only to select dangling images created by this Compose project. It
+  # deliberately does not match images or build cache from other projects.
+  PROJECT_LABEL: com.docker.compose.project=flexidim-configuration-webapp
+  # Docker Desktop's bridge interface cannot reveal the Mac's physical LAN
+  # subnet. Pass it as a discovery seed without storing it in the repository.
+  # The empty fallback keeps non-macOS and offline use working normally.
+  HOST_LAN_DISCOVERY_SEED:
+    sh: ipconfig getifaddr en0 2>/dev/null || true
+
+env:
+  FLEXIDIM_DISCOVERY_SEED: "{{.HOST_LAN_DISCOVERY_SEED}}"
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  up:
+    desc: Start the web + bridge stack (web on :3000) — use `task rebuild` after code changes
+    cmds:
+      - task: ensure:image
+      - "{{.COMPOSE}} up --no-build"
+
+  rebuild:
+    desc: Rebuild the images and start the stack (run after changing code or deps)
+    cmds:
+      # Old Compose-built images are ordinary dangling images, not BuildKit
+      # cache. Prune only this project's dangling images before the next build
+      # so repeated rebuilds remain bounded without touching other projects.
+      - docker image prune -f --filter "label={{.PROJECT_LABEL}}"
+      # Build the shared image once. The bridge consumes the same tag.
+      - "{{.COMPOSE}} build flexidim-web"
+      - "{{.COMPOSE}} up --no-build"
+
+  ensure:image:
+    internal: true
+    cmds:
+      - "{{.COMPOSE}} build flexidim-web"
+    status:
+      - docker image inspect flexidim-web:local
+
+  down:
+    desc: Stop and remove the stack (the flexidim-config volume is kept)
+    cmds:
+      - "{{.COMPOSE}} down"
+
+  prune:
+    desc: Reclaim this project's dangling images and Docker build cache (never volumes)
+    cmds:
+      - docker image prune -f --filter "label={{.PROJECT_LABEL}}"
+      - docker builder prune -f
+      - docker system df
+
+  clean:
+    desc: Remove this project's containers, image and build cache (KEEPS your configuration)
+    cmds:
+      # Scoped to this project on purpose. A bare `docker system prune -a` would
+      # take other projects' images with it, and `docker volume prune` would
+      # delete the flexidim-config volume that holds the saved workspace.
+      - "{{.COMPOSE}} down --remove-orphans"
+      - docker image rm -f flexidim-web:local || true
+      - docker image prune -f --filter "label={{.PROJECT_LABEL}}"
+      - docker builder prune -f
+      - docker system df
+      - 'echo "Configuration volume kept. Run ''task clean:volume'' to delete it too."'
+
+  clean:volume:
+    desc: DESTRUCTIVE — also delete the saved configuration volume
+    prompt: This deletes the flexidim-config volume and every site and configuration saved in it. Continue?
+    cmds:
+      # The volume is the ONLY persistence: there is no browser-side copy to fall
+      # back on, so this loses any configuration that was not exported first.
+      - "{{.COMPOSE}} down --volumes --remove-orphans"
+      - docker system df
+
+  test:
+    desc: Run the entire test suite (214 tests) plus lint
+    cmds:
+      - task: test:fast
+      - task: test:build
+      - task: lint
+
+  test:fast:
+    desc: Fast suite — protocol, migration, storage, round-trip, catalogue, emulator (187)
+    cmds:
+      - npm run bridge:test
+
+  test:build:
+    desc: Build, then rendered-HTML, deployment and DOM interaction tests (27)
+    cmds:
+      - npm test
+
+  test:ui:
+    desc: DOM interaction tests only, no build (12)
+    cmds:
+      - npm run test:ui
+
+  lint:
+    desc: eslint (expect 0 errors; 34 known warnings)
+    cmds:
+      - npm run lint
+
+  logs:
+    desc: Follow the stack's logs
+    cmds:
+      - "{{.COMPOSE}} logs -f"
+
+  restart:
+    desc: Stop and start the stack without rebuilding
+    cmds:
+      - task: down
+      - task: up
+
+  smoke:
+    desc: >-
+      Read-only end-to-end check against the running stack. Set
+      CONTROLLER_HOST/CONTROLLER_PORT/CONTROLLER_KEY to include a live
+      controller connect + status read. Never sends dim, switch, scene or sync.
+    cmds:
+      - node tools/compose-smoke.mjs
+
+  emulator:
+    desc: Run the emulated Scene Controller on :15273 (no hardware needed)
+    cmds:
+      - node tools/controller-emulator.mjs
+
+  fixture:
+    desc: Regenerate the golden .fd4cfg fixture after importer/exporter changes
+    cmds:
+      - node --experimental-strip-types tools/build-golden-fixture.mjs

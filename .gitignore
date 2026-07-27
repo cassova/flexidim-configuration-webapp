@@ -42,3 +42,9 @@ next-env.d.ts
 /outputs/
 /work/
 /config/
+/tools/oracle/private/
+
+# Root-level local archive exports may have extensionless, human-readable names.
+# Public regression fixtures live under tests/fixtures and are wholly synthetic.
+/* *
+/*.sdf

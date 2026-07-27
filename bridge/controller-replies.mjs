@@ -4,6 +4,7 @@
 // chunks because socket data events do not preserve message boundaries.
 export function parseControllerReplies(buffer) {
   const statuses = [];
+  const transferStatuses = [];
   const visible = [];
   const invalid = [];
   let offset = 0;
@@ -34,11 +35,22 @@ export function parseControllerReplies(buffer) {
         channel: record[1] + 1,
         level: record[2],
       });
+      transferStatuses.push({ kind, record });
     } else {
       visible.push(record);
+      // The type-0 iOS stream parser's f2 and f4 jump-table branches both
+      // increment the ivar named F3MsgCount. The transfer runner uses this
+      // explicit list instead of inferring completion from arbitrary traffic.
+      if (kind === 0xf4) transferStatuses.push({ kind, record });
     }
     offset += length;
   }
 
-  return { statuses, visible, invalid, rest: buffer.subarray(offset) };
+  return {
+    statuses,
+    transferStatuses,
+    visible,
+    invalid,
+    rest: buffer.subarray(offset),
+  };
 }

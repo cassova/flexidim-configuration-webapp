@@ -1,0 +1,11 @@
+{
+  "description": "Passive record capture from a real FlexiDim Scene Controller on an authenticated site-type-0 local session. Nothing was sent after the authentication record. Counts and record types only; no site address, channel level or key appears here.",
+  "capturedAt": "2026-07-25",
+  "firmwareProfile": "type-0-live-only",
+  "listenedSeconds": 50,
+  "bytesSeen": 1248,
+  "recordCounts": { "0xf2": 312 },
+  "checkFailures": 0,
+  "unknownSamples": [],
+  "conclusion": "On an authenticated type-0 local session the controller emits ONLY the f2 channel-level scan, unsolicited. No period, pending-scene, f4 or f5 record appears without a request frame. This matches the recovered binary: the period-flag request is emitted only for encrypted remote sessions."
+}
