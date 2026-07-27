@@ -57,7 +57,16 @@ test("Compose builds and starts both private bridge and persistent web services"
   assert.match(compose, /FLEXIDIM_BRIDGE_UPSTREAM_HOST: flexidim-bridge/);
   assert.doesNotMatch(compose, /8765:8765/);
   assert.match(compose, /flexidim-config:\/config/);
-  assert.match(dockerfile, /COPY --from=build \/app\/bridge \.\/bridge/);
+  assert.match(compose, /FLEXIDIM_TRANSFER_AUDIT_PATH: \/config\/transfer-audit\.jsonl/);
+  assert.equal(
+    (compose.match(/- flexidim-config:\/config/g) ?? []).length,
+    2,
+    "both services must reuse the same named volume; neither may create an anonymous one",
+  );
+  assert.match(
+    dockerfile,
+    /COPY (?:--chown=node:node )?--from=build \/app\/bridge \.\/bridge/,
+  );
 });
 
 test("the web server proxies an authenticated bridge WebSocket", async (t) => {

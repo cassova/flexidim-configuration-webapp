@@ -1,0 +1,1588 @@
+{
+  "site": {
+    "name": "Golden Test House",
+    "id": "FD4-GOLD",
+    "ip": "192.168.77.50",
+    "port": 15273,
+    "routerPort": 15273,
+    "description": "Imported from FlexiDim Configuration for iOS",
+    "address": "1 Fixture Way, Testville",
+    "contact": "Golden Tester",
+    "email": "golden@example.test",
+    "phone": "01234 567890",
+    "latitude": "51.50000",
+    "longitude": "-0.12000",
+    "timezone": "Europe/London",
+    "dst": "UK / Europe",
+    "remote": false,
+    "remoteServer": "",
+    "securityCode": "GOLDENFIXTURE016",
+    "autoDetect": true,
+    "addressLines": [
+      "1 Fixture Way",
+      "Testville",
+      "",
+      ""
+    ],
+    "siteType": 0,
+    "modulesChanged": false,
+    "routerInbound": true,
+    "wirelessGateways": [
+      {
+        "address": "gateway-one",
+        "count": 2
+      }
+    ],
+    "moduleOrderA": [
+      7000,
+      7010
+    ],
+    "moduleOrderB": [
+      8000
+    ],
+    "updatedAt": "2026-01-02T03:04:05.000Z",
+    "legacy": {
+      "top": {
+        "$0": "29",
+        "$1": "Golden Test House",
+        "$2": "1 Fixture Way",
+        "$3": "Testville",
+        "$4": "",
+        "$5": "",
+        "$6": "Golden Tester",
+        "$7": "01234 567890",
+        "$8": "golden@example.test",
+        "$9": "FD4-GOLD",
+        "$10": "GOLDENFIXTURE016",
+        "$11": "192.168.77.50",
+        "$12": "1",
+        "$13": "0",
+        "$14": {
+          "$date": "2026-01-02T03:04:05.000Z"
+        },
+        "$15": "-0.12000",
+        "$16": "51.50000",
+        "$17": "0",
+        "$18": "1",
+        "$19": "0",
+        "$20": "UK / Europe",
+        "$21": "gateway-one",
+        "$22": "",
+        "$23": "",
+        "$24": "",
+        "$25": "2",
+        "$26": "",
+        "$27": "",
+        "$28": "",
+        "$29": "",
+        "$30": "7000",
+        "$31": "7010",
+        "$32": "8000",
+        "$42": "Golden Test House",
+        "$43": "Synthetic golden fixture",
+        "$44": "",
+        "$45": {
+          "$date": "2026-01-02T03:04:05.000Z"
+        },
+        "$46": "2",
+        "$49": "4",
+        "$54": "35",
+        "$90": "1",
+        "hwc": 9,
+        "modc": 2,
+        "modcB": 1
+      },
+      "hardwareOrder": [
+        101,
+        102,
+        103,
+        201,
+        202,
+        203,
+        204,
+        301,
+        302
+      ],
+      "sceneOrder": [
+        401,
+        402,
+        403,
+        404
+      ]
+    }
+  },
+  "configurations": [
+    {
+      "id": 1,
+      "siteId": "FD4-GOLD",
+      "name": "Golden Test House",
+      "description": "Synthetic golden fixture",
+      "lastUpdated": "2026-01-02T03:04:05.000Z"
+    }
+  ],
+  "activeConfigId": 1,
+  "rooms": [
+    {
+      "id": 1,
+      "name": "Ground Floor",
+      "floor": "FlexiDim",
+      "icon": "/flexidim/rooms/0.png",
+      "parentId": null,
+      "shortName": "Ground",
+      "displayRank": 0,
+      "hardwareType": 0,
+      "hardwareIndex": 0,
+      "legacyKey": 101,
+      "legacy": {
+        "ix": 0,
+        "ch": false,
+        "df": 100,
+        "sn": "Ground",
+        "ra": 0,
+        "ri": 0,
+        "nm": "Ground Floor",
+        "mp": 100,
+        "mx": 100,
+        "di": 0,
+        "hw": 0,
+        "mi": 0,
+        "pr": 0,
+        "ac": 0,
+        "fn": "",
+        "ky": 101,
+        "ad": "",
+        "ty": 0,
+        "md": -1
+      }
+    },
+    {
+      "id": 2,
+      "name": "Lounge",
+      "floor": "Ground Floor",
+      "icon": "/flexidim/rooms/3.png",
+      "parentId": 1,
+      "shortName": "Lounge",
+      "displayRank": 1,
+      "hardwareType": 0,
+      "hardwareIndex": 0,
+      "legacyKey": 102,
+      "legacy": {
+        "ix": 0,
+        "ch": false,
+        "df": 100,
+        "sn": "Lounge",
+        "ra": 1,
+        "ri": 3,
+        "nm": "Lounge",
+        "mp": 100,
+        "mx": 100,
+        "di": 0,
+        "hw": 0,
+        "mi": 0,
+        "pr": 101,
+        "ac": 0,
+        "fn": "",
+        "ky": 102,
+        "ad": "",
+        "ty": 0,
+        "md": -1
+      }
+    },
+    {
+      "id": 3,
+      "name": "Kitchen",
+      "floor": "Ground Floor",
+      "icon": "/flexidim/rooms/10.png",
+      "parentId": 1,
+      "shortName": "Kitchen",
+      "displayRank": 2,
+      "hardwareType": 0,
+      "hardwareIndex": 0,
+      "legacyKey": 103,
+      "legacy": {
+        "ix": 0,
+        "ch": false,
+        "df": 100,
+        "sn": "Kitchen",
+        "ra": 2,
+        "ri": 10,
+        "nm": "Kitchen",
+        "mp": 100,
+        "mx": 100,
+        "di": 0,
+        "hw": 0,
+        "mi": 0,
+        "pr": 101,
+        "ac": 0,
+        "fn": "",
+        "ky": 103,
+        "ad": "",
+        "ty": 0,
+        "md": -1
+      }
+    }
+  ],
+  "channels": [
+    {
+      "id": 1,
+      "name": "Lounge Ceiling",
+      "roomId": 2,
+      "module": "Module 7000 / Ch1",
+      "kind": "Dimmable",
+      "level": 0,
+      "moduleId": 7000,
+      "moduleIndex": 1,
+      "channelIndex": 1,
+      "profileOrder": 6,
+      "controllerChannel": 1,
+      "accessoryModule": "None",
+      "accessoryType": 0,
+      "minimum": 5,
+      "maximum": 100,
+      "maximumPermissible": 95,
+      "defaultLevel": 80,
+      "shortName": "Ceiling",
+      "displayRank": 0,
+      "hardwareType": 2,
+      "dimmable": true,
+      "hardwareChanged": false,
+      "legacyKey": 201,
+      "legacy": {
+        "ix": 1,
+        "ch": false,
+        "df": 80,
+        "sn": "Ceiling",
+        "ra": 0,
+        "ri": 0,
+        "nm": "Lounge Ceiling",
+        "mp": 95,
+        "mx": 100,
+        "di": 1,
+        "hw": 2,
+        "mi": 5,
+        "pr": 102,
+        "ac": 0,
+        "fn": "",
+        "ky": 201,
+        "ad": "",
+        "ty": 2,
+        "md": 7000
+      }
+    },
+    {
+      "id": 2,
+      "name": "Lounge Lamps",
+      "roomId": 2,
+      "module": "Module 7000 / Ch2",
+      "kind": "Hard fired dimmable",
+      "level": 0,
+      "moduleId": 7000,
+      "moduleIndex": 2,
+      "channelIndex": 2,
+      "profileOrder": 3,
+      "controllerChannel": 2,
+      "accessoryModule": "None",
+      "accessoryType": 0,
+      "minimum": 0,
+      "maximum": 100,
+      "maximumPermissible": 100,
+      "defaultLevel": 100,
+      "shortName": "Lamps",
+      "displayRank": 1,
+      "hardwareType": 38,
+      "dimmable": true,
+      "hardwareChanged": true,
+      "legacyKey": 202,
+      "legacy": {
+        "ix": 2,
+        "ch": true,
+        "df": 100,
+        "sn": "Lamps",
+        "ra": 1,
+        "ri": 0,
+        "nm": "Lounge Lamps",
+        "mp": 100,
+        "mx": 100,
+        "di": 1,
+        "hw": 38,
+        "mi": 0,
+        "pr": 102,
+        "ac": 0,
+        "fn": "",
+        "ky": 202,
+        "ad": "",
+        "ty": 2,
+        "md": 7000
+      }
+    },
+    {
+      "id": 3,
+      "name": "Kitchen Spots",
+      "roomId": 3,
+      "module": "Module 7010 / Ch1",
+      "kind": "Full cycle on/off",
+      "level": 0,
+      "moduleId": 7010,
+      "moduleIndex": 1,
+      "channelIndex": 1,
+      "profileOrder": 1,
+      "controllerChannel": 9,
+      "accessoryModule": "None",
+      "accessoryType": 0,
+      "minimum": 10,
+      "maximum": 90,
+      "maximumPermissible": 90,
+      "defaultLevel": 60,
+      "shortName": "Spots",
+      "displayRank": 2,
+      "hardwareType": 101,
+      "dimmable": false,
+      "hardwareChanged": false,
+      "legacyKey": 203,
+      "legacy": {
+        "ix": 1,
+        "ch": false,
+        "df": 60,
+        "sn": "Spots",
+        "ra": 2,
+        "ri": 0,
+        "nm": "Kitchen Spots",
+        "mp": 90,
+        "mx": 90,
+        "di": 0,
+        "hw": 101,
+        "mi": 10,
+        "pr": 103,
+        "ac": 0,
+        "fn": "",
+        "ky": 203,
+        "ad": "",
+        "ty": 2,
+        "md": 7010
+      }
+    },
+    {
+      "id": 4,
+      "name": "Kitchen Blind",
+      "roomId": 3,
+      "module": "Module 8000 / Ch1",
+      "kind": "On/Off",
+      "level": 0,
+      "moduleId": 8000,
+      "moduleIndex": 1,
+      "channelIndex": 1,
+      "profileOrder": 7,
+      "controllerChannel": 17,
+      "accessoryModule": "None",
+      "accessoryType": 1,
+      "minimum": 0,
+      "maximum": 100,
+      "maximumPermissible": 100,
+      "defaultLevel": 0,
+      "shortName": "Blind",
+      "displayRank": 3,
+      "hardwareType": 0,
+      "dimmable": false,
+      "hardwareChanged": false,
+      "legacyKey": 204,
+      "legacy": {
+        "ix": 1,
+        "ch": false,
+        "df": 0,
+        "sn": "Blind",
+        "ra": 3,
+        "ri": 0,
+        "nm": "Kitchen Blind",
+        "mp": 100,
+        "mx": 100,
+        "di": 0,
+        "hw": 0,
+        "mi": 0,
+        "pr": 103,
+        "ac": 1,
+        "fn": "",
+        "ky": 204,
+        "ad": "",
+        "ty": 2,
+        "md": 8000
+      }
+    }
+  ],
+  "switches": [
+    {
+      "id": 1,
+      "name": "Lounge Switch",
+      "roomId": 2,
+      "kind": "8 scene",
+      "buttons": 11,
+      "type": 15,
+      "number": 1,
+      "shortName": "Lounge SW",
+      "displayRank": 0,
+      "hardwareType": 15,
+      "legacyKey": 301,
+      "legacy": {
+        "hardware": {
+          "ix": 1,
+          "ch": false,
+          "df": 100,
+          "sn": "Lounge SW",
+          "ra": 0,
+          "ri": 0,
+          "nm": "Lounge Switch",
+          "mp": 100,
+          "mx": 100,
+          "di": 0,
+          "hw": 15,
+          "mi": 0,
+          "pr": 102,
+          "ac": 0,
+          "fn": "",
+          "ky": 301,
+          "ad": "",
+          "ty": 1,
+          "md": -1
+        },
+        "settings": {
+          "bu0": "403",
+          "bu1": "404",
+          "bu2": "0",
+          "bu3": "0",
+          "bu4": "0",
+          "bu5": "0",
+          "bu6": "0",
+          "bu7": "0",
+          "bu8": "0",
+          "bu9": "0",
+          "bu10": "0",
+          "bu11": "0",
+          "bu12": "0",
+          "bu13": "0",
+          "bu14": "0",
+          "bu15": "0",
+          "bu16": "0",
+          "bu17": "0",
+          "bu18": "0",
+          "bu19": "0",
+          "bu20": "0",
+          "bu21": "0",
+          "bu22": "0",
+          "bu23": "0",
+          "bs0": {
+            "$class": "JCLFDChannel",
+            "ky": 201,
+            "t2": 4,
+            "de": 0,
+            "br": 100,
+            "fl": 7,
+            "ch": false,
+            "t1": 2
+          },
+          "bs1": {
+            "$class": "JCLFDChannel",
+            "ky": 202,
+            "t2": 6,
+            "de": 0,
+            "br": 100,
+            "fl": 9,
+            "ch": false,
+            "t1": 1
+          },
+          "bs": 2,
+          "op": true,
+          "ky": 301
+        }
+      },
+      "basic": {
+        "channelIds": [
+          1,
+          2
+        ],
+        "assignOn": true,
+        "assignOff": true,
+        "assignDimming": true,
+        "assignChannelDimming": false,
+        "onTime": 1,
+        "offTime": 2,
+        "offPriority": 0,
+        "onPriority": true,
+        "channelSettings": {
+          "1": {
+            "assignOn": true,
+            "assignOff": true,
+            "assignDimming": true,
+            "assignChannelDimming": false,
+            "onPriority": true,
+            "offPriority": false,
+            "onFade": 1,
+            "offFade": 2
+          },
+          "2": {
+            "assignOn": true,
+            "assignOff": false,
+            "assignDimming": false,
+            "assignChannelDimming": true,
+            "onPriority": true,
+            "offPriority": false,
+            "onFade": 0.5,
+            "offFade": 3
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Kitchen Switch",
+      "roomId": 3,
+      "kind": "4 scene",
+      "buttons": 7,
+      "type": 13,
+      "number": 2,
+      "shortName": "Kitchen SW",
+      "displayRank": 1,
+      "hardwareType": 13,
+      "legacyKey": 302,
+      "legacy": {
+        "hardware": {
+          "ix": 2,
+          "ch": false,
+          "df": 100,
+          "sn": "Kitchen SW",
+          "ra": 1,
+          "ri": 0,
+          "nm": "Kitchen Switch",
+          "mp": 100,
+          "mx": 100,
+          "di": 0,
+          "hw": 13,
+          "mi": 0,
+          "pr": 103,
+          "ac": 0,
+          "fn": "",
+          "ky": 302,
+          "ad": "",
+          "ty": 1,
+          "md": -1
+        },
+        "settings": {
+          "bu0": "404",
+          "bu1": "0",
+          "bu2": "0",
+          "bu3": "0",
+          "bu4": "0",
+          "bu5": "0",
+          "bu6": "0",
+          "bu7": "0",
+          "bu8": "0",
+          "bu9": "0",
+          "bu10": "0",
+          "bu11": "0",
+          "bu12": "0",
+          "bu13": "0",
+          "bu14": "0",
+          "bu15": "0",
+          "bu16": "0",
+          "bu17": "0",
+          "bu18": "0",
+          "bu19": "0",
+          "bu20": "0",
+          "bu21": "0",
+          "bu22": "0",
+          "bu23": "0",
+          "bs0": {
+            "$class": "JCLFDChannel",
+            "ky": 203,
+            "t2": 0,
+            "de": 0,
+            "br": 100,
+            "fl": 3,
+            "ch": false,
+            "t1": 0
+          },
+          "bs": 1,
+          "op": false,
+          "ky": 302
+        }
+      },
+      "basic": {
+        "channelIds": [
+          3
+        ],
+        "assignOn": true,
+        "assignOff": true,
+        "assignDimming": false,
+        "assignChannelDimming": false,
+        "onTime": 0,
+        "offTime": 0,
+        "offPriority": 1,
+        "onPriority": false,
+        "channelSettings": {
+          "3": {
+            "assignOn": true,
+            "assignOff": true,
+            "assignDimming": false,
+            "assignChannelDimming": false,
+            "onPriority": false,
+            "offPriority": true,
+            "onFade": 0,
+            "offFade": 0
+          }
+        }
+      }
+    }
+  ],
+  "sceneGroups": [
+    {
+      "id": 1,
+      "name": "Downstairs",
+      "shortName": "Down",
+      "parentId": null,
+      "icon": "/flexidim/rooms/0.png",
+      "displayRank": 0,
+      "legacyKey": 401,
+      "legacy": {
+        "es": 0,
+        "re1": 0,
+        "ns": 0,
+        "sf": 0,
+        "nt": 0,
+        "nd": 0,
+        "cc": 0,
+        "lk": 0,
+        "fl": 0,
+        "dr": 0,
+        "gr": true,
+        "pr": 0,
+        "p1": 0,
+        "rm": 0,
+        "ps": 0,
+        "ky": 401,
+        "nsm": -1,
+        "p2": 0,
+        "ty": 0,
+        "nm": "Downstairs",
+        "sn": "Down"
+      }
+    },
+    {
+      "id": 2,
+      "name": "Evening",
+      "shortName": "Eve",
+      "parentId": 1,
+      "icon": "/flexidim/rooms/3.png",
+      "displayRank": 1,
+      "legacyKey": 402,
+      "legacy": {
+        "es": 0,
+        "re1": 0,
+        "ns": 0,
+        "sf": 0,
+        "nt": 0,
+        "nd": 0,
+        "cc": 0,
+        "lk": 0,
+        "fl": 0,
+        "dr": 1,
+        "gr": true,
+        "pr": 401,
+        "p1": 0,
+        "rm": 3,
+        "ps": 0,
+        "ky": 402,
+        "nsm": -1,
+        "p2": 0,
+        "ty": 0,
+        "nm": "Evening",
+        "sn": "Eve"
+      }
+    }
+  ],
+  "scenes": [
+    {
+      "id": 1,
+      "name": "Relax",
+      "shortName": "Relax",
+      "group": "Evening",
+      "groupId": 2,
+      "folderPath": [
+        "Downstairs",
+        "Evening"
+      ],
+      "levels": {
+        "1": 40,
+        "2": 25
+      },
+      "channelSettings": {
+        "1": {
+          "brightness": 40,
+          "fadeTime": 2,
+          "relativePercent": false,
+          "use100PercentTime": false,
+          "delay": 0,
+          "flags": 0
+        },
+        "2": {
+          "brightness": 25,
+          "fadeTime": 4,
+          "relativePercent": true,
+          "use100PercentTime": false,
+          "delay": 1.5,
+          "flags": 128
+        }
+      },
+      "channelOrder": [
+        1,
+        2
+      ],
+      "fade": 0,
+      "enabled": true,
+      "days": [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun"
+      ],
+      "time": "",
+      "autoStart": false,
+      "nextSceneId": 2,
+      "nextSceneMode": 1,
+      "nextSceneTime": 120,
+      "nextSceneDay": 0,
+      "runExtenderFirst": false,
+      "beginNewSequence": false,
+      "period1": 0,
+      "period2": 0,
+      "stateFlag": 0,
+      "flags": 0,
+      "legacyKey": 403,
+      "displayRank": 4,
+      "locked": false,
+      "sceneType": 0,
+      "legacy": {
+        "es": 0,
+        "re1": 0,
+        "ns": 404,
+        "sf": 0,
+        "nt": 120,
+        "nd": 0,
+        "cc": 2,
+        "lk": 0,
+        "fl": 0,
+        "dr": 4,
+        "gr": false,
+        "pr": 402,
+        "p1": 0,
+        "rm": 0,
+        "ps": 0,
+        "nsm": 1,
+        "p2": 0,
+        "ty": 0,
+        "ky": 403,
+        "nm": "Relax",
+        "sn": "Relax",
+        "ch0": {
+          "$class": "JCLFDChannel",
+          "ky": 201,
+          "t2": 0,
+          "de": 0,
+          "br": 40,
+          "fl": 0,
+          "ch": false,
+          "t1": 4
+        },
+        "ch1": {
+          "$class": "JCLFDChannel",
+          "ky": 202,
+          "t2": 0,
+          "de": 3,
+          "br": 25,
+          "fl": 128,
+          "ch": false,
+          "t1": 8
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Bright",
+      "shortName": "Bright",
+      "group": "Downstairs",
+      "groupId": 1,
+      "folderPath": [
+        "Downstairs"
+      ],
+      "levels": {
+        "1": 100,
+        "3": 100
+      },
+      "channelSettings": {
+        "1": {
+          "brightness": 100,
+          "fadeTime": 0.5,
+          "relativePercent": false,
+          "use100PercentTime": true,
+          "delay": 0,
+          "flags": 16
+        },
+        "3": {
+          "brightness": 100,
+          "fadeTime": 0.5,
+          "relativePercent": false,
+          "use100PercentTime": false,
+          "delay": 0,
+          "flags": 0
+        }
+      },
+      "channelOrder": [
+        1,
+        3
+      ],
+      "fade": 0,
+      "enabled": true,
+      "days": [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun"
+      ],
+      "time": "",
+      "autoStart": true,
+      "nextSceneMode": -1,
+      "nextSceneTime": 0,
+      "nextSceneDay": 0,
+      "previousSceneId": 1,
+      "runExtenderFirst": false,
+      "beginNewSequence": true,
+      "period1": 1,
+      "period2": 0,
+      "stateFlag": 2,
+      "flags": 160,
+      "legacyKey": 404,
+      "displayRank": 1,
+      "locked": true,
+      "sceneType": 0,
+      "legacy": {
+        "es": 0,
+        "re1": 0,
+        "ns": 0,
+        "sf": 2,
+        "nt": 0,
+        "nd": 0,
+        "cc": 2,
+        "lk": 1,
+        "fl": 160,
+        "dr": 1,
+        "gr": false,
+        "pr": 401,
+        "p1": 1,
+        "rm": 0,
+        "ps": 403,
+        "nsm": -1,
+        "p2": 0,
+        "ty": 0,
+        "ky": 404,
+        "nm": "Bright",
+        "sn": "Bright",
+        "ch0": {
+          "$class": "JCLFDChannel",
+          "ky": 201,
+          "t2": 0,
+          "de": 0,
+          "br": 100,
+          "fl": 16,
+          "ch": false,
+          "t1": 1
+        },
+        "ch1": {
+          "$class": "JCLFDChannel",
+          "ky": 203,
+          "t2": 0,
+          "de": 0,
+          "br": 100,
+          "fl": 0,
+          "ch": false,
+          "t1": 1
+        }
+      }
+    }
+  ],
+  "deletedScenes": [],
+  "periods": [
+    {
+      "id": 1,
+      "name": "Evenings",
+      "start": "17:30",
+      "end": "23:00",
+      "days": [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun"
+      ],
+      "enabled": true,
+      "startMode": 0,
+      "endMode": 0,
+      "legacyIndex": 0,
+      "legacy": {
+        "nm": "Evenings",
+        "et": 1380,
+        "sm": 0,
+        "em": 0,
+        "st": 1050,
+        "ix": 0
+      }
+    },
+    {
+      "id": 2,
+      "name": "",
+      "start": "06:00",
+      "end": "08:30",
+      "days": [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun"
+      ],
+      "enabled": true,
+      "startMode": 1,
+      "endMode": 2,
+      "legacyIndex": 1,
+      "legacy": {
+        "nm": "",
+        "et": 510,
+        "sm": 1,
+        "em": 2,
+        "st": 360,
+        "ix": 1
+      }
+    },
+    {
+      "id": 3,
+      "name": "",
+      "start": "00:00",
+      "end": "00:00",
+      "days": [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun"
+      ],
+      "enabled": true,
+      "startMode": 0,
+      "endMode": 0,
+      "legacyIndex": 2,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 2
+      }
+    },
+    {
+      "id": 4,
+      "name": "",
+      "start": "00:00",
+      "end": "00:00",
+      "days": [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun"
+      ],
+      "enabled": true,
+      "startMode": 0,
+      "endMode": 0,
+      "legacyIndex": 3,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 3
+      }
+    },
+    {
+      "id": 5,
+      "name": "",
+      "start": "00:00",
+      "end": "00:00",
+      "days": [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun"
+      ],
+      "enabled": true,
+      "startMode": 0,
+      "endMode": 0,
+      "legacyIndex": 4,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 4
+      }
+    },
+    {
+      "id": 6,
+      "name": "",
+      "start": "00:00",
+      "end": "00:00",
+      "days": [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun"
+      ],
+      "enabled": true,
+      "startMode": 0,
+      "endMode": 0,
+      "legacyIndex": 5,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 5
+      }
+    },
+    {
+      "id": 7,
+      "name": "",
+      "start": "00:00",
+      "end": "00:00",
+      "days": [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun"
+      ],
+      "enabled": true,
+      "startMode": 0,
+      "endMode": 0,
+      "legacyIndex": 6,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 6
+      }
+    },
+    {
+      "id": 8,
+      "name": "",
+      "start": "00:00",
+      "end": "00:00",
+      "days": [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun"
+      ],
+      "enabled": true,
+      "startMode": 0,
+      "endMode": 0,
+      "legacyIndex": 7,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 7
+      }
+    },
+    {
+      "id": 9,
+      "name": "",
+      "start": "00:00",
+      "end": "00:00",
+      "days": [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun"
+      ],
+      "enabled": true,
+      "startMode": 0,
+      "endMode": 0,
+      "legacyIndex": 8,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 8
+      }
+    },
+    {
+      "id": 10,
+      "name": "",
+      "start": "00:00",
+      "end": "00:00",
+      "days": [
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun"
+      ],
+      "enabled": true,
+      "startMode": 0,
+      "endMode": 0,
+      "legacyIndex": 9,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 9
+      }
+    }
+  ],
+  "stateFlags": [
+    {
+      "id": 1,
+      "name": "Guests present",
+      "legacyIndex": 10,
+      "legacy": {
+        "nm": "Guests present",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 10
+      }
+    },
+    {
+      "id": 2,
+      "name": "",
+      "legacyIndex": 11,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 11
+      }
+    },
+    {
+      "id": 3,
+      "name": "",
+      "legacyIndex": 12,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 12
+      }
+    },
+    {
+      "id": 4,
+      "name": "",
+      "legacyIndex": 13,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 13
+      }
+    },
+    {
+      "id": 5,
+      "name": "",
+      "legacyIndex": 14,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 14
+      }
+    },
+    {
+      "id": 6,
+      "name": "",
+      "legacyIndex": 15,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 15
+      }
+    },
+    {
+      "id": 7,
+      "name": "",
+      "legacyIndex": 16,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 16
+      }
+    },
+    {
+      "id": 8,
+      "name": "",
+      "legacyIndex": 17,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 17
+      }
+    },
+    {
+      "id": 9,
+      "name": "",
+      "legacyIndex": 18,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 18
+      }
+    },
+    {
+      "id": 10,
+      "name": "",
+      "legacyIndex": 19,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 19
+      }
+    },
+    {
+      "id": 11,
+      "name": "",
+      "legacyIndex": 20,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 20
+      }
+    },
+    {
+      "id": 12,
+      "name": "",
+      "legacyIndex": 21,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 21
+      }
+    },
+    {
+      "id": 13,
+      "name": "",
+      "legacyIndex": 22,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 22
+      }
+    },
+    {
+      "id": 14,
+      "name": "",
+      "legacyIndex": 23,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 23
+      }
+    },
+    {
+      "id": 15,
+      "name": "",
+      "legacyIndex": 24,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 24
+      }
+    },
+    {
+      "id": 16,
+      "name": "",
+      "legacyIndex": 25,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 25
+      }
+    },
+    {
+      "id": 17,
+      "name": "",
+      "legacyIndex": 26,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 26
+      }
+    },
+    {
+      "id": 18,
+      "name": "",
+      "legacyIndex": 27,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 27
+      }
+    },
+    {
+      "id": 19,
+      "name": "",
+      "legacyIndex": 28,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 28
+      }
+    },
+    {
+      "id": 20,
+      "name": "",
+      "legacyIndex": 29,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 29
+      }
+    },
+    {
+      "id": 21,
+      "name": "",
+      "legacyIndex": 30,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 30
+      }
+    },
+    {
+      "id": 22,
+      "name": "",
+      "legacyIndex": 31,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 31
+      }
+    },
+    {
+      "id": 23,
+      "name": "",
+      "legacyIndex": 32,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 32
+      }
+    },
+    {
+      "id": 24,
+      "name": "",
+      "legacyIndex": 33,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 33
+      }
+    },
+    {
+      "id": 25,
+      "name": "",
+      "legacyIndex": 34,
+      "legacy": {
+        "nm": "",
+        "et": 0,
+        "sm": 0,
+        "em": 0,
+        "st": 0,
+        "ix": 34
+      }
+    }
+  ],
+  "users": [
+    {
+      "id": 1,
+      "name": "Owner",
+      "remote": false,
+      "changes": true,
+      "key": "OWNERKEY01234567",
+      "securityCode": "OWNERKEY01234567",
+      "legacyKey": 501,
+      "roomIds": [],
+      "switchIds": [],
+      "roomAccess": [
+        "Lounge",
+        "Kitchen"
+      ],
+      "accessCount": 2,
+      "profileVersion": 3,
+      "profileStatus": "imported",
+      "legacy": {
+        "ky": 501,
+        "nm": "Owner",
+        "sk": "OWNERKEY01234567",
+        "rc": 2,
+        "ve": 3,
+        "rm0": "Lounge",
+        "rm1": "Kitchen"
+      }
+    }
+  ],
+  "assignments": [
+    {
+      "switchId": 1,
+      "button": 1,
+      "sceneId": 1
+    },
+    {
+      "switchId": 1,
+      "button": 2,
+      "sceneId": 2
+    },
+    {
+      "switchId": 2,
+      "button": 1,
+      "sceneId": 2
+    }
+  ],
+  "modules": [
+    {
+      "id": 7000,
+      "name": "Module 7000",
+      "bus": "A",
+      "enabled": true,
+      "pending": false,
+      "position": 0
+    },
+    {
+      "id": 7010,
+      "name": "Module 7010",
+      "bus": "A",
+      "enabled": true,
+      "pending": false,
+      "position": 1
+    },
+    {
+      "id": 8000,
+      "name": "Module 8000",
+      "bus": "B",
+      "enabled": true,
+      "pending": false,
+      "position": 2
+    }
+  ],
+  "deletedItems": []
+}

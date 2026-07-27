@@ -1,5 +1,7 @@
-import { parse } from "@plist/binary.parse";
+import { parseBinaryPlist } from "./binary-plist.ts";
+import { channelTypeName } from "./channel-catalogue.ts";
 import { controllerChannelAddress } from "./flexidim-addressing.mjs";
+import { foundationDictionaryOrder } from "./foundation-dictionary-order.ts";
 
 export type Room = {
   id: number;
@@ -36,7 +38,15 @@ export type Channel = {
   shortName?: string;
   displayRank?: number;
   hardwareType?: number;
+  /**
+   * Which recovered channel-type family this channel's `hardwareType` should be
+   * read against. Web-native only: the iOS archive does not store it, and the
+   * selector the app uses was not recovered, so it is a display hint.
+   */
+  typeFamily?: string;
   channelIndex?: number;
+  /** Final tie-break inherited from the iOS hardware NSDictionary. */
+  profileOrder?: number;
   dimmable?: boolean;
   hardwareChanged?: boolean;
   legacyKey?: number;
@@ -98,6 +108,8 @@ export type SceneGroup = {
   parentId: number | null;
   icon: string;
   displayRank: number;
+  legacyKey?: number;
+  legacy?: Record<string, unknown>;
 };
 export type SceneChannelSettings = {
   brightness: number;
@@ -118,6 +130,15 @@ export type Scene = {
   folderPath?: string[];
   levels: Record<number, number>;
   channelSettings?: Record<number, SceneChannelSettings>;
+  /**
+   * Channel ids in the order the archive listed them (`ch0`, `ch1`, ...).
+   *
+   * `levels` cannot carry this: its keys are numeric, and JavaScript always
+   * iterates integer-like keys in ascending order, so reading the order back off
+   * it silently gives channel-id order instead. The Scene Controller image is
+   * built in the archive's order, so it has to be kept separately.
+   */
+  channelOrder?: number[];
   fade: number;
   enabled: boolean;
   days: string[];
@@ -157,6 +178,12 @@ export type Period = {
   legacyIndex?: number;
   legacy?: Record<string, unknown>;
 };
+export type StateFlag = {
+  id: number;
+  name: string;
+  legacyIndex?: number;
+  legacy?: Record<string, unknown>;
+};
 export type FlexUser = {
   id: number;
   name: string;
@@ -167,9 +194,10 @@ export type FlexUser = {
   securityCode?: string;
   roomIds?: number[];
   switchIds?: number[];
-  // Raw room/switch access entries (archive keys rm0..rmN). Their internal
-  // encoding is not yet decoded, so they are preserved verbatim rather than
-  // resolved to room IDs. accessCount mirrors the archive `rc` field.
+  // Raw room/switch access entries (archive keys rm0..rmN). Each is a
+  // pipe-delimited legacy-key path: the owning room followed by one or more
+  // switches. Keep the raw form for byte-faithful export; roomIds/switchIds are
+  // the editable resolved projection.
   roomAccess?: string[];
   accessCount?: number;
   profileData?: string;
@@ -212,6 +240,7 @@ export type Site = {
   autoDetect?: boolean;
   addressLines?: string[];
   siteType?: number;
+  modulesChanged?: boolean;
   routerInbound?: boolean;
   wirelessGateways?: { address: string; count: number }[];
   moduleOrderA?: number[];
@@ -267,6 +296,16 @@ export function controllerConnectionRequest(
   };
 }
 
+/**
+ * The iOS app derives the controller site type from the fifth character of
+ * the site ID rather than a stored archive field. Type 0 is the verified
+ * local plaintext protocol; types 1 and 2 are remote/encrypted generations.
+ */
+export function siteTypeFromSiteId(id: string): number {
+  const character = (id ?? "").trim().charAt(4);
+  return character >= "0" && character <= "2" ? Number(character) : 0;
+}
+
 function isIanaTimeZone(value: string) {
   try {
     new Intl.DateTimeFormat("en-GB", { timeZone: value }).format(0);
@@ -290,6 +329,38 @@ export function normalizeSiteTimeZone(
 }
 
 /** Serialize imported configuration data, including BigInts from binary plists. */
+/**
+ * Order-insensitive serialisation, for COMPARISON and checksums only.
+ *
+ * `stringifyConfiguration` preserves insertion order because it also writes the
+ * `.fd4web.json` backup, where a stable readable shape matters. That makes it
+ * unsafe for equality: an import → export → import round trip reorders keys
+ * inside the preserved `legacy` bags, so two structurally identical
+ * configurations serialise differently. Using it for a change-detection
+ * checksum meant the checksum could change when nothing had changed.
+ *
+ * Keys are sorted recursively; array order is preserved, because array order is
+ * meaningful here (module order, compiled assignment order).
+ */
+export function canonicalJson(value: unknown): string {
+  const canonical = (item: unknown): unknown => {
+    if (typeof item === "bigint") {
+      const numeric = Number(item);
+      return Number.isSafeInteger(numeric) ? numeric : item.toString();
+    }
+    if (Array.isArray(item)) return item.map(canonical);
+    if (item && typeof item === "object") {
+      const source = item as Record<string, unknown>;
+      const sorted: Record<string, unknown> = {};
+      for (const key of Object.keys(source).sort())
+        sorted[key] = canonical(source[key]);
+      return sorted;
+    }
+    return item;
+  };
+  return JSON.stringify(canonical(value));
+}
+
 export function stringifyConfiguration(value: unknown, space?: number) {
   return JSON.stringify(
     value,
@@ -338,34 +409,60 @@ export function mergeImportedSite(
 }
 
 /** Compare only portable site fields; ignore timestamps, raw archive and local bridge settings. */
+/**
+ * The site fields an import compares, with the label shown to an installer.
+ *
+ * `ip` and `port` are deliberately ABSENT. They are the live connection
+ * endpoint, owned by discovery: `autoDetect` rewrites them after every connect,
+ * so a working site's address legitimately diverges from the address its archive
+ * was saved with. Including them made a site permanently unequal to its own
+ * backup, prompting on every re-import over a difference the user cannot act on
+ * — `mergeImportedSite` preserves the running endpoint either way.
+ */
+const COMPARED_SITE_FIELDS: {
+  key: keyof Site;
+  label: string;
+  read: (site: Site) => unknown;
+}[] = [
+  { key: "name", label: "Site name", read: (s) => s.name },
+  { key: "id", label: "Site ID", read: (s) => s.id },
+  { key: "routerPort", label: "Router port", read: (s) => s.routerPort ?? null },
+  { key: "description", label: "Description", read: (s) => s.description },
+  { key: "address", label: "Address", read: (s) => s.address },
+  { key: "contact", label: "Contact", read: (s) => s.contact ?? "" },
+  { key: "email", label: "Email", read: (s) => s.email ?? "" },
+  { key: "phone", label: "Phone", read: (s) => s.phone ?? "" },
+  { key: "latitude", label: "Latitude", read: (s) => s.latitude ?? "" },
+  { key: "longitude", label: "Longitude", read: (s) => s.longitude ?? "" },
+  { key: "timezone", label: "Time zone", read: (s) => s.timezone },
+  { key: "dst", label: "Daylight saving rule", read: (s) => s.dst },
+  { key: "remote", label: "Remote access", read: (s) => s.remote },
+  { key: "remoteServer", label: "Remote server", read: (s) => s.remoteServer ?? "" },
+  // Compared but never named in a prompt — see siteImportDifferences.
+  { key: "securityCode", label: "Controller security code", read: (s) => s.securityCode ?? "" },
+  { key: "autoDetect", label: "Auto-detect controller", read: (s) => s.autoDetect ?? true },
+  { key: "addressLines", label: "Address lines", read: (s) => s.addressLines ?? [] },
+  { key: "siteType", label: "Controller site type", read: (s) => s.siteType ?? 0 },
+  { key: "routerInbound", label: "Router inbound", read: (s) => s.routerInbound ?? false },
+  { key: "wirelessGateways", label: "Wireless gateways", read: (s) => s.wirelessGateways ?? [] },
+  { key: "moduleOrderA", label: "Bus A module order", read: (s) => s.moduleOrderA ?? [] },
+  { key: "moduleOrderB", label: "Bus B module order", read: (s) => s.moduleOrderB ?? [] },
+];
+
+/**
+ * The labels of the site fields that differ between a saved site and an import.
+ *
+ * The security code is compared but reported only as the fact that it differs —
+ * its value must never reach a dialog or a log.
+ */
+export function siteImportDifferences(left: Site, right: Site): string[] {
+  return COMPARED_SITE_FIELDS.filter(
+    (field) => canonicalJson(field.read(left)) !== canonicalJson(field.read(right)),
+  ).map((field) => field.label);
+}
+
 export function siteImportDetailsEqual(left: Site, right: Site) {
-  const comparable = (site: Site) => ({
-    name: site.name,
-    id: site.id,
-    ip: site.ip,
-    port: site.port,
-    routerPort: site.routerPort ?? null,
-    description: site.description,
-    address: site.address,
-    contact: site.contact ?? "",
-    email: site.email ?? "",
-    phone: site.phone ?? "",
-    latitude: site.latitude ?? "",
-    longitude: site.longitude ?? "",
-    timezone: site.timezone,
-    dst: site.dst,
-    remote: site.remote,
-    remoteServer: site.remoteServer ?? "",
-    securityCode: site.securityCode ?? "",
-    autoDetect: site.autoDetect ?? true,
-    addressLines: site.addressLines ?? [],
-    siteType: site.siteType ?? 0,
-    routerInbound: site.routerInbound ?? false,
-    wirelessGateways: site.wirelessGateways ?? [],
-    moduleOrderA: site.moduleOrderA ?? [],
-    moduleOrderB: site.moduleOrderB ?? [],
-  });
-  return stringifyConfiguration(comparable(left)) === stringifyConfiguration(comparable(right));
+  return siteImportDifferences(left, right).length === 0;
 }
 // The editable logical model that belongs to one configuration. A site can
 // hold several configurations; the active one's content lives at the top level
@@ -378,6 +475,7 @@ export type ConfigContent = {
   scenes: Scene[];
   deletedScenes: Scene[];
   periods: Period[];
+  stateFlags: StateFlag[];
   users: FlexUser[];
   assignments: Assignment[];
   modules: FlexModule[];
@@ -632,6 +730,12 @@ export type Configuration = {
   siteId: string;
   name: string;
   description: string;
+  /**
+   * The configuration's own eight-character controller identifier. This is a
+   * separate archive field from the owning site's `site.id`; the original app
+   * uses it while compiling user/profile transfer data.
+   */
+  controllerCode?: string;
   lastUpdated: string;
   content?: ConfigContent;
   legacy?: Record<string, unknown>;
@@ -640,6 +744,165 @@ export type Configuration = {
 export type OwnedConfiguration = Omit<Configuration, "siteId" | "content"> & {
   content: ConfigContent;
 };
+
+/**
+ * Recover the configuration identifier from the exact retained positional
+ * archive slot for workspaces saved by builds that preserved the archive but
+ * did not yet model `controllerCode`.
+ *
+ * This is a data migration, not a guess from the site ID. It is deliberately
+ * limited to the active configuration because the retained site archive
+ * describes that imported configuration only.
+ */
+export function migrateWorkspaceControllerCode(
+  workspace: FlexiDimWorkspace,
+): FlexiDimWorkspace {
+  const siteIndex = workspace.sites.findIndex(
+    (site) => site.id === workspace.activeSiteId,
+  );
+  if (siteIndex < 0) return workspace;
+  const site = workspace.sites[siteIndex];
+  const configurationIndex = site.configurations.findIndex(
+    (configuration) => configuration.id === workspace.activeConfigId,
+  );
+  if (configurationIndex < 0) return workspace;
+  const configuration = site.configurations[configurationIndex];
+  if (/^[A-Za-z0-9]{8}$/.test(configuration.controllerCode ?? ""))
+    return workspace;
+
+  const top = site.legacy?.top;
+  const hardwareOrder = site.legacy?.hardwareOrder;
+  if (
+    !top ||
+    typeof top !== "object" ||
+    !Array.isArray(hardwareOrder)
+  )
+    return workspace;
+  const extraBase =
+    30 +
+    (site.moduleOrderA?.length ?? 0) +
+    (site.moduleOrderB?.length ?? 0) +
+    hardwareOrder.length;
+  const retained = (top as Record<string, unknown>)[`$${extraBase + 2}`];
+  if (typeof retained !== "string" || !/^[A-Za-z0-9]{8}$/.test(retained))
+    return workspace;
+
+  const configurations = [...site.configurations];
+  configurations[configurationIndex] = {
+    ...configuration,
+    controllerCode: retained,
+  };
+  const sites = [...workspace.sites];
+  sites[siteIndex] = { ...site, configurations };
+  return { ...workspace, sites };
+}
+
+/**
+ * Older persisted workspaces retained each imported user's raw `rmN` access
+ * paths but saved empty resolved room/switch selections. Restore that derived
+ * projection only for untouched imported profiles. Pending/current profiles
+ * may have been deliberately edited and must never be overwritten.
+ */
+export function migrateWorkspaceImportedUserAccess(
+  workspace: FlexiDimWorkspace,
+): FlexiDimWorkspace {
+  let changed = false;
+  const sites = workspace.sites.map((site) => {
+    const configurations = site.configurations.map((configuration) => {
+      const content = configuration.content;
+      const roomIdByLegacyKey = new Map(
+        content.rooms.flatMap((room) =>
+          room.legacyKey === undefined ? [] : [[room.legacyKey, room.id] as const]),
+      );
+      const switchIdByLegacyKey = new Map(
+        content.switches.flatMap((wallSwitch) =>
+          wallSwitch.legacyKey === undefined
+            ? []
+            : [[wallSwitch.legacyKey, wallSwitch.id] as const]),
+      );
+      const users = content.users.map((user) => {
+        if (
+          user.profileStatus !== "imported" ||
+          !user.roomAccess?.length ||
+          (user.roomIds?.length ?? 0) > 0 ||
+          (user.switchIds?.length ?? 0) > 0
+        )
+          return user;
+        const roomIds = user.roomAccess.flatMap((entry) => {
+          const id = roomIdByLegacyKey.get(Number(entry.split("|")[0]));
+          return id === undefined ? [] : [id];
+        }).filter((id, index, values) => values.indexOf(id) === index);
+        const switchIds = user.roomAccess.flatMap((entry) =>
+          entry.split("|").slice(1).flatMap((value) => {
+            const id = switchIdByLegacyKey.get(Number(value));
+            return id === undefined ? [] : [id];
+          }),
+        ).filter((id, index, values) => values.indexOf(id) === index);
+        if (!roomIds.length && !switchIds.length) return user;
+        changed = true;
+        return { ...user, roomIds, switchIds };
+      });
+      return users === content.users || users.every((user, index) => user === content.users[index])
+        ? configuration
+        : { ...configuration, content: { ...content, users } };
+    });
+    return configurations.every(
+      (configuration, index) => configuration === site.configurations[index],
+    )
+      ? site
+      : { ...site, configurations };
+  });
+  return changed ? { ...workspace, sites } : workspace;
+}
+
+/**
+ * Restore the CoreFoundation dictionary enumeration rank that older workspaces
+ * did not persist on imported channels. The retained hardware order is the
+ * original archive order used by the exporter; existing ranks are authoritative
+ * and are never replaced.
+ */
+export function migrateWorkspaceChannelProfileOrder(
+  workspace: FlexiDimWorkspace,
+): FlexiDimWorkspace {
+  let changed = false;
+  const sites = workspace.sites.map((site) => {
+    const hardwareOrder = site.legacy?.hardwareOrder;
+    if (!Array.isArray(hardwareOrder)) return site;
+    const insertionKeys = [-4, ...hardwareOrder.map(Number)];
+    const rankByLegacyKey = new Map(
+      foundationDictionaryOrder(insertionKeys).flatMap(
+        (insertionIndex, profileIndex) =>
+          insertionIndex === 0
+            ? []
+            : [[insertionKeys[insertionIndex], profileIndex] as const],
+      ),
+    );
+    const configurations = site.configurations.map((configuration) => {
+      const channels = configuration.content.channels.map((channel) => {
+        if (channel.profileOrder !== undefined || channel.legacyKey === undefined)
+          return channel;
+        const profileOrder = rankByLegacyKey.get(channel.legacyKey);
+        if (profileOrder === undefined) return channel;
+        changed = true;
+        return { ...channel, profileOrder };
+      });
+      return channels.every(
+        (channel, index) => channel === configuration.content.channels[index],
+      )
+        ? configuration
+        : {
+            ...configuration,
+            content: { ...configuration.content, channels },
+          };
+    });
+    return configurations.every(
+      (configuration, index) => configuration === site.configurations[index],
+    )
+      ? site
+      : { ...site, configurations };
+  });
+  return changed ? { ...workspace, sites } : workspace;
+}
 
 /** Canonical persisted owner: configuration content is nested beneath its site. */
 export type OwnedSite = Site & {
@@ -660,6 +923,7 @@ export const CONFIG_CONTENT_KEYS = [
   "scenes",
   "deletedScenes",
   "periods",
+  "stateFlags",
   "users",
   "assignments",
   "modules",
@@ -678,6 +942,7 @@ export type AppData = {
   scenes: Scene[];
   deletedScenes?: Scene[];
   periods: Period[];
+  stateFlags?: StateFlag[];
   users: FlexUser[];
   assignments: Assignment[];
   modules?: FlexModule[];
@@ -693,6 +958,7 @@ export function emptyConfigContent(): ConfigContent {
     scenes: [],
     deletedScenes: [],
     periods: [],
+    stateFlags: [],
     users: [],
     assignments: [],
     modules: [],
@@ -701,9 +967,57 @@ export function emptyConfigContent(): ConfigContent {
 }
 
 export function snapshotConfigContent(source: AppData): ConfigContent {
-  return Object.fromEntries(
+  const content = Object.fromEntries(
     CONFIG_CONTENT_KEYS.map((key) => [key, source[key] ?? []]),
   ) as unknown as ConfigContent;
+  const tables = normalizePeriodTables(content.periods, content.stateFlags);
+  return { ...content, ...tables };
+}
+
+const PERIOD_ROW_COUNT = 10;
+const STATE_FLAG_COUNT = 25;
+
+/**
+ * The iOS model stores one 35-object JCLFDPeriod array, but its screen and
+ * compiler give those objects two distinct jobs: ten period rows followed by
+ * twenty-five state-flag labels. Older web workspaces exposed all 35 as periods,
+ * so this also performs the persisted-data migration.
+ */
+export function normalizePeriodTables(
+  rawPeriods: Period[] = [],
+  rawStateFlags: StateFlag[] = [],
+): { periods: Period[]; stateFlags: StateFlag[] } {
+  const periodRows = rawPeriods.slice(0, PERIOD_ROW_COUNT);
+  const legacyFlagRows =
+    rawStateFlags.length > 0
+      ? rawStateFlags
+      : rawPeriods.slice(PERIOD_ROW_COUNT, PERIOD_ROW_COUNT + STATE_FLAG_COUNT);
+  const periods = Array.from({ length: PERIOD_ROW_COUNT }, (_, index) => {
+    const existing = periodRows[index];
+    return existing
+      ? { ...existing, id: index + 1 }
+      : {
+          id: index + 1,
+          name: "",
+          start: "00:00",
+          end: "00:00",
+          days: allDays,
+          enabled: true,
+          startMode: 0,
+          endMode: 0,
+          legacyIndex: index,
+        };
+  });
+  const stateFlags = Array.from({ length: STATE_FLAG_COUNT }, (_, index) => {
+    const existing = legacyFlagRows[index];
+    return {
+      id: index + 1,
+      name: existing?.name ?? "",
+      legacyIndex: existing?.legacyIndex ?? PERIOD_ROW_COUNT + index,
+      ...(existing?.legacy ? { legacy: existing.legacy } : {}),
+    };
+  });
+  return { periods, stateFlags };
 }
 
 /** Build the versioned web-native representation of an editable user profile. */
@@ -774,7 +1088,10 @@ export function isFlexiDimWorkspace(value: unknown): value is FlexiDimWorkspace 
             configuration.content &&
             typeof configuration.content === "object" &&
             CONFIG_CONTENT_KEYS.every((key) =>
-              Array.isArray(configuration.content[key]),
+              key === "stateFlags"
+                ? configuration.content[key] == null ||
+                  Array.isArray(configuration.content[key])
+                : Array.isArray(configuration.content[key]),
             ),
         ),
     );
@@ -889,7 +1206,13 @@ export function canonicalizeAppData(data: AppData): FlexiDimWorkspace {
           content:
             site.id === data.site.id && configuration.id === activeConfigId
               ? activeContent
-              : (configuration.content ?? emptyConfigContent()),
+              : {
+                  ...(configuration.content ?? emptyConfigContent()),
+                  ...normalizePeriodTables(
+                    configuration.content?.periods,
+                    configuration.content?.stateFlags,
+                  ),
+                },
         } as OwnedConfiguration;
       });
     return { ...site, configurations: ownedConfigurations };
@@ -932,12 +1255,19 @@ export function materializeAppData(workspace: FlexiDimWorkspace): AppData {
           : content,
     })),
   );
+  const activeContent = {
+    ...activeConfiguration.content,
+    ...normalizePeriodTables(
+      activeConfiguration.content.periods,
+      activeConfiguration.content.stateFlags,
+    ),
+  };
   return {
     site: sites.find((site) => site.id === activeSite.id)!,
     sites,
     configurations,
     activeConfigId: activeConfiguration.id,
-    ...activeConfiguration.content,
+    ...activeContent,
   };
 }
 
@@ -1065,11 +1395,87 @@ export function convertLegacyArchive(archive: unknown): AppData {
       .map((value) => object(value)!)
       .filter(Boolean);
 
+  // NSDate archives seconds relative to the Apple epoch (2001-01-01T00:00:00Z).
+  const APPLE_EPOCH_MS = Date.UTC(2001, 0, 1);
+  const archivedDateIso = (value: unknown): string | undefined => {
+    const resolved = object(value);
+    if (!resolved || className(value) !== "NSDate") return undefined;
+    const seconds = number(resolved["NS.time"], Number.NaN);
+    if (!Number.isFinite(seconds)) return undefined;
+    return new Date(APPLE_EPOCH_MS + seconds * 1000).toISOString();
+  };
+
+  // Legacy bags must survive JSON persistence and drive the binary exporter,
+  // so archive values are dereferenced to plain data instead of keeping dead
+  // CF$UID indices into a discarded object table.
+  const plainValue = (value: unknown): unknown => {
+    const resolved = dereference(value);
+    if (resolved === null || resolved === undefined) return undefined;
+    if (typeof resolved === "bigint") {
+      const numeric = Number(resolved);
+      return Number.isSafeInteger(numeric) ? numeric : resolved.toString();
+    }
+    if (
+      typeof resolved === "number" ||
+      typeof resolved === "string" ||
+      typeof resolved === "boolean"
+    )
+      return resolved;
+    if (typeof resolved === "object") {
+      const name = className(value);
+      if (name === "NSDate") return { $date: archivedDateIso(value) };
+      if (name === "NSMutableString" || name === "NSString")
+        return string(value);
+      if (name) {
+        const nested: Record<string, unknown> = { $class: name };
+        for (const [key, entry] of Object.entries(
+          resolved as ArchiveObject,
+        )) {
+          if (key === "$class") continue;
+          nested[key] = plainValue(entry);
+        }
+        return nested;
+      }
+    }
+    return undefined;
+  };
+  const plainLegacy = (item: ArchiveObject): Record<string, unknown> => {
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(item)) {
+      if (key === "$class") continue;
+      const resolved = plainValue(value);
+      if (resolved !== undefined) out[key] = resolved;
+    }
+    return out;
+  };
+
   const hardware = instances("JCLFDHardware");
   if (!hardware.length)
     throw new Error("No FlexiDim hardware was found in the archive");
   const hardwareByKey = new Map(
     hardware.map((item) => [number(item.ky), item]),
+  );
+  // importConfigFD4CFG: decodes the positional `$0`, `$1`, … stream, inserts
+  // a synthetic root hardware object under "-4", and then each decoded
+  // JCLFDHardware under a decimal NSString key. Later user-profile generation
+  // inherits the resulting NSMutableDictionary bucket order for exact ties.
+  const decodedHardwareKeys = Object.entries(top)
+    .flatMap(([key, value]) => {
+      const match = /^\$(\d+)$/.exec(key);
+      return match && className(value) === "JCLFDHardware"
+        ? [{ position: Number(match[1]), key: number(object(value)?.ky) }]
+        : [];
+    })
+    .sort((left, right) => left.position - right.position)
+    .map(({ key }) => key);
+  const dictionaryInsertionKeys = [-4, ...decodedHardwareKeys];
+  const hardwareProfileOrder = new Map(
+    foundationDictionaryOrder(dictionaryInsertionKeys).flatMap(
+      (insertionIndex, profileIndex) =>
+        insertionIndex === 0
+          ? []
+          : [[dictionaryInsertionKeys[insertionIndex], profileIndex] as const],
+    ),
   );
   const roomHardware = hardware.filter((item) => number(item.ty) === 0);
   const roomIdByKey = new Map(
@@ -1106,7 +1512,7 @@ export function convertLegacyArchive(archive: unknown): AppData {
       hardwareType: number(item.hw),
       hardwareIndex: number(item.ix),
       legacyKey: number(item.ky),
-      legacy: { ...item },
+      legacy: plainLegacy(item),
     };
   });
   if (!rooms.length)
@@ -1125,15 +1531,27 @@ export function convertLegacyArchive(archive: unknown): AppData {
   // array and sendDiM: addresses a channel as `index + modulePosition * 8`.
   // Module identifiers happen to be ordered at many sites, but sorting them is
   // not protocol-correct: the archive order is the source of truth.
-  const archivedModuleCount = Math.max(0, topNumber("modc"));
-  const archivedModules = Array.from(
-    { length: archivedModuleCount },
-    (_, moduleIndex) => number(topString(`$${30 + moduleIndex}`), -1),
+  // Modules are stored as two ordered buses, A then B, in slots $30 onward:
+  // bus-A IDs occupy $30..$30+modc-1 and bus-B IDs follow immediately. The
+  // slot order is the controller-address order and must never be re-sorted.
+  const busACount = Math.max(0, topNumber("modc"));
+  const busBCount = Math.max(0, topNumber("modcB"));
+  const moduleIdAtSlot = (slot: number) => number(topString(`$${slot}`), -1);
+  const busAModules = Array.from({ length: busACount }, (_, moduleIndex) =>
+    moduleIdAtSlot(30 + moduleIndex),
   ).filter((moduleNumber) => moduleNumber >= 0);
+  const busBModules = Array.from({ length: busBCount }, (_, moduleIndex) =>
+    moduleIdAtSlot(30 + busACount + moduleIndex),
+  ).filter(
+    (moduleNumber) =>
+      moduleNumber >= 0 && !busAModules.includes(moduleNumber),
+  );
   const encounteredModules = channelHardware
     .map((item) => number(item.md, -1))
     .filter((moduleNumber) => moduleNumber >= 0);
-  const orderedModules = [...new Set([...archivedModules, ...encounteredModules])];
+  const orderedModules = [
+    ...new Set([...busAModules, ...busBModules, ...encounteredModules]),
+  ];
   const channels: Channel[] = channelHardware.map((item, index) => {
     const moduleNumber = number(item.md, -1);
     const channelIndex = number(item.ix);
@@ -1150,11 +1568,16 @@ export function convertLegacyArchive(archive: unknown): AppData {
         moduleNumber >= 0
           ? `Module ${moduleNumber} / Ch${channelIndex}`
           : `Channel ${channelIndex}`,
-      kind: `FlexiDim type ${number(item.hw)}`,
+      // Name the output from the recovered catalogue so an imported channel
+      // reads the way the original app shows it. An unrecognised code keeps its
+      // numeric identity rather than being renamed to something plausible.
+      kind:
+        channelTypeName(number(item.hw)) ?? `FlexiDim type ${number(item.hw)}`,
       level: 0,
       moduleId: moduleNumber >= 0 ? moduleNumber : undefined,
       moduleIndex: channelIndex,
       channelIndex,
+      profileOrder: hardwareProfileOrder.get(number(item.ky)),
       controllerChannel,
       // Archive keys recovered from the iOS binary and validated against a real
       // archive: ac accessory type, mi/mx min/max, mp max-permissible, df
@@ -1169,16 +1592,20 @@ export function convertLegacyArchive(archive: unknown): AppData {
       shortName: string(item.sn) || string(item.nm),
       displayRank: number(item.ra, index),
       hardwareType: number(item.hw),
+      // Taken from the stored `di` flag, not derived from the catalogue: `di` is
+      // what the controller actually holds, and re-deriving it here would make
+      // the exporter write back a value the source archive never contained.
       dimmable: item.di === true || number(item.di) > 0,
       hardwareChanged: item.ch === true || number(item.ch) > 0,
       legacyKey: number(item.ky),
-      legacy: { ...item },
+      legacy: plainLegacy(item),
     };
   });
+  const busBSet = new Set(busBModules);
   const modules: FlexModule[] = orderedModules.map((moduleId, position) => ({
     id: moduleId,
     name: `Module ${moduleId}`,
-    bus: "A",
+    bus: busBSet.has(moduleId) ? "B" : "A",
     enabled: true,
     pending: false,
     position,
@@ -1274,7 +1701,10 @@ export function convertLegacyArchive(archive: unknown): AppData {
       displayRank: number(item.ra, index),
       hardwareType: type,
       legacyKey: number(item.ky),
-      legacy: { hardware: { ...item }, settings: settings ? { ...settings } : undefined },
+      legacy: {
+        hardware: plainLegacy(item),
+        settings: settings ? plainLegacy(settings) : undefined,
+      },
       basic: {
         channelIds,
         assignOn: firstChannel?.assignOn ?? false,
@@ -1321,6 +1751,8 @@ export function convertLegacyArchive(archive: unknown): AppData {
       parentId: sceneGroupIdByKey.get(number(item.pr)) ?? null,
       icon: `/flexidim/rooms/${Math.max(0, number(item.rm))}.png`,
       displayRank: number(item.dr, index),
+      legacyKey: number(item.ky),
+      legacy: plainLegacy(item),
     }))
     .sort((a, b) => a.displayRank - b.displayRank);
   const allLeafScenes = archivedScenes.filter((item) => !isSceneGroup(item));
@@ -1332,8 +1764,15 @@ export function convertLegacyArchive(archive: unknown): AppData {
   const mapScene = (item: ArchiveObject, index: number): Scene => {
     const levels: Record<number, number> = {};
     const channelSettings: Record<number, SceneChannelSettings> = {};
-    for (const [key, value] of Object.entries(item)) {
-      if (!/^ch\d+$/.test(key)) continue;
+    const channelOrder: number[] = [];
+    // The archive's dictionary does not come back in key order — a four-channel
+    // scene arrives as ch2, ch3, ch0, ch1 — so the suffix is the only reliable
+    // sequence, and the Scene Controller image is built in exactly that order.
+    const orderedChannelKeys = Object.keys(item)
+      .filter((key) => /^ch\d+$/.test(key))
+      .sort((a, b) => Number(a.slice(2)) - Number(b.slice(2)));
+    for (const key of orderedChannelKeys) {
+      const value = item[key];
       const archivedChannel = object(value);
       const channelId = archivedChannel
         ? channelIdByKey.get(number(archivedChannel.ky))
@@ -1348,6 +1787,7 @@ export function convertLegacyArchive(archive: unknown): AppData {
             : 100;
         const channelFlags = number(archivedChannel.fl);
         levels[channelId] = brightness;
+        channelOrder.push(channelId);
         channelSettings[channelId] = {
           brightness,
           fadeTime: Math.max(0, number(archivedChannel.t1)) / 2,
@@ -1375,7 +1815,10 @@ export function convertLegacyArchive(archive: unknown): AppData {
       folderPath: folderPath.length ? folderPath : ["Scenes"],
       levels,
       channelSettings,
-      fade: Math.max(0, number(item.dr)),
+      channelOrder,
+      // `dr` is the display rank (recovered from the iOS binary); the scene
+      // has no separate whole-scene fade, its channels carry their own.
+      fade: 0,
       enabled: true,
       days: allDays,
       time: "",
@@ -1396,7 +1839,7 @@ export function convertLegacyArchive(archive: unknown): AppData {
       displayRank: number(item.dr, index),
       locked: number(item.lk) > 0,
       sceneType: number(item.ty),
-      legacy: { ...item },
+      legacy: plainLegacy(item),
     };
   };
   const scenes: Scene[] = leafScenes.map(mapScene);
@@ -1423,35 +1866,50 @@ export function convertLegacyArchive(archive: unknown): AppData {
       if (sceneId) assignments.push({ switchId, button: index + 1, sceneId });
     }
   }
+  // Archive dictionaries carry no guaranteed key order, so keep the list
+  // deterministic for comparisons and exports.
+  assignments.sort(
+    (a, b) => a.switchId - b.switchId || a.button - b.button,
+  );
 
-  const periods: Period[] = instances("JCLFDPeriod").flatMap((item, index) => {
-    const name = string(item.nm).trim();
-    if (!name) return [];
+  // The iOS controller deliberately stores 35 JCLFDPeriod objects in one array,
+  // but the UI splits them into ten actual periods and a 5×5 grid of state-flag
+  // names. The latter are labels only; exposing all 35 as schedule periods was a
+  // web importer bug.
+  const archivedPeriodRows = instances("JCLFDPeriod");
+  const periods: Period[] = archivedPeriodRows.slice(0, 10).map((item, index) => {
     const minutes = (value: unknown) =>
       `${String(Math.floor(number(value) / 60)).padStart(2, "0")}:${String(number(value) % 60).padStart(2, "0")}`;
-    return [
-      {
-        id: index + 1,
-        name,
-        // The archive keys are st/et for time and sm/em for the independent
-        // sunrise/sunset/absolute modes. Older builds accidentally treated
-        // the mode values as clock minutes.
-        start: minutes(item.st),
-        end: minutes(item.et),
-        days: allDays,
-        enabled: true,
-        startMode: number(item.sm),
-        endMode: number(item.em),
-        legacyIndex: number(item.ix, index),
-        legacy: { ...item },
-      },
-    ];
+    return {
+      id: index + 1,
+      name: string(item.nm).trim(),
+      // The archive keys are st/et for time and sm/em for the independent
+      // sunrise/sunset/absolute modes. Older builds accidentally treated
+      // the mode values as clock minutes.
+      start: minutes(item.st),
+      end: minutes(item.et),
+      days: allDays,
+      enabled: true,
+      startMode: number(item.sm),
+      endMode: number(item.em),
+      legacyIndex: number(item.ix, index),
+      legacy: plainLegacy(item),
+    };
   });
+  const stateFlags: StateFlag[] = archivedPeriodRows
+    .slice(10, 35)
+    .map((item, index) => ({
+      id: index + 1,
+      name: string(item.nm).trim(),
+      legacyIndex: number(item.ix, index + 10),
+      legacy: plainLegacy(item),
+    }));
+  const normalizedPeriodTables = normalizePeriodTables(periods, stateFlags);
 
   const users: FlexUser[] = instances("JCLFDUser").map((item, index) => {
     // Archive keys recovered from the iOS binary and validated against a real
     // archive: sk 16-character security key, ve profile version, rc access-entry
-    // count, rm0..rmN the access entries (strings, not room-key references).
+    // count, rm0..rmN pipe-delimited room/switch legacy-key paths.
     const accessCount = number(item.rc);
     const roomAccess = Object.keys(item)
       .filter((key) => /^rm\d+$/.test(key))
@@ -1466,56 +1924,65 @@ export function convertLegacyArchive(archive: unknown): AppData {
       key: string(item.sk),
       securityCode: string(item.sk),
       legacyKey: number(item.ky),
-      // The rm entries are not room-key references, so no room IDs are resolved
-      // until their encoding is decoded; the raw entries are preserved instead.
-      roomIds: [],
-      switchIds: [],
+      roomIds: roomAccess.flatMap((entry) => {
+        const roomKy = Number(entry.split("|")[0]);
+        const room = rooms.find((candidate) => candidate.legacyKey === roomKy);
+        return room ? [room.id] : [];
+      }).filter((id, index, values) => values.indexOf(id) === index),
+      switchIds: roomAccess.flatMap((entry) =>
+        entry.split("|").slice(1).flatMap((value) => {
+          const wallSwitch = switches.find(
+            (candidate) => candidate.legacyKey === Number(value),
+          );
+          return wallSwitch ? [wallSwitch.id] : [];
+        }),
+      ).filter((id, index, values) => values.indexOf(id) === index),
       roomAccess,
       accessCount,
       profileVersion: number(item.ve),
       profileStatus: "imported",
-      legacy: { ...item },
+      legacy: plainLegacy(item),
     };
   });
 
-  // Site fields are stored as positional NSKeyedArchiver entries ($1..$N) in
-  // the app's encode order, recovered from the iOS binary:
-  //   $1 name  $2-$5 address lines  $6 contact  $7 phone  $8 email
-  //   $9 siteID  $10 security code  $11 IP  $12 auto-detect  $14 last updated
+  // Site fields are stored as positional NSKeyedArchiver entries ($0..$N) in
+  // the app's encode order, recovered from the iOS binary's getExportFileData:
+  //   $0 format marker ("29")  $1 name  $2-$5 address lines  $6 contact
+  //   $7 phone  $8 email  $9 siteID  $10 security code  $11 IP
+  //   $12 auto-detect  $13 modules-changed flag  $14 last updated
   //   $15 longitude  $16 latitude  $17 time zone  $18 router-inbound flag
-  //   $19 DST rules  $29 remote server
+  //   $19 router-inbound port  $20 DST rules  $21-$24 wireless-gateway
+  //   addresses  $25-$28 wireless-gateway counts  $29 remote server
   const addressLines = ["$2", "$3", "$4", "$5"].map((key) => topString(key));
   const address = addressLines
     .filter(Boolean)
     .join(", ");
-  const dstRaw = topString("$19");
-  const dstByIndex = ["No daylight saving", "UK / Europe", "USA"];
+  const dstRaw = topString("$20");
   const dst = /uk|europe/i.test(dstRaw)
     ? "UK / Europe"
     : /usa|us\b/i.test(dstRaw)
       ? "USA"
-      : /no daylight|none/i.test(dstRaw)
-        ? "No daylight saving"
-        : dstByIndex[topNumber("$19")] ?? "UK / Europe";
-  const routerRaw = topString("$18");
-  const routerPortValue = /^\d+$/.test(routerRaw)
-    ? Number(routerRaw)
-    : topNumber("$18");
+      : "No daylight saving";
+  const routerInbound = topString("$18") !== "" && topString("$18") !== "0";
+  const routerPortValue = topNumber("$19");
   const remoteServer = topString("$29");
-  const updatedRaw = topString("$14");
+  const updatedRaw = topString("$14") || archivedDateIso(top["$14"]) || "";
   const updatedDate = new Date(updatedRaw);
   const lastUpdated =
     updatedRaw && !Number.isNaN(updatedDate.getTime())
       ? updatedDate.toISOString()
       : "";
+  // The iOS decoder derives the site type from the fifth character of the
+  // site ID rather than a stored field; the reference site selects type 0.
+  const siteId = topString("$9") || "FD4";
+  const siteType = siteTypeFromSiteId(siteId);
   const site: Site = {
     name: topString("$1") || "Imported FlexiDim site",
-    id: topString("$9") || "FD4",
+    id: siteId,
     ip: topString("$11") || "192.168.1.50",
     port: 15273,
-    // Real archives store a boolean-like router setting at $18. Preserve a
-    // plausible legacy port from older fixtures, but never turn 0/1 into a TCP
-    // destination.
+    // $19 is the router-inbound port. Never turn a boolean-like remnant into
+    // a TCP destination.
     routerPort: routerPortValue >= 1024 ? routerPortValue : 15273,
     description: "Imported from FlexiDim Configuration for iOS",
     address,
@@ -1528,32 +1995,58 @@ export function convertLegacyArchive(archive: unknown): AppData {
     dst,
     // A remembered remote server is present even on local type-0 sites. Only
     // non-local site types should select that transport automatically.
-    remote: topNumber("$13") !== 0 && Boolean(remoteServer),
+    remote: siteType !== 0 && Boolean(remoteServer),
     remoteServer,
     securityCode: topString("$10"),
     autoDetect: topString("$12") !== "0" && topNumber("$12") !== 0,
     addressLines,
-    siteType: topNumber("$13"),
-    routerInbound: Boolean(routerPortValue),
+    siteType,
+    // $13 is the modules-changed flag written by the iOS equipment editors.
+    modulesChanged: topString("$13") !== "" && topString("$13") !== "0",
+    routerInbound,
+    // Four wireless-gateway address slots ($21..$24) and their counts
+    // ($25..$28).
     wirelessGateways: [0, 1, 2, 3].flatMap((index) => {
-      const address = topString(`$${20 + index * 2}`);
-      const count = topNumber(`$${21 + index * 2}`);
+      const address = topString(`$${21 + index}`);
+      const count = topNumber(`$${25 + index}`);
       return address ? [{ address, count }] : [];
     }),
-    moduleOrderA: archivedModules,
-    moduleOrderB: [],
+    moduleOrderA: busAModules,
+    moduleOrderB: busBModules,
     updatedAt: lastUpdated,
-    legacy: { top: { ...top } },
+    legacy: {
+      // Dereferenced positional scalars (modeled object slots excluded) plus
+      // the original archive ordering, so the binary exporter can reproduce
+      // the exact iOS encode layout and unknown fields survive round-trips.
+      top: Object.fromEntries(
+        Object.entries(top).flatMap(([key, value]) => {
+          if (className(value).startsWith("JCLFD")) return [];
+          const resolved = plainValue(value);
+          return resolved === undefined ? [] : [[key, resolved]];
+        }),
+      ),
+      hardwareOrder: hardware.map((item) => number(item.ky)),
+      sceneOrder: archivedScenes.map((item) => number(item.ky)),
+    },
   };
+  // The four post-hardware slots carry the configuration's own identity:
+  // name, description, an eight-character code and its update date.
+  const extraBase =
+    30 + busACount + busBCount + Math.max(topNumber("hwc"), hardware.length);
+  const configName = topString(`$${extraBase}`);
+  const configDescription = topString(`$${extraBase + 1}`);
+  const configControllerCode = topString(`$${extraBase + 2}`);
+  const configUpdated = archivedDateIso(top[`$${extraBase + 3}`]) ?? "";
   return {
     site,
     configurations: [
       {
         id: 1,
         siteId: site.id,
-        name: site.name,
-        description: site.description,
-        lastUpdated,
+        name: configName || site.name,
+        description: configDescription || site.description,
+        ...(configControllerCode ? { controllerCode: configControllerCode } : {}),
+        lastUpdated: configUpdated || lastUpdated,
       },
     ],
     activeConfigId: 1,
@@ -1563,7 +2056,8 @@ export function convertLegacyArchive(archive: unknown): AppData {
     sceneGroups,
     scenes,
     deletedScenes,
-    periods,
+    periods: normalizedPeriodTables.periods,
+    stateFlags: normalizedPeriodTables.stateFlags,
     users,
     assignments,
     modules,
@@ -1574,7 +2068,241 @@ export function convertLegacyArchive(archive: unknown): AppData {
 export function parseLegacyFd4Config(buffer: ArrayBuffer): AppData {
   const bytes = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 8));
   const signature = new TextDecoder().decode(bytes);
-  if (!signature.startsWith("bplist"))
-    throw new Error("The .fd4cfg file is not an Apple binary property list");
-  return convertLegacyArchive(parse(buffer));
+  if (signature.startsWith("bplist"))
+    return convertLegacyArchive(parseBinaryPlist(buffer));
+  // `.fd4xlt` translation documents are plain text, not keyed archives.
+  const text = new TextDecoder().decode(new Uint8Array(buffer));
+  if (/^\s*#SWITCHES/m.test(text)) return parseFd4XltDocument(text);
+  throw new Error(
+    "The file is neither a FlexiDim binary configuration nor a translation document",
+  );
+}
+
+/**
+ * Parse a `.fd4xlt` translation document. Recovered from the iOS binary's
+ * importConfigFD4XLT:: a CRLF-line text file with three sections —
+ *   #SWITCHES <number>,<type>,<name>
+ *   #CHANNELS <number>,<dimmable>,<name>
+ *   #SWITCH-SCENES <switch>:<button>,<scene1>,<scene2>
+ * Importing one creates a fresh starting-point configuration (no basic
+ * assignments, periods or users), exactly like the original app.
+ */
+export function parseFd4XltDocument(text: string): AppData {
+  const lines = text.split(/\r?\n/);
+  let section: "switches" | "channels" | "switchScenes" | null = null;
+  type XltSwitch = { number: number; type: number; name: string };
+  type XltChannel = { number: number; dimmable: boolean; name: string };
+  type XltAssignment = { switchNumber: number; button: number; scenes: string[] };
+  const xltSwitches: XltSwitch[] = [];
+  const xltChannels: XltChannel[] = [];
+  const xltAssignments: XltAssignment[] = [];
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith("#SWITCHES")) {
+      section = "switches";
+      continue;
+    }
+    if (line.startsWith("#CHANNELS")) {
+      section = "channels";
+      continue;
+    }
+    if (line.startsWith("#SWITCH-SCENES")) {
+      section = "switchScenes";
+      continue;
+    }
+    if (line.startsWith("#")) continue; // comment row
+    const fields = line.split(/[|,]/).map((field) => field.trim());
+    if (section === "switches" && fields.length >= 3) {
+      const [numberField, typeField, ...nameFields] = fields;
+      xltSwitches.push({
+        number: number(numberField),
+        type: number(typeField),
+        name: nameFields.join(", ") || `Switch ${numberField}`,
+      });
+    } else if (section === "channels" && fields.length >= 3) {
+      const [numberField, dimmableField, ...nameFields] = fields;
+      xltChannels.push({
+        number: number(numberField),
+        dimmable: number(dimmableField) !== 0,
+        name: nameFields.join(", ") || `Channel ${numberField}`,
+      });
+    } else if (section === "switchScenes" && fields.length >= 2) {
+      const [slotField, ...sceneFields] = fields;
+      const slot = /^(\d+):(\d+)$/.exec(slotField);
+      if (!slot) continue;
+      xltAssignments.push({
+        switchNumber: Number(slot[1]),
+        button: Number(slot[2]),
+        scenes: sceneFields.filter((name) => name.length > 0),
+      });
+    }
+  }
+  if (!xltSwitches.length && !xltChannels.length)
+    throw new Error("The translation document contains no equipment");
+
+  const room: Room = {
+    id: 1,
+    name: "FlexiDim",
+    floor: "FlexiDim",
+    icon: "/flexidim/rooms/0.png",
+    parentId: null,
+    areaType: "Floor",
+  };
+  const switchTypeNames: Record<number, { name: string; buttons: number }> = {
+    15: { name: "8 scene", buttons: 11 },
+    13: { name: "4 scene", buttons: 7 },
+    8: { name: "8 channel opto", buttons: 8 },
+    2: { name: "2 channel opto", buttons: 2 },
+  };
+  const switches: WallSwitch[] = xltSwitches.map((item, index) => ({
+    id: index + 1,
+    name: item.name,
+    roomId: room.id,
+    kind: switchTypeNames[item.type]?.name ?? `${item.type} type`,
+    buttons: switchTypeNames[item.type]?.buttons ?? 8,
+    type: item.type,
+    number: item.number,
+    hardwareType: item.type,
+  }));
+  const channels: Channel[] = xltChannels.map((item, index) => ({
+    id: index + 1,
+    name: item.name,
+    roomId: room.id,
+    module: `Channel ${item.number}`,
+    kind: item.dimmable ? "Dimmable" : "On/Off",
+    level: 0,
+    channelIndex: item.number,
+    controllerChannel: item.number,
+    dimmable: item.dimmable,
+  }));
+
+  // Scenes come only from the switch-scene rows; consecutive fields are the
+  // first and second press of one physical button.
+  const sceneIdByName = new Map<string, number>();
+  const scenes: Scene[] = [];
+  const assignments: Assignment[] = [];
+  const switchIdByNumber = new Map(
+    switches.map((item) => [item.number ?? item.id, item.id]),
+  );
+  for (const entry of xltAssignments) {
+    const switchId = switchIdByNumber.get(entry.switchNumber);
+    if (!switchId) continue;
+    entry.scenes.forEach((sceneName, pressIndex) => {
+      let sceneId = sceneIdByName.get(sceneName);
+      if (!sceneId) {
+        sceneId = scenes.length + 1;
+        sceneIdByName.set(sceneName, sceneId);
+        scenes.push({
+          id: sceneId,
+          name: sceneName,
+          shortName: sceneName,
+          group: "Scenes",
+          folderPath: ["Scenes"],
+          levels: {},
+          channelSettings: {},
+          fade: 0,
+          enabled: true,
+          days: allDays,
+          time: "",
+          displayRank: sceneId,
+        });
+      }
+      assignments.push({
+        switchId,
+        button: (entry.button - 1) * 2 + pressIndex + 1,
+        sceneId,
+      });
+    });
+  }
+
+  const site: Site = {
+    name: "Imported FlexiDim site",
+    id: "FD4",
+    ip: "192.168.1.50",
+    port: 15273,
+    routerPort: 15273,
+    description: "Created as starting point",
+    address: "",
+    timezone: normalizeSiteTimeZone("", "UK / Europe"),
+    dst: "UK / Europe",
+    remote: false,
+    autoDetect: true,
+    siteType: 0,
+  };
+  return {
+    site,
+    configurations: [
+      {
+        id: 1,
+        siteId: site.id,
+        name: "Initial import",
+        description: "Created as starting point",
+        lastUpdated: "",
+      },
+    ],
+    activeConfigId: 1,
+    rooms: [room],
+    channels,
+    switches,
+    sceneGroups: [],
+    scenes,
+    deletedScenes: [],
+    periods: [],
+    users: [],
+    assignments,
+    modules: [],
+    deletedItems: [],
+  };
+}
+
+/** Build a `.fd4xlt` translation document from the current configuration. */
+export function buildFd4XltDocument(data: AppData): string {
+  const lines: string[] = [];
+  lines.push("#SWITCHES <number> <Type> <name/location>");
+  lines.push(
+    "# Type 15 = 8 scene : Type 13 = 4 scene : Type 2 = 2 channel opto : Type 8 = 8 channel opto",
+  );
+  for (const wallSwitch of data.switches)
+    lines.push(
+      `${wallSwitch.number ?? wallSwitch.id},${wallSwitch.type ?? wallSwitch.hardwareType ?? 15},${wallSwitch.name}`,
+    );
+  lines.push("#CHANNELS <number> <dimmable> <name/location>");
+  for (const channel of data.channels)
+    lines.push(
+      `${channel.controllerChannel ?? channel.channelIndex ?? channel.id},${channel.dimmable === false ? 0 : 1},${channel.name}`,
+    );
+  lines.push(
+    "#SWITCH-SCENES <switch number:button number> <scene1 name/location> <scene2 name/location>",
+  );
+  const sceneById = new Map(data.scenes.map((scene) => [scene.id, scene]));
+  const bySwitch = new Map<number, Map<number, string[]>>();
+  for (const assignment of data.assignments) {
+    if (!assignment.sceneId) continue;
+    const scene = sceneById.get(assignment.sceneId);
+    if (!scene) continue;
+    const physical = Math.ceil(assignment.button / 2);
+    const press = (assignment.button - 1) % 2;
+    const wallSwitch = data.switches.find(
+      (item) => item.id === assignment.switchId,
+    );
+    if (!wallSwitch) continue;
+    const switchNumber = wallSwitch.number ?? wallSwitch.id;
+    if (!bySwitch.has(switchNumber)) bySwitch.set(switchNumber, new Map());
+    const buttons = bySwitch.get(switchNumber)!;
+    if (!buttons.has(physical)) buttons.set(physical, []);
+    buttons.get(physical)![press] = scene.name;
+  }
+  for (const [switchNumber, buttons] of [...bySwitch.entries()].sort(
+    (a, b) => a[0] - b[0],
+  )) {
+    for (const [button, presses] of [...buttons.entries()].sort(
+      (a, b) => a[0] - b[0],
+    )) {
+      lines.push(
+        `${switchNumber}:${button},${presses[0] ?? ""},${presses[1] ?? ""}`,
+      );
+    }
+  }
+  return lines.join("\r\n") + "\r\n";
 }

@@ -10,6 +10,9 @@ import {
   isFlexiDimWorkspace,
   materializeAppData,
   mergeLegacyBrowserConnectionState,
+  migrateWorkspaceControllerCode,
+  migrateWorkspaceChannelProfileOrder,
+  migrateWorkspaceImportedUserAccess,
   orderUserAccess,
   parseLegacyFd4Config,
   CONFIG_CONTENT_KEYS,
@@ -33,13 +36,83 @@ import {
   isStarterSite,
   upsertImportedConfiguration,
   siteImportDetailsEqual,
+  siteImportDifferences,
   updateUserProfile,
   validateConfigContent,
+  siteTypeFromSiteId,
 } from "./fd4cfg";
-import { controllerChannelAddress } from "./flexidim-addressing.mjs";
+import { buildLegacyArchive } from "./fd4cfg-export";
+import { transferReadiness } from "./transfer-readiness";
+import { compileConfig, formatChecksum } from "./compile-config";
+import { compileUserProfiles } from "./compile-user-profiles";
+import { onOffPriority } from "./basic-assignment";
+import {
+  UTILITY_BUTTON_PROMPT,
+  generateSceneUtility,
+  type SceneUtility,
+} from "./scene-utilities";
+import {
+  UNRECOVERED_SCENE_FLAGS,
+  editScene,
+  moveScene,
+  moveSceneGroup,
+  sceneIsLocked,
+  switchesAffectedByScene,
+  unknownSceneFlagBits,
+} from "./scene-order";
+import {
+  controllerActionState,
+  type ControllerActionState,
+} from "./controller-actions";
+import {
+  ACCESSORY_TYPE_NAMES,
+  DEFAULT_CHANNEL_TYPE_FAMILY,
+  SWITCH_TYPES,
+  channelSupportsColour,
+  channelTypeFamily,
+  isBlindControl,
+  switchTypeByCode,
+  switchTypeByName,
+} from "./channel-catalogue";
+import {
+  controllerChannelAddress,
+  controllerModuleNumber,
+} from "./flexidim-addressing.mjs";
 import { defaultOnOffCommands, rawControllerButton } from "./live-switch.mjs";
 import { dstTransition, isDstActive, loadDstRuleSet, type DstYearRule } from "./dst-rules";
 import { solarTimes } from "./solar";
+
+/**
+ * Site types are a protocol generation, not a preference: only type 0 (local
+ * plaintext) is protocol-verified, so the other two are labelled as such.
+ */
+const SITE_TYPE_LABELS: Record<number, string> = {
+  0: "Type 0 — local plaintext",
+  1: "Type 1 — remote (not yet available)",
+  2: "Type 2 — encrypted remote (not yet available)",
+};
+
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000)
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  return btoa(binary);
+}
+
+function transferClock(now = new Date()) {
+  const january = new Date(now.getFullYear(), 0, 1).getTimezoneOffset();
+  const july = new Date(now.getFullYear(), 6, 1).getTimezoneOffset();
+  return {
+    year: now.getFullYear(),
+    month: now.getMonth() + 1,
+    day: now.getDate(),
+    weekday: now.getDay(),
+    hour: now.getHours(),
+    minute: now.getMinutes(),
+    second: now.getSeconds(),
+    dst: now.getTimezoneOffset() < Math.max(january, july),
+  };
+}
 
 type Tab =
   | "Sites"
@@ -53,6 +126,40 @@ type Tab =
   | "Users"
   | "Trace";
 type TraceItem = { at: string; text: string; tone?: "ok" | "warn" };
+type TransferPreflight = {
+  state: "passed" | "failed";
+  message: string;
+  imageChecksum?: string;
+  imageBytes?: number;
+  firstPassChecksum?: string;
+  blockCount?: number;
+  userCount?: number;
+  userBytes?: number;
+  frameCount?: number;
+  runnerQualification?: {
+    state: "passed";
+    resetReconnectExercised: true;
+    validatedStatusRecords: 10;
+  };
+  lifecycle?: string[];
+  transcriptSha256?: string;
+  comparison?: { fresh: boolean; bound: boolean; ageMs: number | null };
+  eligibleAfterHardwareQualification?: boolean;
+  liveWritesEnabled: boolean;
+};
+type TransferProgress = {
+  state: string;
+  message: string;
+  blockNumber?: number;
+  retry?: number;
+};
+type TransferResult = {
+  state: "completed" | "failed";
+  outcome: string;
+  message: string;
+  imageChecksum?: string;
+  frameCount?: number;
+};
 type EquipmentSection = "areas" | "modules" | "switches" | "deleted";
 type EquipmentSelection =
   | { type: "area"; id: number }
@@ -258,18 +365,6 @@ const initialData: AppData = {
 // FlexiDim switch types (recovered from the iOS binary). The name reflects the
 // count of main scene buttons; the physical plate also carries a shifted column
 // of three extra buttons, so an "8 scene" switch has 11 physical buttons.
-const SWITCH_TYPE_BY_NAME: Record<string, { type: number; buttons: number }> = {
-  "8 scene": { type: 15, buttons: 11 },
-  "4 scene": { type: 13, buttons: 7 },
-  "8 channel opto": { type: 8, buttons: 8 },
-  "2 channel opto": { type: 2, buttons: 2 },
-};
-const CHANNEL_TYPE_NAMES = [
-  "On/Off", "Dimmable", "Hard fired dimmable", "Full cycle dimmable",
-  "Hard fired on/off", "Full cycle on/off", "Enhanced DMX", "DALI",
-  "Enhanced DALI", "Accessory", "Leading edge", "Trailing edge",
-  "L.Edge LED", "T.Edge LED", "1–10V", "Blind control",
-];
 
 // "When button pressed" test modes (recovered from the iOS binary, with the
 // original option descriptions).
@@ -403,6 +498,38 @@ function Field({
       </span>
       {children}
     </label>
+  );
+}
+
+/**
+ * A controller action that is only offered when the active profile actually
+ * supports it. When it does not, the button stays visible but disabled and
+ * carries the specific missing evidence, so an installer can tell "not
+ * implemented" apart from "not verified against hardware".
+ */
+function GatedAction({
+  state,
+  onClick,
+  children,
+}: {
+  state: ControllerActionState;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <span className="gated-action">
+      <button
+        disabled={!state.allowed}
+        title={state.reason}
+        aria-describedby={state.allowed ? undefined : "gated-reason"}
+        onClick={onClick}
+      >
+        {children}
+      </button>
+      {!state.allowed && (
+        <small className="gated-reason">{state.reason}</small>
+      )}
+    </span>
   );
 }
 
@@ -689,6 +816,27 @@ export default function FlexiDimWeb() {
   const [connection, setConnection] = useState<
     "offline" | "bridge" | "connecting" | "connected" | "error"
   >("offline");
+  const [bridgeProfile, setBridgeProfile] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
+  const [comparisonState, setComparisonState] = useState<string | null>(null);
+  const [comparisonMatch, setComparisonMatch] = useState<{
+    localChecksum: string;
+    controllerChecksum: string;
+    version: string;
+  } | null>(null);
+  const [transferPreflight, setTransferPreflight] =
+    useState<TransferPreflight | null>(null);
+  const [transferProgress, setTransferProgress] =
+    useState<TransferProgress | null>(null);
+  const [transferDialog, setTransferDialog] = useState<
+    "closed" | "warning" | "running" | "result"
+  >("closed");
+  const [transferResult, setTransferResult] =
+    useState<TransferResult | null>(null);
+  const [liveWritesEnabled, setLiveWritesEnabled] = useState(false);
+  const [transferStopped, setTransferStopped] = useState(false);
   const [trace, setTrace] = useState<TraceItem[]>([
     { at: "—", text: "FlexiDim Web ready" },
   ]);
@@ -702,6 +850,12 @@ export default function FlexiDimWeb() {
   const socket = useRef<WebSocket | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
   const serverReady = useRef(false);
+  // Whether edits are actually reaching server storage. A transient toast is not
+  // enough: if storage is unavailable the app keeps accepting edits that are
+  // never persisted, so the state has to stay on screen.
+  const [storageState, setStorageState] = useState<
+    "loading" | "ready" | "unavailable"
+  >("loading");
   const serverRevision = useRef(0);
   const lastSyncedWorkspace = useRef("");
   const pendingWorkspace = useRef<FlexiDimWorkspace | null>(null);
@@ -762,33 +916,37 @@ export default function FlexiDimWeb() {
         if (payload.workspace != null) {
           if (!isFlexiDimWorkspace(payload.workspace))
             throw new Error("The server returned an invalid workspace");
-          authoritative = payload.workspace;
+          const storedWorkspace = payload.workspace;
+          authoritative = migrateWorkspaceImportedUserAccess(
+            migrateWorkspaceChannelProfileOrder(
+              migrateWorkspaceControllerCode(storedWorkspace),
+            ),
+          );
           if (legacyBrowserWorkspace) {
-            const merged = mergeLegacyBrowserConnectionState(
+            authoritative = mergeLegacyBrowserConnectionState(
               authoritative,
               legacyBrowserWorkspace,
             );
-            if (
-              stringifyConfiguration(merged) !==
-              stringifyConfiguration(authoritative)
-            ) {
-              const migrationResponse = await fetch("/api/workspace", {
-                method: "PUT",
-                headers: { "content-type": "application/json" },
-                body: stringifyConfiguration({
-                  workspace: merged,
-                  expectedRevision: revision,
-                }),
-              });
-              const migrated = await migrationResponse.json();
-              if (!migrationResponse.ok)
-                throw new Error(
-                  migrated.error ??
-                    "Could not migrate the working browser connection settings",
-                );
-              authoritative = merged;
-              revision = Number(migrated.revision);
-            }
+          }
+          if (
+            stringifyConfiguration(authoritative) !==
+            stringifyConfiguration(storedWorkspace)
+          ) {
+            const migrationResponse = await fetch("/api/workspace", {
+              method: "PUT",
+              headers: { "content-type": "application/json" },
+              body: stringifyConfiguration({
+                workspace: authoritative,
+                expectedRevision: revision,
+              }),
+            });
+            const migrated = await migrationResponse.json();
+            if (!migrationResponse.ok)
+              throw new Error(
+                migrated.error ??
+                  "Could not migrate retained configuration metadata",
+              );
+            revision = Number(migrated.revision);
           }
         } else {
           const createResponse = await fetch("/api/workspace", {
@@ -809,12 +967,14 @@ export default function FlexiDimWeb() {
         lastSyncedWorkspace.current = stringifyConfiguration(authoritative);
         setWorkspace(authoritative);
         serverReady.current = true;
+        setStorageState("ready");
         setStorageLoaded(true);
         localStorage.removeItem("flexidim-web-data");
         if (payload.workspace != null)
           showToast("Configuration loaded from the server", "ok");
       } catch (error) {
         if (!active) return;
+        setStorageState("unavailable");
         notify(
           `Server storage unavailable: ${
             error instanceof Error ? error.message : "unknown error"
@@ -837,8 +997,39 @@ export default function FlexiDimWeb() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /**
+   * Confirm storage is reachable right now.
+   *
+   * `serverReady` is set once at startup and never falsifies on its own, so it
+   * cannot be trusted to report success: killing the server after load left it
+   * true, and an import reported success while the save that followed failed.
+   */
+  const storageReachable = async () => {
+    try {
+      const response = await fetch("/api/workspace", {
+        method: "GET",
+        cache: "no-store",
+      });
+      const ok = response.ok;
+      setStorageState(ok ? "ready" : "unavailable");
+      if (!ok) serverReady.current = false;
+      return ok;
+    } catch {
+      setStorageState("unavailable");
+      serverReady.current = false;
+      return false;
+    }
+  };
+
   const flushWorkspaceToServer = async () => {
-    if (workspaceSaveInFlight.current || !serverReady.current) return;
+    if (workspaceSaveInFlight.current) return;
+    // Storage was never reachable, so a save cannot even be attempted. Bailing
+    // out silently here is what let an import report success while persisting
+    // nothing.
+    if (!serverReady.current) {
+      setStorageState("unavailable");
+      return;
+    }
     const next = pendingWorkspace.current;
     if (!next) return;
     pendingWorkspace.current = null;
@@ -863,7 +1054,9 @@ export default function FlexiDimWeb() {
         );
       serverRevision.current = Number(payload.revision);
       lastSyncedWorkspace.current = serialized;
+      setStorageState("ready");
     } catch (error) {
+      setStorageState("unavailable");
       notify(
         `Configuration not saved: ${
           error instanceof Error ? error.message : "unknown error"
@@ -877,11 +1070,15 @@ export default function FlexiDimWeb() {
   };
 
   useEffect(() => {
-    if (!serverReady.current) return;
     if (
       stringifyConfiguration(workspace) === lastSyncedWorkspace.current
     )
       return;
+    // An edit was made. If storage is down, say so rather than dropping it.
+    if (!serverReady.current) {
+      setStorageState("unavailable");
+      return;
+    }
     pendingWorkspace.current = workspace;
     if (workspaceSaveTimer.current)
       window.clearTimeout(workspaceSaveTimer.current);
@@ -950,6 +1147,14 @@ export default function FlexiDimWeb() {
         pending: false,
       }));
   const currentScene = data.scenes.find((scene) => scene.id === selectedScene);
+  // Which wall switches run this scene, so an installer can see what a change
+  // affects before making it.
+  const sceneAffectedSwitches = currentScene
+    ? switchesAffectedByScene(data, currentScene.id)
+    : [];
+  const sceneUnknownFlagBits = currentScene
+    ? unknownSceneFlagBits(currentScene)
+    : 0;
   const sceneGroups = data.sceneGroups ?? [];
   const currentSceneGroup = sceneGroups.find((group) => group.id === sceneGroupId);
   const editingSceneGroup = sceneGroups.find((group) => group.id === editingSceneGroupId);
@@ -1064,6 +1269,15 @@ export default function FlexiDimWeb() {
           );
         } else if (message.type === "channelStatus" && message.levels) {
           const levels = message.levels as Record<string, number>;
+          // Remember which controller addresses have actually reported. This is
+          // the one stored-vs-controller comparison available without the
+          // unverified block-read frames.
+          for (const key of Object.keys(levels)) {
+            const address = Number(key);
+            if (!Number.isInteger(address)) continue;
+            reportedAddresses.current.add(address);
+            reportedLevels.current.set(address, Number(levels[key]));
+          }
           setData((old) => ({
             ...old,
             channels: old.channels.map((channel) => {
@@ -1074,7 +1288,54 @@ export default function FlexiDimWeb() {
             }),
           }));
         } else if (message.type === "capabilities") {
+          setBridgeProfile(message.profile ?? null);
           addTrace(`Controller profile: ${message.profile?.id ?? "unknown"}`);
+        } else if (message.type === "verifyResult") {
+          setComparisonState(message.message ?? "Comparison finished");
+          setComparisonMatch(
+            message.state === "match"
+              ? {
+                  localChecksum: String(message.localChecksum || "").toLowerCase(),
+                  controllerChecksum: String(
+                    message.controllerChecksum || "",
+                  ).toLowerCase(),
+                  version: String(message.version || ""),
+                }
+              : null,
+          );
+          // Toast the outcome too — the inline state sits in a panel of similar
+          // sentences, so on its own it is not visible feedback.
+          notify(
+            message.state === "match"
+              ? "Configuration matches the Scene Controller"
+              : message.state === "unavailable"
+                ? "Controller comparison is not available"
+                : "Configuration differs from the Scene Controller",
+            message.state === "match" ? "ok" : "warn",
+          );
+        } else if (message.type === "transferPreflight") {
+          setTransferPreflight(message as TransferPreflight);
+          setTransferProgress(null);
+          setLiveWritesEnabled(Boolean(message.liveWritesEnabled));
+          notify(
+            message.message ?? "Offline transfer dry run finished",
+            message.state === "passed" ? "ok" : "warn",
+          );
+        } else if (message.type === "transferProgress") {
+          setTransferProgress(message as TransferProgress);
+          addTrace(message.message ?? `Transfer state: ${message.state}`);
+        } else if (message.type === "transferResult") {
+          const result = message as TransferResult;
+          setTransferResult(result);
+          setTransferDialog("result");
+          setTransferProgress(null);
+          notify(
+            result.message,
+            result.state === "completed" ? "ok" : "warn",
+          );
+        } else if (message.type === "transferSafetyStatus") {
+          setTransferStopped(Boolean(message.emergencyStopped));
+          setLiveWritesEnabled(Boolean(message.liveWritesEnabled));
         } else if (message.type === "trace") addTrace(message.message);
       } catch {
         addTrace(String(event.data));
@@ -1104,6 +1365,10 @@ export default function FlexiDimWeb() {
     pending: { id: number; level: number } | null;
   }>({ timer: null, pending: null });
   const lastSceneRun = useRef<number | null>(null);
+  const reportedAddresses = useRef(new Set<number>());
+  // The last level the controller reported per address, so the comparison can
+  // show controller-side state and not just which addresses exist.
+  const reportedLevels = useRef(new Map<number, number>());
   const sceneStateFlags = useRef(new Set<number>());
 
   // The Scene Controller addresses a channel by the byte computed at import
@@ -1253,6 +1518,10 @@ export default function FlexiDimWeb() {
   const updateSite = (patch: Partial<Site>) =>
     setData((old) => {
       const updated = { ...old.site, ...patch };
+      // The iOS app never stores the site type: it derives it from the fifth
+      // character of the site ID. Editing the ID therefore re-derives it so the
+      // model can never disagree with the ID an exported archive carries.
+      if (patch.id !== undefined) updated.siteType = siteTypeFromSiteId(updated.id);
       const sites = (old.sites?.length ? old.sites : [old.site]).map((site) =>
         site.id === old.site.id ? updated : site,
       );
@@ -1261,6 +1530,115 @@ export default function FlexiDimWeb() {
             config.siteId === old.site.id ? { ...config, siteId: patch.id! } : config)
         : old.configurations;
       return { ...old, site: updated, sites, configurations };
+    });
+
+  /**
+   * Resolves a controller action against the profile the bridge announced. Before
+   * a bridge connects there is no profile, so the safe local one is assumed —
+   * which is also the only one any real controller has offered so far.
+   */
+  const capability = (messageType: string) =>
+    controllerActionState(messageType, bridgeProfile);
+
+  const compareWithController = () => {
+    const compiled = compileConfig(data);
+    if (!compiled.complete) {
+      notify(
+        "This configuration cannot be compared because its controller image is incomplete.",
+        "warn",
+      );
+      return;
+    }
+    const localChecksum = formatChecksum(compiled.checksum);
+    setComparisonState(
+      `Current local configuration CRC: ${localChecksum}. Waiting for the Scene Controller…`,
+    );
+    send({ type: "verify", localChecksum });
+  };
+
+  const runTransferDryRun = () => {
+    const compiled = compileConfig(data);
+    const users = compileUserProfiles(data);
+    if (!compiled.complete || !users.complete) {
+      const details = [
+        ...(compiled.complete ? [] : ["The controller image is incomplete."]),
+        ...users.problems,
+      ];
+      const message = `Offline dry run blocked: ${details.join(" ")}`;
+      setTransferPreflight({ state: "failed", message, liveWritesEnabled: false });
+      notify(message, "warn");
+      return;
+    }
+    setTransferProgress("Compiling and replaying the complete transfer offline…");
+    send({
+      type: "transferDryRun",
+      imageBase64: bytesToBase64(compiled.image),
+      imageChecksum: formatChecksum(compiled.checksum),
+      userPayloadsBase64: users.payloads.map(bytesToBase64),
+      clock: transferClock(),
+      siteType: data.site.siteType ?? 0,
+      firmwareProfile: "type-0-live-only",
+    });
+  };
+
+  const beginLiveTransfer = () => {
+    const compiled = compileConfig(data);
+    const users = compileUserProfiles(data);
+    if (!compiled.complete || !users.complete) {
+      notify("The configuration is not complete enough to send.", "warn");
+      return;
+    }
+    const imageChecksum = formatChecksum(compiled.checksum).toLowerCase();
+    if (
+      transferPreflight?.state !== "passed" ||
+      transferPreflight.imageChecksum?.toLowerCase() !== imageChecksum
+    ) {
+      notify(
+        "Run the offline transfer dry run for this exact configuration first.",
+        "warn",
+      );
+      return;
+    }
+    setTransferResult(null);
+    setTransferProgress({
+      state: "starting",
+      message: "Connecting to Scene Controller",
+    });
+    setTransferDialog("running");
+    send({
+      type: "sync",
+      confirm: "Continue",
+      imageBase64: bytesToBase64(compiled.image),
+      imageChecksum,
+      userPayloadsBase64: users.payloads.map(bytesToBase64),
+      clock: transferClock(),
+      siteType: data.site.siteType ?? 0,
+      firmwareProfile: "type-0-live-only",
+    });
+  };
+
+
+
+  /**
+   * The archive always carries four gateway address slots and four count
+   * slots, so the editor writes into a fixed-length array rather than
+   * appending — a sparse edit must not shift the remaining slots.
+   */
+  const updateGateway = (
+    index: number,
+    patch: Partial<{ address: string; count: number }>,
+  ) =>
+    setData((old) => {
+      const gateways = Array.from({ length: 4 }, (_, slot) => ({
+        address: old.site.wirelessGateways?.[slot]?.address ?? "",
+        count: old.site.wirelessGateways?.[slot]?.count ?? 0,
+      }));
+      gateways[index] = { ...gateways[index], ...patch };
+      const site = { ...old.site, wirelessGateways: gateways };
+      const sites = (old.sites?.length ? old.sites : [old.site]).map((item) =>
+        item.id === old.site.id ? site : item,
+      );
+      return { ...old, site, sites };
     });
 
   const selectSite = (site: Site) => {
@@ -1615,17 +1993,25 @@ export default function FlexiDimWeb() {
     });
   };
 
-  const moveToDeleted = (deleted: DeletedItem) => {
+  /**
+   * The recovery key is minted from the existing list rather than from a clock:
+   * it only has to be unique within `deletedItems`, and deriving it keeps this
+   * path pure so a delete can never depend on when it happened.
+   */
+  const moveToDeleted = (
+    type: DeletedItem["type"],
+    item: DeletedItem["item"],
+  ) => {
     if (!allowEquipment) return;
-    if (deleted.type === "area" && (
-      data.rooms.some((room) => room.parentId === deleted.item.id) ||
-      data.channels.some((channel) => channel.roomId === deleted.item.id) ||
-      data.switches.some((wallSwitch) => wallSwitch.roomId === deleted.item.id)
+    if (type === "area" && (
+      data.rooms.some((room) => room.parentId === item.id) ||
+      data.channels.some((channel) => channel.roomId === item.id) ||
+      data.switches.some((wallSwitch) => wallSwitch.roomId === item.id)
     )) {
       window.alert("Move the child rooms, channels and switches before deleting this area.");
       return;
     }
-    if (deleted.type === "module" && data.channels.some((channel) => channel.moduleId === deleted.item.id)) {
+    if (type === "module" && data.channels.some((channel) => channel.moduleId === item.id)) {
       window.alert("Move this module's channels before deleting it.");
       return;
     }
@@ -1638,9 +2024,14 @@ export default function FlexiDimWeb() {
       } as const;
       const content = deleteConfigEntity(
         snapshotContent(old),
-        entityType[deleted.type],
-        deleted.item.id,
+        entityType[type],
+        item.id,
       );
+      const taken = new Set(content.deletedItems.map((entry) => entry.key));
+      let key = `${type}-${item.id}`;
+      for (let attempt = 2; taken.has(key); attempt += 1)
+        key = `${type}-${item.id}-${attempt}`;
+      const deleted = { key, type, item } as DeletedItem;
       return {
         ...old,
         ...content,
@@ -1648,7 +2039,7 @@ export default function FlexiDimWeb() {
       };
     });
     setEquipmentSelection(null);
-    addTrace(`${deleted.item.name} moved to Deleted items`);
+    addTrace(`${item.name} moved to Deleted items`);
   };
 
   const restoreDeleted = (deleted: DeletedItem) => {
@@ -1720,68 +2111,27 @@ export default function FlexiDimWeb() {
     );
   };
 
-  const createSceneUtility = (
-    utility: "extractor" | "security" | "simple",
-    label: string,
-  ) => {
-    const firstId = newId([...data.scenes, ...(data.deletedScenes ?? [])]);
-    const groupId = sceneGroupId ?? sceneGroups[0]?.id;
-    const folderPath = currentSceneGroup ? [currentSceneGroup.name] : ["Sequences"];
-    const assignSimpleToButtons = utility === "simple" && window.confirm(
-      "Put automatically created scenes on buttons 1, 2 and 3 when those buttons are unused?",
-    );
-    const makeScene = (id: number, name: string, levels: Record<number, number>): Scene => ({
-      id, name, shortName: name, group: currentSceneGroup?.name ?? "Sequences",
-      groupId, folderPath, levels,
-      channelSettings: Object.fromEntries(Object.entries(levels).map(([channelId, brightness]) => [Number(channelId), {
-        brightness, fadeTime: 2, relativePercent: false, use100PercentTime: false, delay: 0, flags: 0,
-      }])),
-      fade: 0, enabled: true, days: dayNames, time: "", utility,
-    });
+  /**
+   * Runs one of the recovered scene-creation utilities. The generated shape
+   * lives in `scene-utilities.ts` so it can be asserted directly; this only
+   * handles the prompt and merging the result into the workspace.
+   */
+  const createSceneUtility = (utility: SceneUtility, label: string) => {
+    // The original app offers the button prompt after EVERY utility, not just
+    // Simple Scenes.
+    const assignToButtons = window.confirm(UTILITY_BUTTON_PROMPT);
+    let firstSceneId: number | undefined;
     setData((old) => {
-      let created: Scene[] = [];
-      const assignments = [...old.assignments];
-      if (utility === "simple") {
-        for (const room of old.rooms) {
-          const wallSwitch = old.switches.find((item) => item.roomId === room.id && item.basic?.channelIds.length);
-          if (!wallSwitch) continue;
-          const channelIds = wallSwitch.basic?.channelIds ?? [];
-          const sceneLevels = (level: number) => Object.fromEntries(channelIds.map((id) => [id, level]));
-          const offset = created.length;
-          const roomScenes = [
-            makeScene(firstId + offset, `${room.name} Bright`, sceneLevels(100)),
-            makeScene(firstId + offset + 1, `${room.name} Medium`, sceneLevels(50)),
-            makeScene(firstId + offset + 2, `${room.name} Off`, sceneLevels(0)),
-          ];
-          created.push(...roomScenes);
-          if (assignSimpleToButtons) {
-            [1, 3, 5].forEach((button, index) => {
-              if (!assignments.some((item) => item.switchId === wallSwitch.id && item.button === button))
-                assignments.push({ switchId: wallSwitch.id, button, sceneId: roomScenes[index].id });
-            });
-          }
-        }
-      } else {
-        const names = utility === "extractor"
-          ? ["Extractor Night", "Extractor Sequence", "Start Extractor Now", "Stop Extractor Now", "Extractor On", "Extractor On Night", "Extractor Off", "Cancel Extractor"]
-          : Array.from({ length: 8 }, (_, index) => `Security Step ${index + 1}`);
-        created = names.map((name, index) => makeScene(
-          firstId + index,
-          name,
-          Object.fromEntries(old.channels.map((channel) => [channel.id,
-            utility === "security" ? (index % 2 ? 0 : channel.level) : channel.level])),
-        ));
-        created = created.map((scene, index) => ({
-          ...scene,
-          nextSceneId: created[(index + 1) % created.length].id,
-          nextSceneMode: 0,
-          nextSceneTime: utility === "security" ? 60 : 10,
-          beginNewSequence: index === 0,
-        }));
-      }
-      return { ...old, scenes: [...old.scenes, ...created], assignments };
+      const result = generateSceneUtility(utility, old, { assignToButtons });
+      firstSceneId = result.scenes[0]?.id;
+      return {
+        ...old,
+        scenes: [...old.scenes, ...result.scenes],
+        sceneGroups: [...old.sceneGroups, ...result.sceneGroups],
+        assignments: [...old.assignments, ...result.assignments],
+      };
     });
-    setSelectedScene(firstId);
+    if (firstSceneId !== undefined) setSelectedScene(firstSceneId);
     setEditingSceneGroupId(null);
     setShowSceneUtilities(false);
     addTrace(`${label} created`, "ok");
@@ -1990,12 +2340,23 @@ export default function FlexiDimWeb() {
       }),
     }));
 
+  // Edits route through editScene so a locked scene stays read-only everywhere,
+  // rather than each control having to remember to check the lock.
   const updateScene = (sceneId: number, patch: Partial<Scene>) =>
     setData((old) => ({
       ...old,
       scenes: old.scenes.map((scene) =>
-        scene.id === sceneId ? { ...scene, ...patch } : scene,
+        scene.id === sceneId ? editScene(scene, patch) : scene,
       ),
+    }));
+
+  const reorderScene = (sceneId: number, direction: -1 | 1) =>
+    setData((old) => ({ ...old, scenes: moveScene(old.scenes, sceneId, direction) }));
+
+  const reorderSceneGroup = (groupId: number, direction: -1 | 1) =>
+    setData((old) => ({
+      ...old,
+      sceneGroups: moveSceneGroup(old.sceneGroups ?? [], groupId, direction),
     }));
 
   const updateSceneGroup = (groupId: number, patch: Partial<SceneGroup>) =>
@@ -2064,6 +2425,25 @@ export default function FlexiDimWeb() {
     URL.revokeObjectURL(url);
     addTrace("Configuration exported", "ok");
   };
+  const exportLegacyConfig = () => {
+    try {
+      const bytes = buildLegacyArchive(data);
+      const url = URL.createObjectURL(
+        new Blob([bytes], { type: "application/octet-stream" }),
+      );
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${data.site.name.replace(/\s+/g, "-").toLowerCase()}.fd4cfg`;
+      link.click();
+      URL.revokeObjectURL(url);
+      addTrace("iOS .fd4cfg configuration exported", "ok");
+    } catch (error) {
+      notify(
+        `Configuration not exported: ${error instanceof Error ? error.message : String(error)}`,
+        "warn",
+      );
+    }
+  };
   const exportHardwareCsv = () => {
     const rows = [
       ["Type", "Name", "Room", "Controller number", "Module", "Channel", "Hardware type"],
@@ -2131,6 +2511,19 @@ export default function FlexiDimWeb() {
         }),
       }).catch(() => undefined);
     };
+    // Server storage is the ONLY persistence — the browser copy is a one-time
+    // migration candidate that is deleted after the first successful load. So an
+    // import with no reachable server cannot be completed, and applying it to
+    // in-memory state would leave the UI showing a configuration that vanishes
+    // on reload. Refuse before touching any state.
+    if (!(await storageReachable())) {
+      notify(
+        `Cannot import ${file.name}: server storage is unavailable, so there is nowhere to save the configuration. Restore the server and try again.`,
+        "warn",
+      );
+      event.target.value = "";
+      return;
+    }
     reportImportEvent("started");
     try {
       let imported: AppData;
@@ -2184,8 +2577,14 @@ export default function FlexiDimWeb() {
                   ? "The saved site details are newer."
                   : "The timestamps match, but the site details differ."
               : "The imported and saved site details differ.";
+            // Name the fields that differ. "Details differ" alone gives an
+            // installer no way to tell a stale backup from a corrected one.
+            const differences = siteImportDifferences(sameId, imported.site);
+            const detail = differences.length
+              ? ` Differences: ${differences.join(", ")}.`
+              : "";
             const useImported = window.confirm(
-              `A site with ID ${sameId.id} already exists. ${freshness} The matching configuration will be refreshed rather than duplicated. Use the imported site details too?`,
+              `A site with ID ${sameId.id} already exists. ${freshness}${detail} The controller address in use is kept either way. The matching configuration will be refreshed rather than duplicated. Use the imported site details too?`,
             );
             targetSite = mergeImportedSite(sameId, imported.site, useImported);
           }
@@ -2263,6 +2662,8 @@ export default function FlexiDimWeb() {
         periods: imported.periods.length,
         users: imported.users.length,
       });
+      // Storage was confirmed reachable before any state was touched, and the
+      // debounced save reports its own failure if the server dies mid-write.
       notify(`Imported configuration from ${file.name}`, "ok");
     } catch (error) {
       const message =
@@ -2322,8 +2723,8 @@ export default function FlexiDimWeb() {
           name: name.trim(),
           roomId: selectedRoom,
           kind: "4 scene",
-          type: SWITCH_TYPE_BY_NAME["4 scene"].type,
-          buttons: SWITCH_TYPE_BY_NAME["4 scene"].buttons,
+          type: switchTypeByName("4 scene").code,
+          buttons: switchTypeByName("4 scene").buttons,
         },
       ],
     }));
@@ -2663,13 +3064,52 @@ export default function FlexiDimWeb() {
               onChange={(e) => updateSite({ securityCode: e.target.value })}
             />
           </Field>
-          <Field label="Controller site type" help="The protocol generation used by this Scene Controller.">
-            <select value={data.site.siteType ?? 0} disabled={!installer} onChange={(event) => updateSite({ siteType: Number(event.target.value) })}>
-              <option value="0">Type 0 — local plaintext</option>
-              <option value="1">Type 1 — remote (not yet available)</option>
-              <option value="2">Type 2 — encrypted remote (not yet available)</option>
-            </select>
+          <Field
+            label="Controller site type"
+            help="Derived from the fifth character of the site ID, exactly as the original app does; edit the site ID to change it."
+          >
+            <output className="derived-value" data-testid="derived-site-type">
+              {SITE_TYPE_LABELS[siteTypeFromSiteId(data.site.id)] ??
+                SITE_TYPE_LABELS[0]}
+            </output>
           </Field>
+        </div>
+        <div className="gateway-editor">
+          <h3>Wireless gateways</h3>
+          <p className="hint">
+            Up to four wireless gateway addresses and their device counts, as
+            stored in the site record.
+          </p>
+          {[0, 1, 2, 3].map((index) => {
+            const gateway = data.site.wirelessGateways?.[index];
+            return (
+              <div className="gateway-row" key={index}>
+                <Field label={`Gateway ${index + 1} address`}>
+                  <input
+                    value={gateway?.address ?? ""}
+                    disabled={!installer}
+                    placeholder="Not configured"
+                    onChange={(event) =>
+                      updateGateway(index, { address: event.target.value })
+                    }
+                  />
+                </Field>
+                <Field label={`Gateway ${index + 1} count`}>
+                  <input
+                    type="number"
+                    min={0}
+                    value={gateway?.count ?? 0}
+                    disabled={!installer}
+                    onChange={(event) =>
+                      updateGateway(index, {
+                        count: Math.max(0, Number(event.target.value) || 0),
+                      })
+                    }
+                  />
+                </Field>
+              </div>
+            );
+          })}
         </div>
         <Toggle label="Router inbound enabled" help="Use the configured router-forwarded port for supported remote access." checked={data.site.routerInbound ?? false} disabled={!installer} onChange={(routerInbound) => updateSite({ routerInbound })} />
         <Toggle
@@ -2689,6 +3129,23 @@ export default function FlexiDimWeb() {
       </section>
     </div>
   );
+
+  const readiness = transferReadiness(data);
+  const currentImageChecksum = formatChecksum(
+    compileConfig(data).checksum,
+  ).toLowerCase();
+  const matchingComparison =
+    comparisonMatch?.localChecksum === currentImageChecksum &&
+    comparisonMatch?.controllerChecksum === currentImageChecksum &&
+    comparisonMatch?.version === "4.0";
+  const matchingPreflight =
+    transferPreflight?.state === "passed" &&
+    transferPreflight.imageChecksum?.toLowerCase() === currentImageChecksum &&
+    transferPreflight.runnerQualification?.state === "passed";
+  const visibleTransferMessage =
+    transferProgress?.message === "This takes about 60 seconds"
+      ? "Restarting Scene Controller — this takes about 60 seconds"
+      : transferProgress?.message;
 
   const configPanel = (
     <div className="content-grid config-grid">
@@ -2796,29 +3253,186 @@ export default function FlexiDimWeb() {
             </Field>
           </div>
           <div className="config-actions">
-            <button className="primary" onClick={exportConfig}>
+            {/* The primary download is the SAME format the importer accepts, so
+                import and download are a round trip. The JSON export is a
+                web-native superset kept as a secondary backup. */}
+            <button
+              className="primary"
+              title="Download this site as a .fd4cfg file — the same format the original app and this importer use."
+              onClick={exportLegacyConfig}
+            >
               Download configuration
             </button>
             <button
-              onClick={() => send({ type: "verify" })}
+              title="Back up every site, including web-only settings the .fd4cfg format cannot hold."
+              onClick={exportConfig}
+            >
+              Back up all sites (JSON)
+            </button>
+            <button
+              disabled={
+                connection !== "connected" || !capability("verify").allowed
+              }
+              title={
+                connection !== "connected"
+                  ? "Connect to the Scene Controller first."
+                  : capability("verify").reason
+              }
+              onClick={compareWithController}
             >
               Compare with Scene Controller
             </button>
             <button
-              disabled={connection !== "connected"}
-              onClick={() => {
-                send({ type: "sync", data });
-                notify("Sending configuration to the Scene Controller…");
-                updateConfiguration(activeConfiguration.id, {});
-              }}
+              disabled={
+                connection === "offline" ||
+                connection === "error" ||
+                readiness.blockers.length > 0 ||
+                transferStopped
+              }
+              title={
+                transferStopped
+                  ? "The emergency stop is latched. Restart the bridge before another offline dry run."
+                  : readiness.blockers[0] ??
+                    "Compile every outgoing byte, replay the recovered sender offline, and self-check every frame. This never writes to the controller."
+              }
+              onClick={runTransferDryRun}
+            >
+              Run offline transfer dry run
+            </button>
+            <button
+              disabled={
+                !readiness.ready ||
+                !capability("sync").allowed ||
+                connection !== "connected" ||
+                !liveWritesEnabled ||
+                !matchingComparison ||
+                !matchingPreflight ||
+                transferDialog === "running"
+              }
+              title={
+                readiness.blockers[0] ??
+                capability("sync").reason ??
+                (!matchingComparison
+                  ? "Run Compare and confirm that the firmware 4.0 Scene Controller matches this exact configuration."
+                  : !matchingPreflight
+                    ? "Run the offline transfer dry run for this exact configuration."
+                    : !liveWritesEnabled
+                      ? "The local bridge has live configuration writes disabled."
+                      : readiness.unavailableReason)
+              }
+              onClick={() => setTransferDialog("warning")}
             >
               Send configuration to Scene Controller
             </button>
           </div>
+          <div className="readiness" data-testid="transfer-readiness">
+            {/* Only things that change, or that an installer can act on. The
+                reason transfer is unavailable is a constant: it lives on the
+                disabled button and in the downloaded report, because shown here
+                permanently it read as a fault in the user's own data. */}
+            <p className="readiness-crc">
+              Checksum <code>0x{readiness.localCrc}</code>
+              <HelpTip
+                label="Checksum"
+                help="A short fingerprint of this configuration. It changes whenever the configuration changes, so you can tell two copies apart. It is not the Scene Controller's own checksum."
+              />
+            </p>
+            {comparisonState && (
+              <p className="readiness-comparison" data-testid="comparison-state">
+                <b>Controller comparison:</b> {comparisonState}
+              </p>
+            )}
+            <div className="transfer-safety" data-testid="transfer-safety">
+              <p>
+                <b>Live configuration writes:</b>{" "}
+                {liveWritesEnabled ? "enabled" : "disabled"}
+                {transferStopped ? " — emergency stop latched" : ""}
+              </p>
+              {visibleTransferMessage && <p>{visibleTransferMessage}</p>}
+              {transferPreflight && (
+                <>
+                  <p>
+                    <b>Offline dry run:</b> {transferPreflight.message}
+                  </p>
+                  {transferPreflight.state === "passed" && (
+                    <p>
+                      Image CRC <code>0x{transferPreflight.imageChecksum}</code>,
+                      {" "}{transferPreflight.imageBytes} bytes in{" "}
+                      {transferPreflight.blockCount} blocks;{" "}
+                      {transferPreflight.userCount} user payloads totaling{" "}
+                      {transferPreflight.userBytes} bytes;{" "}
+                      {transferPreflight.frameCount} validated frames.
+                    </p>
+                  )}
+                  {transferPreflight.transcriptSha256 && (
+                    <p>
+                      Transcript SHA-256{" "}
+                      <code>{transferPreflight.transcriptSha256}</code>
+                    </p>
+                  )}
+                  {transferPreflight.runnerQualification?.state === "passed" && (
+                    <p>
+                      <b>Bridge runner qualification:</b> passed offline,
+                      including the original app&apos;s reset/reconnect cycle and{" "}
+                      {transferPreflight.runnerQualification.validatedStatusRecords}{" "}
+                      validated normal status records. No controller bytes were
+                      written.
+                    </p>
+                  )}
+                  {transferPreflight.lifecycle?.length ? (
+                    <p>
+                      <b>Original-app lifecycle modeled offline:</b>{" "}
+                      {transferPreflight.lifecycle
+                        .map((message) =>
+                          message.startsWith("Downloading block ")
+                            ? message.replace(
+                                /^Downloading block \d+$/,
+                                `Downloading blocks 1–${transferPreflight.blockCount}`,
+                              )
+                            : message
+                        )
+                        .filter((message, index, all) =>
+                          index === 0 || message !== all[index - 1]
+                        )
+                        .join(" → ")}
+                    </p>
+                  ) : null}
+                  <p>
+                    Live Send requires a successful Compare from this
+                    connection within five minutes, bound to this exact image
+                    CRC, plus this exact offline dry run.
+                  </p>
+                </>
+              )}
+              <p>
+                Recovery rule: keep the current <code>.fd4cfg</code> available
+                on the iPad. If a future transfer is interrupted, stop and use
+                the original app’s restore workflow; do not retry blindly.
+              </p>
+            </div>
+            {readiness.blockers.length > 0 && (
+              <div className="readiness-blockers">
+                <h4>Fix before transferring</h4>
+                <ul>
+                  {readiness.blockers.map((blocker) => (
+                    <li key={blocker}>{blocker}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {readiness.warnings.length > 0 && (
+              <div className="readiness-warnings">
+                <h4>Review before transferring</h4>
+                <ul>
+                  {readiness.warnings.map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
           <p className="warning-copy">
-            Download saves this configuration to a file. Send transfers it to the
-            Scene Controller; the full binary transfer is handled by the local
-            bridge.
+            Hover any button for what it does.
           </p>
         </section>
       )}
@@ -2864,6 +3478,29 @@ export default function FlexiDimWeb() {
     equipmentSelection?.type === "light"
       ? data.channels.find((item) => item.id === equipmentSelection.id)
       : undefined;
+
+  // Bus A and bus B are numbered independently, so the module's number comes
+  // from its position within its OWN bus, not its position in the merged list.
+  const selectedModuleNumber = selectedEquipmentModule
+    ? controllerModuleNumber(
+        selectedEquipmentModule.bus,
+        equipmentModules
+          .filter((module) => module.bus === selectedEquipmentModule.bus)
+          .sort((left, right) => (left.position ?? 0) - (right.position ?? 0))
+          .findIndex((module) => module.id === selectedEquipmentModule.id),
+      )
+    : -1;
+
+  // Which hardware family a module belongs to was not recovered from the iOS
+  // binary, so the editor works from the default family and never rewrites an
+  // imported hardware code it does not recognise.
+  const selectedChannelFamily = channelTypeFamily(
+    selectedEquipmentLight?.typeFamily ?? DEFAULT_CHANNEL_TYPE_FAMILY,
+  );
+  const selectedChannelTypeOption = selectedChannelFamily.options.find(
+    (option) => option.hw === selectedEquipmentLight?.hardwareType,
+  );
+  const selectedChannelLoadClass = selectedChannelTypeOption?.loadClass;
 
   const equipmentPanel = (
     <div className="master-detail equipment-layout">
@@ -3065,11 +3702,7 @@ export default function FlexiDimWeb() {
                 <button
                   className="delete"
                   onClick={() =>
-                    moveToDeleted({
-                      key: `area-${selectedEquipmentArea.id}-${Date.now()}`,
-                      type: "area",
-                      item: selectedEquipmentArea,
-                    })
+                    moveToDeleted("area", selectedEquipmentArea)
                   }
                 >
                   Delete
@@ -3162,11 +3795,7 @@ export default function FlexiDimWeb() {
                 <button
                   className="delete"
                   onClick={() =>
-                    moveToDeleted({
-                      key: `module-${selectedEquipmentModule.id}-${Date.now()}`,
-                      type: "module",
-                      item: selectedEquipmentModule,
-                    })
+                    moveToDeleted("module", selectedEquipmentModule)
                   }
                 >
                   Delete
@@ -3209,6 +3838,14 @@ export default function FlexiDimWeb() {
                   {equipmentModules.map((_, index) => <option key={index} value={index}>{index + 1}</option>)}
                 </select>
               </Field>
+              <Field
+                label="Controller module number"
+                help="Bus A numbers from 1; bus B numbers from 16, so a bus can hold at most 15 modules."
+              >
+                <output className="derived-value" data-testid="module-number">
+                  {selectedModuleNumber > 0 ? selectedModuleNumber : "Unassigned"}
+                </output>
+              </Field>
               <Toggle
                 label="Turn on"
                 checked={selectedEquipmentModule.enabled}
@@ -3217,6 +3854,20 @@ export default function FlexiDimWeb() {
                   updateModule(selectedEquipmentModule.id, { enabled })
                 }
               />
+            </div>
+            {selectedEquipmentModule.pending && (
+              <p className="hint pending-profile" data-testid="module-pending">
+                This module has profile changes that have not been sent to the
+                Scene Controller.
+              </p>
+            )}
+            <div className="equipment-actions">
+              <GatedAction
+                state={capability("moduleProfiles")}
+                onClick={() => send({ type: "moduleProfiles" })}
+              >
+                Send module profile
+              </GatedAction>
             </div>
             <h3>Channel names</h3>
             <div className="module-channel-list">
@@ -3256,11 +3907,7 @@ export default function FlexiDimWeb() {
                 <button
                   className="delete"
                   onClick={() =>
-                    moveToDeleted({
-                      key: `switch-${selectedEquipmentSwitch.id}-${Date.now()}`,
-                      type: "switch",
-                      item: selectedEquipmentSwitch,
-                    })
+                    moveToDeleted("switch", selectedEquipmentSwitch)
                   }
                 >
                   Delete
@@ -3292,24 +3939,29 @@ export default function FlexiDimWeb() {
                     }
                   />
                 </Field>
-                <Field label="Switch type">
+                <Field
+                  label="Switch type"
+                  help="The physical switch face. “Not used” parks the address without deleting the switch."
+                >
                   <select
                     value={selectedEquipmentSwitch.type ?? 13}
                     disabled={!allowEquipment}
+                    data-testid="switch-type"
                     onChange={(event) => {
-                      const type = Number(event.target.value);
-                      const entry = Object.entries(SWITCH_TYPE_BY_NAME).find(([, value]) => value.type === type);
+                      const entry = switchTypeByCode(Number(event.target.value));
                       if (!entry) return;
                       updateSwitch(selectedEquipmentSwitch.id, {
-                        type,
-                        hardwareType: type,
-                        buttons: entry[1].buttons,
-                        kind: entry[0],
+                        type: entry.code,
+                        hardwareType: entry.code,
+                        buttons: entry.buttons,
+                        kind: entry.name,
                       });
                     }}
                   >
-                    {Object.entries(SWITCH_TYPE_BY_NAME).map(([name, value]) => (
-                      <option key={value.type} value={value.type}>{name}</option>
+                    {SWITCH_TYPES.map((entry) => (
+                      <option key={entry.code} value={entry.code}>
+                        {entry.name}
+                      </option>
                     ))}
                   </select>
                 </Field>
@@ -3348,9 +4000,21 @@ export default function FlexiDimWeb() {
               </div>
             </div>
             <div className="equipment-actions">
-              <button onClick={() => send({ type: "switchDetect", switch: controllerSwitchFor(selectedEquipmentSwitch) })}>Detect by button press</button>
-              <button onClick={() => send({ type: "switchTypeDetect", switch: controllerSwitchFor(selectedEquipmentSwitch) })}>Detect switch types</button>
-              <button onClick={() => pressSwitch(selectedEquipmentSwitch, 1)}>Flash button LED</button>
+              <GatedAction
+                state={capability("switchDetect")}
+                onClick={() => send({ type: "switchDetect", switch: controllerSwitchFor(selectedEquipmentSwitch) })}
+              >
+                Detect by button press
+              </GatedAction>
+              <GatedAction
+                state={capability("switchTypeDetect")}
+                onClick={() => send({ type: "switchTypeDetect", switch: controllerSwitchFor(selectedEquipmentSwitch) })}
+              >
+                Detect switch types
+              </GatedAction>
+              {/* A button press uses the verified raw switch command, so it is
+                  not gated: it replays what the controller already has. */}
+              <button onClick={() => pressSwitch(selectedEquipmentSwitch, 1)}>Press button 1</button>
             </div>
           </>
         ) : selectedEquipmentLight ? (
@@ -3364,11 +4028,7 @@ export default function FlexiDimWeb() {
                 <button
                   className="delete"
                   onClick={() =>
-                    moveToDeleted({
-                      key: `light-${selectedEquipmentLight.id}-${Date.now()}`,
-                      type: "light",
-                      item: selectedEquipmentLight,
-                    })
+                    moveToDeleted("light", selectedEquipmentLight)
                   }
                 >
                   Delete
@@ -3410,33 +4070,85 @@ export default function FlexiDimWeb() {
                   ))}
                 </select>
               </Field>
-              <Field label="Type">
+              <Field
+                label="Output type"
+                help={`${selectedChannelFamily.description}. Choosing a type stores the controller's own hardware code.`}
+              >
                 <select
-                  value={selectedEquipmentLight.kind}
+                  value={String(
+                    selectedChannelTypeOption?.displayPosition ??
+                      selectedEquipmentLight.hardwareType ??
+                      "",
+                  )}
                   disabled={!allowEquipment}
-                  onChange={(event) =>
+                  data-testid="channel-output-type"
+                  onChange={(event) => {
+                    const option = selectedChannelFamily.options.find(
+                      (candidate) =>
+                        String(candidate.displayPosition) === event.target.value,
+                    );
+                    if (!option) return;
+                    // The stored hardware code is what the controller and the
+                    // archive care about; `kind` and `dimmable` follow from it
+                    // so the three can never disagree.
                     updateChannel(selectedEquipmentLight.id, {
-                      kind: event.target.value,
-                    })
-                  }
+                      hardwareType: option.hw,
+                      kind: option.name,
+                      dimmable: option.loadClass === "dimmable",
+                      hardwareChanged: true,
+                    });
+                  }}
                 >
-                  {CHANNEL_TYPE_NAMES.map((name) => <option key={name}>{name}</option>)}
+                  {selectedChannelTypeOption === undefined && (
+                    <option value="">
+                      {selectedEquipmentLight.hardwareType === undefined
+                        ? "Not set"
+                        : `Stored code ${selectedEquipmentLight.hardwareType} — not in this family`}
+                    </option>
+                  )}
+                  {selectedChannelFamily.options.map((option) => (
+                    <option
+                      key={option.displayPosition}
+                      value={String(option.displayPosition)}
+                    >
+                      {option.name}
+                    </option>
+                  ))}
                 </select>
               </Field>
-              <Field label="Accessory module">
+              {selectedChannelFamily.nameBindingVerified === false && (
+                <p className="hint">
+                  This module family&apos;s type labels are not yet confirmed
+                  against the original app; the stored hardware code is
+                  preserved exactly as imported.
+                </p>
+              )}
+              <Field
+                label="Accessory type"
+                help="Only meaningful for an accessory output. The original app offers exactly these two."
+              >
                 <select
-                  value={selectedEquipmentLight.accessoryModule ?? "None"}
-                  disabled={!allowEquipment}
+                  value={String(selectedEquipmentLight.accessoryType ?? "")}
+                  disabled={
+                    !allowEquipment || selectedChannelLoadClass !== "accessory"
+                  }
+                  data-testid="channel-accessory-type"
                   onChange={(event) =>
                     updateChannel(selectedEquipmentLight.id, {
-                      accessoryModule: event.target.value,
+                      accessoryType:
+                        event.target.value === ""
+                          ? undefined
+                          : Number(event.target.value),
+                      hardwareChanged: true,
                     })
                   }
                 >
-                  <option>None</option>
-                  <option>Automated search</option>
-                  <option>Blind controller</option>
-                  <option>DALI interface</option>
+                  <option value="">Not set</option>
+                  {ACCESSORY_TYPE_NAMES.map((name, index) => (
+                    <option key={name} value={String(index)}>
+                      {name}
+                    </option>
+                  ))}
                 </select>
               </Field>
               <Field label="Minimum">
@@ -3501,14 +4213,41 @@ export default function FlexiDimWeb() {
               the connected driver or load.
             </p>
             <div className="equipment-actions">
+              {/* Toggle and flash are ordinary verified dim commands. */}
               <button onClick={() => setChannelLevel(selectedEquipmentLight.id, selectedEquipmentLight.level ? 0 : 100)}>Toggle</button>
               <button onClick={() => flashChannel(selectedEquipmentLight)}>Flash channel</button>
-              <button onClick={() => send({ type: "channelProfile", channel: controllerChannelFor(selectedEquipmentLight.id) })}>Send configuration changes</button>
-              {/blind/i.test(selectedEquipmentLight.kind) && (
+              <GatedAction
+                state={capability("channelSearch")}
+                onClick={() => send({ type: "channelSearch", channel: controllerChannelFor(selectedEquipmentLight.id) })}
+              >
+                Search for this channel
+              </GatedAction>
+              <GatedAction
+                state={capability("channelProfile")}
+                onClick={() => send({ type: "channelProfile", channel: controllerChannelFor(selectedEquipmentLight.id) })}
+              >
+                Send configuration changes
+              </GatedAction>
+              {isBlindControl(selectedEquipmentLight.accessoryType) && (
                 <>
-                  <button onClick={() => send({ type: "blind", channel: controllerChannelFor(selectedEquipmentLight.id), action: "open" })}>Open blind</button>
-                  <button onClick={() => send({ type: "blind", channel: controllerChannelFor(selectedEquipmentLight.id), action: "toggle" })}>Toggle blind</button>
-                  <button onClick={() => send({ type: "blind", channel: controllerChannelFor(selectedEquipmentLight.id), action: "close" })}>Close blind</button>
+                  <GatedAction
+                    state={capability("blind")}
+                    onClick={() => send({ type: "blind", channel: controllerChannelFor(selectedEquipmentLight.id), action: "open" })}
+                  >
+                    Open blind
+                  </GatedAction>
+                  <GatedAction
+                    state={capability("blind")}
+                    onClick={() => send({ type: "blind", channel: controllerChannelFor(selectedEquipmentLight.id), action: "toggle" })}
+                  >
+                    Toggle blind
+                  </GatedAction>
+                  <GatedAction
+                    state={capability("blind")}
+                    onClick={() => send({ type: "blind", channel: controllerChannelFor(selectedEquipmentLight.id), action: "close" })}
+                  >
+                    Close blind
+                  </GatedAction>
                 </>
               )}
             </div>
@@ -3683,9 +4422,11 @@ export default function FlexiDimWeb() {
                             ? {
                                 ...s,
                                 kind: e.target.value,
-                                type: SWITCH_TYPE_BY_NAME[e.target.value]?.type,
+                                type: switchTypeByName(e.target.value)?.code,
+                                hardwareType: switchTypeByName(e.target.value)
+                                  ?.code,
                                 buttons:
-                                  SWITCH_TYPE_BY_NAME[e.target.value]?.buttons ??
+                                  switchTypeByName(e.target.value)?.buttons ??
                                   s.buttons,
                               }
                             : s,
@@ -3693,10 +4434,9 @@ export default function FlexiDimWeb() {
                       }))
                     }
                   >
-                    <option>4 scene</option>
-                    <option>8 scene</option>
-                    <option>2 channel opto</option>
-                    <option>8 channel opto</option>
+                    {SWITCH_TYPES.map((entry) => (
+                      <option key={entry.code}>{entry.name}</option>
+                    ))}
                   </select>
                 </Field>
               </div>
@@ -3926,14 +4666,14 @@ export default function FlexiDimWeb() {
                       ＋ Add channels
                     </button>
                     <button
-                      title="Change the order in which assigned channels appear and are processed."
+                      title="Change the order assigned channels are compiled in. The controller processes them in exactly this order."
                       className={orderingBasicChannels ? "active" : ""}
                       onClick={() => {
                         setOrderingBasicChannels((ordering) => !ordering);
                         setShowBasicChannelPicker(false);
                       }}
                     >
-                      ↕ Adjust order
+                      ↕ Adjust compiled order
                     </button>
                     <button
                       title="Assign every light in this room to the selected switch."
@@ -4129,45 +4869,28 @@ export default function FlexiDimWeb() {
                       }
                     />
                     <div className="basic-priority-options">
-                      <label title="Give this channel's On command priority over lower-priority state changes.">
+                      {/* The archive stores ONE `op` (onOffPri) per switch, not
+                          a pair of per-channel flags. Presenting it once here is
+                          what the original app's data model actually supports;
+                          two independent per-channel toggles implied a
+                          precision the controller never receives. */}
+                      <label title="Whether this switch's basic assignment acts with on/off priority. Applies to every channel assigned to the switch.">
                         <input
                           type="checkbox"
-                          checked={selectedBasicChannelSettings.onPriority}
+                          data-testid="switch-on-off-priority"
+                          checked={onOffPriority(currentBasicSwitch)}
                           disabled={!installer}
                           onChange={(event) =>
-                            updateBasicChannelSettings(
-                              currentBasicSwitch.id,
-                              selectedBasicChannel.id,
-                              { onPriority: event.target.checked },
-                            )
+                            updateSwitchBasic(currentBasicSwitch.id, {
+                              onPriority: event.target.checked,
+                            })
                           }
                         />
                         <span className="option-label">
-                          On priority
+                          On/off priority (whole switch)
                           <HelpTip
-                            label="On priority"
-                            help="Give this channel's On command priority over lower-priority state changes."
-                          />
-                        </span>
-                      </label>
-                      <label title="Give this channel's Off command priority over lower-priority state changes.">
-                        <input
-                          type="checkbox"
-                          checked={selectedBasicChannelSettings.offPriority}
-                          disabled={!installer}
-                          onChange={(event) =>
-                            updateBasicChannelSettings(
-                              currentBasicSwitch.id,
-                              selectedBasicChannel.id,
-                              { offPriority: event.target.checked },
-                            )
-                          }
-                        />
-                        <span className="option-label">
-                          Off priority
-                          <HelpTip
-                            label="Off priority"
-                            help="Give this channel's Off command priority over lower-priority state changes."
+                            label="On/off priority"
+                            help="A single setting for the switch, stored as the archive's `op` field. It applies to every channel in this switch's basic assignment."
                           />
                         </span>
                       </label>
@@ -4259,6 +4982,12 @@ export default function FlexiDimWeb() {
         kelvin: undefined,
       })
     : undefined;
+  // Colour capability comes from the channel's archived output type, not from
+  // whether colour data happens to be present.
+  const selectedSceneChannelSupportsColour = channelSupportsColour(
+    selectedSceneChannel?.hardwareType,
+    selectedSceneChannel?.typeFamily,
+  );
   const sceneFadeTimes = [0, 0.5, 1, 1.5, 2, 2.5, 3, 5, 10, 15, 30, 60];
   const currentSceneTimerMode = currentScene?.nextSceneMode ?? -1;
   const currentSceneTimerValue = Math.max(0, currentScene?.nextSceneTime ?? 0);
@@ -4429,6 +5158,24 @@ export default function FlexiDimWeb() {
                 <small>SCENE GROUP</small>
                 <h2>{editingSceneGroup.name}</h2>
               </div>
+              {installer && (
+                <div className="button-row compact scene-order-actions">
+                  <button
+                    title="Move this group earlier among its siblings."
+                    data-testid="group-move-up"
+                    onClick={() => reorderSceneGroup(editingSceneGroup.id, -1)}
+                  >
+                    ↑
+                  </button>
+                  <button
+                    title="Move this group later among its siblings."
+                    data-testid="group-move-down"
+                    onClick={() => reorderSceneGroup(editingSceneGroup.id, 1)}
+                  >
+                    ↓
+                  </button>
+                </div>
+              )}
             </div>
             <div className="scene-group-editor">
               <Field label="Group name" help="The full floor or area name shown in Configuration.">
@@ -4476,8 +5223,69 @@ export default function FlexiDimWeb() {
               <button className="primary" onClick={() => runScene(currentScene)} disabled={connection !== "connected"}>
                 Run scene
               </button>
-              {installer && <button className="delete" onClick={() => moveSceneToDeleted(currentScene)}>Delete</button>}
+              {installer && (
+                <div className="button-row compact scene-order-actions">
+                  <button
+                    title="Move this scene earlier in its group. The order is the scene list's display rank."
+                    data-testid="scene-move-up"
+                    onClick={() => reorderScene(currentScene.id, -1)}
+                  >
+                    ↑
+                  </button>
+                  <button
+                    title="Move this scene later in its group."
+                    data-testid="scene-move-down"
+                    onClick={() => reorderScene(currentScene.id, 1)}
+                  >
+                    ↓
+                  </button>
+                </div>
+              )}
+              {/* Deleting is blocked while locked, exactly as editing is. */}
+              {installer && (
+                <button
+                  className="delete"
+                  disabled={sceneIsLocked(currentScene)}
+                  title={sceneIsLocked(currentScene) ? "Unlock this scene before deleting it." : undefined}
+                  onClick={() => moveSceneToDeleted(currentScene)}
+                >
+                  Delete
+                </button>
+              )}
             </div>
+            <Toggle
+              label="Locked (read-only)"
+              help="A locked scene can be run but not edited, matching the archive's lock flag. Unlock it to make changes."
+              checked={sceneIsLocked(currentScene)}
+              disabled={!installer}
+              onChange={(locked) => updateScene(currentScene.id, { locked })}
+            />
+            {sceneIsLocked(currentScene) && (
+              <p className="hint" data-testid="scene-locked-note">
+                This scene is locked; its settings are read-only until you unlock
+                it.
+              </p>
+            )}
+            {sceneAffectedSwitches.length > 0 && (
+              <p className="hint" data-testid="scene-affected-switches">
+                Affected switches:{" "}
+                {sceneAffectedSwitches
+                  .map(
+                    (entry) =>
+                      `${entry.wallSwitch.name} (button ${entry.buttons.join(", ")})`,
+                  )
+                  .join("; ")}
+              </p>
+            )}
+            {sceneUnknownFlagBits > 0 && (
+              <p className="hint" data-testid="scene-unknown-flags">
+                This scene carries flag bits (0x
+                {sceneUnknownFlagBits.toString(16)}) whose meaning has not been
+                recovered from the original app. They are preserved exactly as
+                imported. The {UNRECOVERED_SCENE_FLAGS.join(" and ")} toggles are
+                not offered because their bit positions are unverified.
+              </p>
+            )}
             <div className="scene-identity-grid">
               <Field label="Scene name" help="The full name of this scene.">
                 <input
@@ -4564,31 +5372,51 @@ export default function FlexiDimWeb() {
                         }}
                       />
                     </Field>
-                    <Field label="Colour" help="RGB scene colour for compatible DMX, DALI or colour accessories.">
-                      <div className="scene-colour-control">
-                        <img src="/flexidim/colorwheel.png" alt="Colour wheel" />
-                        <input
-                          type="color"
-                          disabled={!installer}
-                          value={`#${[selectedSceneChannelSettings.color?.red ?? 255, selectedSceneChannelSettings.color?.green ?? 255, selectedSceneChannelSettings.color?.blue ?? 255].map((value) => value.toString(16).padStart(2, "0")).join("")}`}
-                          onChange={(event) => {
-                            const value = event.target.value;
-                            updateSceneChannel(currentScene.id, selectedSceneChannel.id, {
-                              color: {
-                                red: Number.parseInt(value.slice(1, 3), 16),
-                                green: Number.parseInt(value.slice(3, 5), 16),
-                                blue: Number.parseInt(value.slice(5, 7), 16),
-                              },
-                            });
-                          }}
-                        />
-                      </div>
-                    </Field>
-                    <Field label={`Tunable white: ${selectedSceneChannelSettings.kelvin ?? 4000} K`} help="Colour temperature for compatible tunable-white channels.">
-                      <input type="range" min="2000" max="6500" step="50" disabled={!installer} value={selectedSceneChannelSettings.kelvin ?? 4000} onChange={(event) => updateSceneChannel(currentScene.id, selectedSceneChannel.id, { kelvin: Number(event.target.value) })} />
-                    </Field>
-                    {(selectedSceneChannelSettings.color || selectedSceneChannelSettings.kelvin) && (
-                      <p className="hint">Colour settings are preserved in the configuration. Live colour transmission remains unavailable until its controller command is verified.</p>
+                    {/* Colour and Kelvin only exist on fixtures the archived
+                        channel type can actually address: a DMX address or DALI
+                        group. A phase-control or relay output has intensity and
+                        nothing else, so offering a colour wheel there would
+                        invent a capability. */}
+                    {selectedSceneChannelSupportsColour ? (
+                      <>
+                        <Field label="Colour" help="RGB scene colour for this DMX or DALI channel.">
+                          <div className="scene-colour-control">
+                            <img src="/flexidim/colorwheel.png" alt="Colour wheel" />
+                            <input
+                              type="color"
+                              disabled={!installer}
+                              data-testid="scene-channel-colour"
+                              value={`#${[selectedSceneChannelSettings.color?.red ?? 255, selectedSceneChannelSettings.color?.green ?? 255, selectedSceneChannelSettings.color?.blue ?? 255].map((value) => value.toString(16).padStart(2, "0")).join("")}`}
+                              onChange={(event) => {
+                                const value = event.target.value;
+                                updateSceneChannel(currentScene.id, selectedSceneChannel.id, {
+                                  color: {
+                                    red: Number.parseInt(value.slice(1, 3), 16),
+                                    green: Number.parseInt(value.slice(3, 5), 16),
+                                    blue: Number.parseInt(value.slice(5, 7), 16),
+                                  },
+                                });
+                              }}
+                            />
+                          </div>
+                        </Field>
+                        <Field label={`Tunable white: ${selectedSceneChannelSettings.kelvin ?? 4000} K`} help="Colour temperature for this channel.">
+                          <input type="range" min="2000" max="6500" step="50" disabled={!installer} value={selectedSceneChannelSettings.kelvin ?? 4000} onChange={(event) => updateSceneChannel(currentScene.id, selectedSceneChannel.id, { kelvin: Number(event.target.value) })} />
+                        </Field>
+                        <p className="hint">
+                          Colour settings are stored in the configuration. Live
+                          colour transmission stays unavailable until its
+                          controller command is verified.
+                        </p>
+                      </>
+                    ) : (
+                      (selectedSceneChannelSettings.color || selectedSceneChannelSettings.kelvin) && (
+                        <p className="hint" data-testid="scene-colour-unsupported">
+                          This channel&apos;s output type does not address a
+                          colour-capable fixture, but colour settings imported
+                          for it are preserved rather than discarded.
+                        </p>
+                      )
                     )}
                     <Field label="Fade time" help="How long this channel takes to reach its scene brightness.">
                       <select
@@ -5179,74 +6007,63 @@ export default function FlexiDimWeb() {
         <div className="card-title">
           <div>
             <small>PERIODS</small>
-            <h2>Lighting schedule periods</h2>
+            <h2>Periods</h2>
           </div>
-          <button
-            className="primary"
-            disabled={!installer}
-            onClick={() =>
-              setData((old) => ({
-                ...old,
-                periods: [
-                  ...old.periods,
-                  {
-                    id: newId(old.periods),
-                    name: "New period",
-                    start: "08:00",
-                    end: "18:00",
-                    days: dayNames,
-                    enabled: true,
-                    startMode: 4,
-                    endMode: 4,
-                  },
-                ],
-              }))
-            }
-          >
-            ＋ New period
-          </button>
+        </div>
+        <div className="period-columns" aria-hidden="true">
+          <span>Period name</span>
+          <span>From</span>
+          <span>To</span>
         </div>
         <div className="period-list">
           {data.periods.map((period) => (
-            <div key={period.id} className={period.enabled ? "" : "disabled"}>
-              <button
-                className={`period-power ${period.enabled ? "on" : ""}`}
-                disabled={!installer}
-                onClick={() =>
-                  setData((old) => ({
-                    ...old,
-                    periods: old.periods.map((p) =>
-                      p.id === period.id ? { ...p, enabled: !p.enabled } : p,
-                    ),
-                  }))
-                }
-              >
-                ●
-              </button>
+            <div
+              key={period.id}
+              className={period.name.trim() ? "period-active" : "period-empty"}
+            >
+              <span className="period-number">{period.id}</span>
               <input
                 className="period-name"
+                aria-label={`Period ${period.id} name`}
                 value={period.name}
                 disabled={!installer}
                 onChange={(e) =>
                   setData((old) => ({
                     ...old,
                     periods: old.periods.map((p) =>
-                      p.id === period.id ? { ...p, name: e.target.value } : p,
+                      p.id === period.id
+                        ? e.target.value
+                          ? { ...p, name: e.target.value }
+                          : {
+                              ...p,
+                              name: "",
+                              start: "00:00",
+                              end: "00:00",
+                              startMode: 0,
+                              endMode: 0,
+                            }
+                        : p,
                     ),
                   }))
                 }
               />
-              <label>
-                From{" "}
-                <select value={period.startMode ?? 4} disabled={!installer} onChange={(event) => setData((old) => ({
-                  ...old, periods: old.periods.map((item) => item.id === period.id ? { ...item, startMode: Number(event.target.value) } : item),
-                }))}>
+              <div className="period-boundary">
+                <select
+                  aria-label={`Period ${period.id} from mode`}
+                  value={period.name.trim() ? (period.startMode ?? 0) : ""}
+                  disabled={!installer || !period.name.trim()}
+                  onChange={(event) => setData((old) => ({
+                    ...old, periods: old.periods.map((item) => item.id === period.id ? { ...item, startMode: Number(event.target.value) } : item),
+                  }))}
+                >
+                  <option value=""></option>
                   {periodModes.map((mode, index) => <option key={mode} value={index}>{mode}</option>)}
                 </select>
                 <input
                   type="time"
-                  value={period.start}
-                  disabled={!installer}
+                  aria-label={`Period ${period.id} from time`}
+                  value={period.name.trim() ? period.start : ""}
+                  disabled={!installer || !period.name.trim()}
                   onChange={(e) =>
                     setData((old) => ({
                       ...old,
@@ -5258,18 +6075,24 @@ export default function FlexiDimWeb() {
                     }))
                   }
                 />
-              </label>
-              <label>
-                To{" "}
-                <select value={period.endMode ?? 4} disabled={!installer} onChange={(event) => setData((old) => ({
-                  ...old, periods: old.periods.map((item) => item.id === period.id ? { ...item, endMode: Number(event.target.value) } : item),
-                }))}>
+              </div>
+              <div className="period-boundary">
+                <select
+                  aria-label={`Period ${period.id} to mode`}
+                  value={period.name.trim() ? (period.endMode ?? 0) : ""}
+                  disabled={!installer || !period.name.trim()}
+                  onChange={(event) => setData((old) => ({
+                    ...old, periods: old.periods.map((item) => item.id === period.id ? { ...item, endMode: Number(event.target.value) } : item),
+                  }))}
+                >
+                  <option value=""></option>
                   {periodModes.map((mode, index) => <option key={mode} value={index}>{mode}</option>)}
                 </select>
                 <input
                   type="time"
-                  value={period.end}
-                  disabled={!installer}
+                  aria-label={`Period ${period.id} to time`}
+                  value={period.name.trim() ? period.end : ""}
+                  disabled={!installer || !period.name.trim()}
                   onChange={(e) =>
                     setData((old) => ({
                       ...old,
@@ -5279,51 +6102,40 @@ export default function FlexiDimWeb() {
                     }))
                   }
                 />
-              </label>
-              <div className="mini-days">
-                {dayNames.map((day) => (
-                  <button
-                    key={day}
-                    disabled={!installer}
-                    className={period.days.includes(day) ? "active" : ""}
-                    onClick={() =>
-                      setData((old) => ({
-                        ...old,
-                        periods: old.periods.map((p) =>
-                          p.id === period.id
-                            ? {
-                                ...p,
-                                days: p.days.includes(day)
-                                  ? p.days.filter((d) => d !== day)
-                                  : [...p.days, day],
-                              }
-                            : p,
-                        ),
-                      }))
-                    }
-                  >
-                    {day[0]}
-                  </button>
-                ))}
               </div>
-              <button
-                className="delete"
-                disabled={!installer}
-                onClick={() =>
-                  setData((old) => ({
-                    ...old,
-                    ...deleteConfigEntity(
-                      snapshotContent(old),
-                      "period",
-                      period.id,
-                    ),
-                  }))
-                }
-              >
-                Delete
-              </button>
             </div>
           ))}
+        </div>
+        <div className="state-flags-section">
+          <h3>State Flags</h3>
+          <div className="state-flag-grid">
+            {(data.stateFlags ?? []).map((stateFlag) => (
+              <label key={stateFlag.id}>
+                <span>{stateFlag.id}</span>
+                <input
+                  aria-label={`State flag ${stateFlag.id}`}
+                  value={stateFlag.name}
+                  disabled={!installer}
+                  placeholder="enter a name to activate a state flag"
+                  onChange={(event) =>
+                    setData((old) => ({
+                      ...old,
+                      stateFlags: (old.stateFlags ?? []).map((item) =>
+                        item.id === stateFlag.id
+                          ? { ...item, name: event.target.value }
+                          : item,
+                      ),
+                    }))
+                  }
+                />
+              </label>
+            ))}
+          </div>
+          <p className="hint state-flag-help">
+            State Flags can be set or cleared by Scenes and then used by other
+            Scenes (in the same way as Periods) to determine whether a Scene
+            should run.
+          </p>
         </div>
       </section>
     </div>
@@ -5618,6 +6430,14 @@ export default function FlexiDimWeb() {
 
   return (
     <main className="app-shell">
+      {storageState === "unavailable" && (
+        <div className="storage-banner" role="alert" data-testid="storage-banner">
+          <b>Changes are not being saved.</b> Server storage is unavailable, so
+          edits and imports exist only in this browser tab and will be lost when
+          it closes. Reconnect the server, then reload before making further
+          changes.
+        </div>
+      )}
       <header className="topbar">
         <button className="brand" onClick={() => setTab("Sites")}>
           <span className="brand-mark">
@@ -5683,6 +6503,86 @@ export default function FlexiDimWeb() {
         </div>
         {panels[tab]}
       </section>
+      {transferDialog !== "closed" && (
+        <div className="transfer-dialog-overlay">
+          <div
+            className="transfer-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="transfer-dialog-title"
+          >
+            {transferDialog === "warning" ? (
+              <>
+                <h2 id="transfer-dialog-title">
+                  Ready to send configuration to Scene Controller
+                </h2>
+                <p>
+                  Continuing will suspend operation of the switches until the
+                  new configuration is completely downloaded.
+                </p>
+                <p>
+                  The lighting system will also reset which, depending on the
+                  new configuration, may result in light levels changing or
+                  going off.
+                </p>
+                <p>The download process will take several minutes.</p>
+                <div className="transfer-dialog-actions">
+                  <button onClick={() => setTransferDialog("closed")}>
+                    Cancel
+                  </button>
+                  <button className="primary" onClick={beginLiveTransfer}>
+                    Continue
+                  </button>
+                </div>
+              </>
+            ) : transferDialog === "running" ? (
+              <>
+                <h2 id="transfer-dialog-title">
+                  Send configuration to Scene Controller
+                </h2>
+                <p className="transfer-phase">
+                  {visibleTransferMessage ?? "Connecting to Scene Controller"}
+                </p>
+                {transferProgress?.blockNumber &&
+                  transferPreflight?.blockCount && (
+                    <>
+                      <progress
+                        aria-label="Configuration download progress"
+                        max={transferPreflight.blockCount}
+                        value={transferProgress.blockNumber}
+                      />
+                      <p className="transfer-count">
+                        Block {transferProgress.blockNumber} of{" "}
+                        {transferPreflight.blockCount}
+                      </p>
+                    </>
+                  )}
+              </>
+            ) : (
+              <>
+                <h2 id="transfer-dialog-title">
+                  {transferResult?.state === "completed"
+                    ? "Download completed successfully"
+                    : "Configuration transfer stopped"}
+                </h2>
+                <p>
+                  {transferResult?.state === "completed"
+                    ? "Scene controller running normally"
+                    : transferResult?.message}
+                </p>
+                <div className="transfer-dialog-actions">
+                  <button
+                    className="primary"
+                    onClick={() => setTransferDialog("closed")}
+                  >
+                    OK
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
       <footer>
         <span>FlexiDim Web</span>
         <span>Configuration saves automatically</span>

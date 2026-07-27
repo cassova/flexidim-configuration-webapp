@@ -3,12 +3,18 @@
 Tools to capture the **real** socket traffic between the FlexiDim iOS app and a
 Scene Controller, decode it, and debug the webapp against it.
 
+The app-side compiler and transfer oracle is documented separately in
+[`oracle/README.md`](oracle/README.md). It explains how original-iOS behavior is
+turned into sanitized, repeatable regression fixtures without requiring the
+decrypted app in CI.
+
 | File | What it does |
 | --- | --- |
 | `flexidim-trace.js` | Frida script — runs the real `.ipa` on a jailbroken iPad and logs + decodes every byte it sends/receives. |
 | `decode.mjs` | Standalone FlexiDim protocol decoder. Decodes a hex string or a `.pcap`. Also used by the emulator. |
 | `controller-emulator.mjs` | Fake Scene Controller — debug the webapp/bridge with no hardware. |
 | `controller-probe.mjs` | One-socket, zero-or-one-frame probe for isolating controller disconnects without the web app. |
+| `oracle/` | Original-app oracle documentation, public synthetic evidence, and strict transfer emulation. |
 
 ## Why a packet trace on the router is empty
 
@@ -52,13 +58,13 @@ frida -U -f com.jclighting.flexidimconfig -l tools/flexidim-trace.js --no-pause 
 Then in the app: connect to the controller and send a dim / switch command.
 You'll see, per frame:
 ```
-[12:01:03.412] ⇢ connect() fd7 → 192.168.178.42:15273
+[12:01:03.412] ⇢ connect() fd7 → 192.168.77.42:15273
 [12:01:03.550] ·· -[JCLAppDelegate sendDiMessage:brightness:transition:]  channel=5 level=100 fade=2
-[12:01:03.551] → TX 192.168.178.42:15273  (8 bytes)
+[12:01:03.551] → TX 192.168.77.42:15273  (8 bytes)
   hex : ff f3 04 05 64 02 b9 e2
   txt : ........
   ►►► DIM channel=5 level=100% fade=2  | crc OK
-[12:01:03.590] ← RX 192.168.178.42:15273  (N bytes)   <-- the controller's reply
+[12:01:03.590] ← RX 192.168.77.42:15273  (N bytes)   <-- the controller's reply
 ```
 The **TX** line is the wire-level ground truth. RX lines show whether the
 controller replies. A type-0 local session must send the 23-byte authentication
