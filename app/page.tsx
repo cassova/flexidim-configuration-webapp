@@ -1182,35 +1182,58 @@ export default function FlexiDimWeb() {
     else addTrace("Command not sent — local bridge is offline", "warn");
   };
 
-  const connect = () => {
+  /**
+   * Open the bridge session and ask it for a controller connection.
+   *
+   * `auto` is the attempt the page makes for itself once the saved
+   * configuration has loaded. It is deliberately quieter than a pressed
+   * Connect: an unconfigured or misconfigured site is a normal state on a
+   * fresh install, so it is traced rather than toasted, does not throw the
+   * user onto the Sites tab, and leaves the status pill offline instead of
+   * showing a failure nobody asked for.
+   */
+  const connect = ({ auto = false }: { auto?: boolean } = {}) => {
+    /** Report a reason not to connect, unless this was the page's own attempt. */
+    const refuse = (message: string, markFailed = true) => {
+      if (auto) {
+        addTrace(`Automatic connection skipped — ${message}`);
+        // A refusal after the optimistic "connecting" state must not leave the
+        // pill spinning on a session that was never opened.
+        setConnection((state) => (state === "connecting" ? "offline" : state));
+        return;
+      }
+      if (markFailed) setConnection("error");
+      notify(message, "warn");
+    };
     if (!storageLoaded) {
-      notify("The saved configuration is still loading; try Connect again in a moment", "warn");
+      refuse(
+        "The saved configuration is still loading; try Connect again in a moment",
+        false,
+      );
       return;
     }
     if (!validControllerSecurityCode(data.site.securityCode)) {
-      setTab("Sites");
-      setConnection("error");
-      notify("Enter the controller's 16-character ASCII security code in Sites → Network & Remote before connecting", "warn");
+      if (!auto) setTab("Sites");
+      refuse("Enter the controller's 16-character ASCII security code in Sites → Network & Remote before connecting");
       return;
     }
     let controllerRequest;
     try {
       controllerRequest = controllerConnectionRequest(data.site);
     } catch (error) {
-      setConnection("error");
-      notify(
+      refuse(
         error instanceof Error ? error.message : "Invalid controller connection settings",
-        "warn",
       );
       return;
     }
     socket.current?.close();
     setConnection("connecting");
-    notify(
+    const attempt =
       controllerRequest.type === "discover"
         ? `Searching the local network for a Scene Controller on port ${controllerRequest.port}…`
-        : `Connecting to the Scene Controller at ${controllerRequest.host}:${controllerRequest.port}…`,
-    );
+        : `Connecting to the Scene Controller at ${controllerRequest.host}:${controllerRequest.port}…`;
+    if (auto) addTrace(attempt);
+    else notify(attempt);
     let bridgeUrl: URL;
     try {
       const configuredBridgeUrl = (data.site.bridgeUrl || "").trim();
@@ -1225,8 +1248,7 @@ export default function FlexiDimWeb() {
       if (bridgeUrl.protocol === "https:") bridgeUrl.protocol = "wss:";
       if (!/^wss?:$/.test(bridgeUrl.protocol)) throw new Error();
     } catch {
-      notify("Enter a valid ws:// or wss:// bridge address", "warn");
-      setConnection("error");
+      refuse("Enter a valid ws:// or wss:// bridge address");
       return;
     }
     if (data.site.bridgeToken) bridgeUrl.searchParams.set("token", data.site.bridgeToken);
@@ -1343,7 +1365,12 @@ export default function FlexiDimWeb() {
     };
     ws.onerror = () => {
       setConnection("error");
-      notify("The connection to the local bridge was lost", "warn");
+      const message = "The connection to the local bridge was lost";
+      // The status pill already reads "Connection failed"; an unprompted
+      // attempt should not also throw a toast at someone who has just opened
+      // the page.
+      if (auto) addTrace(message, "warn");
+      else notify(message, "warn");
     };
     ws.onclose = () => {
       if (
@@ -1354,6 +1381,7 @@ export default function FlexiDimWeb() {
       setConnection((state) => (state === "error" ? state : "offline"));
     };
   };
+
 
   // A range slider fires onChange on every pixel of a drag. Transmitting a
   // packet per tick floods the Scene Controller, which drops the connection, so
@@ -1531,6 +1559,28 @@ export default function FlexiDimWeb() {
         : old.configurations;
       return { ...old, site: updated, sites, configurations };
     });
+
+  /**
+   * Try to reach the Scene Controller as soon as the page has its saved site.
+   *
+   * The controller address, port and security code all come from storage, so
+   * this cannot run before the workspace has loaded. It is attempted once per
+   * page load: after that, reconnecting is the Connect button's job, and a
+   * silent retry loop would keep re-opening a session the user may have closed
+   * on purpose.
+   *
+   * It sits below `connect` and everything `connect` reaches — notably
+   * `updateSite`, which a discovery reply calls — because a hook may not run
+   * ahead of the declarations it depends on.
+   */
+  const autoConnectAttempted = useRef(false);
+  useEffect(() => {
+    if (!storageLoaded || autoConnectAttempted.current) return;
+    autoConnectAttempted.current = true;
+    connect({ auto: true });
+    // Only the first load matters, and `connect` reads current state directly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storageLoaded]);
 
   /**
    * Resolves a controller action against the profile the bridge announced. Before
@@ -2867,7 +2917,11 @@ export default function FlexiDimWeb() {
               onChange={(e) => updateSite({ port: Number(e.target.value) })}
             />
           </Field>
-          <button className="primary" disabled={!storageLoaded} onClick={connect}>
+          <button
+            className="primary"
+            disabled={!storageLoaded}
+            onClick={() => connect()}
+          >
             {connection === "connected" ? "Reconnect" : "Connect"}
           </button>
         </div>
@@ -6457,7 +6511,7 @@ export default function FlexiDimWeb() {
         <button
           className={`connection-chip ${connection}`}
           disabled={!storageLoaded}
-          onClick={connect}
+          onClick={() => connect()}
         >
           <i />
           {connectionLabel}

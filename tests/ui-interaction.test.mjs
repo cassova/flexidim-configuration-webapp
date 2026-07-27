@@ -23,9 +23,17 @@ import {
  */
 
 /** Mount the page and return handles for driving it. */
-async function mount({ serverDown = false } = {}) {
+async function mount({ serverDown = false, savedSite } = {}) {
   const dom = installDom();
   if (serverDown) dom.failFetch.value = true;
+  // A previously saved configuration, as a returning user's browser holds it.
+  // The page adopts it at startup, so this is how a test gets a mount that
+  // already knows a controller address and security code.
+  if (savedSite)
+    dom.window.localStorage.setItem(
+      "flexidim-web-data",
+      JSON.stringify(savedSite),
+    );
   const { createRoot } = await import("react-dom/client");
   const React = await import("react");
   const { act } = await import("react");
@@ -691,6 +699,72 @@ test("importing with no reachable server is refused outright", async () => {
 
 
 
+
+test("opening the app connects to the Scene Controller on its own", async () => {
+  const { buildGoldenAppData } = await import("./golden-app-data.mjs");
+  const saved = buildGoldenAppData();
+  const ui = await mount({ savedSite: saved });
+  try {
+    const ws = ui.dom.sockets.at(-1);
+    assert.ok(ws, "opening the page should open the bridge WebSocket by itself");
+    assert.match(String(ws.url), /\/bridge/);
+
+    // The bridge only learns which controller to reach once the socket opens.
+    const { act } = await import("react");
+    await act(async () => {
+      ws.readyState = ws.constructor.OPEN;
+      ws.onopen();
+    });
+    await settle(3);
+    const request = JSON.parse(ws.sent.at(-1));
+    assert.ok(
+      request.type === "discover" || request.type === "connect",
+      `unexpected startup request ${request.type}`,
+    );
+    assert.equal(request.securityCode, saved.site.securityCode);
+
+    await act(async () => {
+      ws.onmessage({
+        data: JSON.stringify({
+          type: "status",
+          state: "connected",
+          message: "Authenticated with Scene Controller",
+        }),
+      });
+    });
+    await settle(3);
+    assert.ok(
+      byText(ui.host, "button.connection-chip", "^Connected$").length > 0,
+      "the header should report the automatic connection",
+    );
+  } finally {
+    ui.cleanup();
+  }
+});
+
+test("an unconfigured site is not nagged about at startup", async () => {
+  const ui = await mount();
+  try {
+    assert.equal(
+      ui.dom.sockets.length,
+      0,
+      "a site with no security code has nothing to connect to",
+    );
+    assert.equal(
+      byText(ui.host, ".toast", "security code").length,
+      0,
+      "opening the app must not toast a connection failure",
+    );
+    assert.ok(
+      byText(ui.host, "button.connection-chip", "Offline").length > 0,
+      "the header should stay offline rather than showing a failure",
+    );
+    await ui.openTab("Trace");
+    assert.match(ui.host.textContent, /Automatic connection skipped/);
+  } finally {
+    ui.cleanup();
+  }
+});
 
 test("Compare is enabled by a controller connection and sends the local checksum", async () => {
   const ui = await mount();

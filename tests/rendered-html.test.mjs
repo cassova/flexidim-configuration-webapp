@@ -224,7 +224,7 @@ test("uses the server workspace API instead of browser storage", async () => {
 test("cannot connect with starter credentials before server storage loads", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const connect = page.slice(
-    page.indexOf("const connect = () =>"),
+    page.indexOf("const connect = ("),
     page.indexOf("// A range slider"),
   );
   assert.match(
@@ -233,11 +233,17 @@ test("cannot connect with starter credentials before server storage loads", asyn
   );
   assert.match(
     page,
-    /<button className="primary" disabled=\{!storageLoaded\} onClick=\{connect\}>/,
+    /className="primary"\s*disabled=\{!storageLoaded\}\s*onClick=\{\(\) => connect\(\)\}/,
   );
   assert.match(
     page,
-    /className=\{`connection-chip \$\{connection\}`\}[\s\S]*disabled=\{!storageLoaded\}[\s\S]*onClick=\{connect\}/,
+    /className=\{`connection-chip \$\{connection\}`\}[\s\S]*disabled=\{!storageLoaded\}[\s\S]*onClick=\{\(\) => connect\(\)\}/,
+  );
+  // The startup attempt reads the controller address and security code out of
+  // the loaded workspace, so it must wait for the same gate.
+  assert.match(
+    page,
+    /if \(!storageLoaded \|\| autoConnectAttempted\.current\) return;[\s\S]*connect\(\{ auto: true \}\)/,
   );
 });
 

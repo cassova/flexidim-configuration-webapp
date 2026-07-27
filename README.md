@@ -172,6 +172,17 @@ Keep both formats:
 
 ### 2. Connect to the Scene Controller
 
+Once a site is saved, the web app tries to reach its controller by itself each
+time the page is opened, using the stored address, port and security code. The
+status chip in the header reports the attempt. Nothing is sent to the
+controller beyond opening the session — configuration is only ever written by
+an explicit transfer.
+
+If the site has no controller security code or address yet, startup connection
+is skipped quietly and the reason is recorded on the **Trace** page. Only one
+attempt is made per page load; **Connect** in the header or in **Sites** retries
+it.
+
 Open **Sites** and select the imported site.
 
 - **Auto-detect controller** uses the recovered local discovery protocol.
