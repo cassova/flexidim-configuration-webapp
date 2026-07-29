@@ -919,6 +919,29 @@ export default function FlexiDimWeb() {
     showToast(text, tone);
   };
 
+  /**
+   * Copy text and say so. The clipboard is absent outside a secure context and
+   * the write can be refused, so report what actually happened rather than
+   * assuming success — a silent copy button is indistinguishable from a broken
+   * one.
+   */
+  const copyToClipboard = async (text: string, description: string) => {
+    if (!text) {
+      notify(`Nothing to copy — ${description} is empty`, "warn");
+      return;
+    }
+    try {
+      if (!navigator.clipboard) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+      notify(`${description} copied`, "ok");
+    } catch {
+      notify(
+        `Could not copy ${description} — this browser blocked clipboard access`,
+        "warn",
+      );
+    }
+  };
+
   useEffect(() => {
     let active = true;
     let migrationWorkspace = workspace;
@@ -1659,6 +1682,13 @@ export default function FlexiDimWeb() {
    * whose reply has never been observed, so this stops at the preflight.
    */
   const runUserProfileDryRun = () => {
+    if (socket.current?.readyState !== WebSocket.OPEN) {
+      const message =
+        "User profiles cannot be checked while the local bridge is offline.";
+      setUserProfilePreflight({ state: "failed", message });
+      notify(message, "warn");
+      return;
+    }
     const users = compileUserProfiles(data);
     if (!users.complete) {
       const message = `User profiles cannot be sent yet: ${users.problems.join(" ")}`;
@@ -6500,14 +6530,15 @@ export default function FlexiDimWeb() {
             configuration. Export a backup before clearing browser data.
           </p>
           <button
-            onClick={() => {
-              navigator.clipboard?.writeText(
+            disabled={!data.users.length}
+            onClick={() =>
+              copyToClipboard(
                 data.users
                   .map((u) => `${u.name}: ${formatSecurityCode(u.key)}`)
                   .join("\n"),
-              );
-              addTrace("User keys copied");
-            }}
+                `${data.users.length} security ${data.users.length === 1 ? "code" : "codes"}`,
+              )
+            }
           >
             Copy all security codes
           </button>
@@ -6588,12 +6619,12 @@ export default function FlexiDimWeb() {
                   className="copy-code"
                   aria-label="Copy security code"
                   title="Copy security code"
-                  onClick={() => {
-                    navigator.clipboard?.writeText(
+                  onClick={() =>
+                    copyToClipboard(
                       formatSecurityCode(selectedUser.key),
-                    );
-                    notify("Security code copied", "ok");
-                  }}
+                      "Security code",
+                    )
+                  }
                 >
                   ⧉
                 </button>
