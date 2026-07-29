@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ConfigurationTransferRunner } from "./transfer-runner.mjs";
 import { crc16X25 } from "./protocol.mjs";
+import { compileUserProfileTranscript } from "./user-transfer.mjs";
 
 export const COMPARE_MAX_AGE_MS = 5 * 60 * 1000;
 export const PREFLIGHT_MAX_AGE_MS = 5 * 60 * 1000;
@@ -373,6 +374,52 @@ export class TransferSafetyCoordinator {
       this.release("failed");
       throw error;
     }
+  }
+
+  /**
+   * Compile the user-profile-only send offline and report exactly what it
+   * would write. Nothing is sent: the frames are built, self-checked and
+   * discarded, so this is safe with or without a controller present.
+   */
+  userProfileDryRun(owner, request) {
+    if (
+      !Array.isArray(request.userPayloadsBase64) ||
+      request.userPayloadsBase64.length > 224
+    )
+      throw new RangeError("user payload list must contain at most 224 entries");
+    const userPayloads = request.userPayloadsBase64.map((value, index) =>
+      decodeBase64(value, `user payload ${index + 1}`, 4 * 1024 * 1024, true),
+    );
+    const transcript = compileUserProfileTranscript({ userPayloads });
+    for (const frame of transcript.frames) validateTransferFrame(frame);
+    const transcriptSha256 = createHash("sha256")
+      .update(Buffer.concat(transcript.frames.map((frame) => frame.bytes)))
+      .digest("hex");
+    this.audit.append("user-profile-dry-run-passed", {
+      owner,
+      userCount: userPayloads.length,
+      frameCount: transcript.frames.length,
+      transcriptSha256,
+      outcome: "passed",
+    });
+    return {
+      type: "userProfilePreflight",
+      state: "passed",
+      generatedAt: new Date(this.now()).toISOString(),
+      userCount: userPayloads.length,
+      userBytes: userPayloads.reduce((total, item) => total + item.length, 0),
+      frameCount: transcript.frames.length,
+      tickCount: transcript.ticks.length,
+      frameNames: transcript.frames.map((frame) => frame.name),
+      transcriptSha256,
+      // Sending profiles is a controller write, and no controller reply to the
+      // user-only conversation has ever been observed. The frames match the
+      // original app exactly; the live path stays closed until hardware
+      // evidence exists.
+      liveSendAvailable: false,
+      message:
+        "Offline user-profile dry run passed; no controller bytes were written.",
+    };
   }
 
   beginLive(owner, request) {

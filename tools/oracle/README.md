@@ -58,6 +58,8 @@ configuration:
 | `transfer-oracle-wire.json` | Complete escaped sender transcript, one hex frame per entry. |
 | `transfer-oracle-manifest.json` | Payload-free state-transition and frame-family summary. |
 | `type0-record-capture.json` | Sanitized type-0 record evidence used by packet regression tests. |
+| `user-transfer-oracle.json` | Escaped frames the user-profile-only sender writes, one complete pass per case. |
+| `user-transfer-*.fd4cfg` | The synthetic archives those user-profile cases were captured from. |
 
 These files contain synthetic identities and may be used in CI. They allow the
 ordinary test suite to retain oracle coverage without distributing or executing
@@ -68,6 +70,7 @@ the original app.
 | File | Purpose |
 | --- | --- |
 | `build-transfer-oracle-fixture.mjs` | Builds configurable, synthetic type-0 `.fd4cfg` inputs for new oracle experiments. |
+| `build-user-transfer-oracle-fixture.mjs` | Turns private user-profile captures over synthetic archives into the committed fixture. |
 | `transfer-prefix-emulator.mjs` | Requires the exact next oracle frame and supplies the scripted response used by the offline iOS run. |
 | `../controller-emulator.mjs` | Wraps the transcript validator in a TCP controller emulator for full bridge-session tests. |
 
@@ -84,6 +87,9 @@ For a configuration that it is given, the executable oracle can establish:
 - which bytes change after a controlled single-field mutation;
 - original-app ordering and encoding of configuration sections;
 - exact user-profile payload text and chunking;
+- the frames the user-profile-only send writes, and the order profiles are
+  transmitted in (which follows the app's own dictionary enumeration, not the
+  archive's slot order);
 - escaped type-0 transfer frames and their order;
 - retry, timeout, abort, reset, and completion behavior reachable through
   scripted inputs;

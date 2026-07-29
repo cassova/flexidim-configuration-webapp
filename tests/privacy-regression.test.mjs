@@ -62,16 +62,21 @@ test("Git-visible files contain no private installation identifiers", () => {
 });
 
 test("committed configuration fixtures use explicitly synthetic identities", () => {
+  const oracleFixtures = path.join(root, "tools", "oracle", "fixtures");
   const fixtures = [
     path.join(root, "tests", "fixtures", "golden.fd4cfg"),
-    path.join(
-      root,
-      "tools",
-      "oracle",
-      "fixtures",
-      "transfer-oracle.fd4cfg",
-    ),
+    path.join(oracleFixtures, "transfer-oracle.fd4cfg"),
+    // The user-profile transfer cases carry captured user payload bytes, so
+    // their synthetic origin matters just as much.
+    ...fs
+      .readdirSync(oracleFixtures)
+      .filter((name) => /^user-transfer-.+\.fd4cfg$/.test(name))
+      .map((name) => path.join(oracleFixtures, name)),
   ];
+  assert.ok(
+    fixtures.length > 2,
+    "the user-profile transfer fixtures must be covered here",
+  );
   for (const fixture of fixtures) {
     const source = fs.readFileSync(fixture).toString("latin1");
     assert.match(source, /Golden Test House/);

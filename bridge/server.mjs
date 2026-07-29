@@ -352,6 +352,18 @@ function handleMessage(ws, raw) {
       });
     }
   }
+  if (message.type === "userProfileDryRun") {
+    try {
+      return emit(ws, transferSafety.userProfileDryRun(clientId, message));
+    } catch (error) {
+      return emit(ws, {
+        type: "userProfilePreflight",
+        state: "failed",
+        message: `Offline user-profile dry run failed: ${error.message}`,
+        liveSendAvailable: false,
+      });
+    }
+  }
   if (message.type === "transferEmergencyStop") {
     transferSafety.emergencyStop("operator");
     for (const controller of controllers.values()) controller.destroy();

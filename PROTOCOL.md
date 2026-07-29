@@ -255,6 +255,42 @@ the offline sender oracle. The pure model implements this framing, but the live
 bridge does not use it. Exact compilation of every hardware-specific user
 profile suffix is still incomplete, so user transfer remains gated.
 
+#### The user-only send — sender-oracle verified, not transmitted
+
+The same method also serves the app's "send user profiles" action, which sends
+profiles without recompiling or re-sending the configuration image. Its
+signature is `-(BOOL)sendUserData:(NSInteger *)cursor userOnly:(BOOL)`, where
+the cursor is an in/out user index and the result reports whether more remains.
+One call is one timer tick, and a complete pass is:
+
+| Tick | Frames written |
+| --- | --- |
+| cursor `0` | `ff fc 00 00 00 00` + CRC, then every chunk of the first profile |
+| while users remain | every chunk of the profile at the cursor, which then advances |
+| cursor spent | `ff f2 e0 7f 7f` + 256 zero bytes, then `ff fe 00 00 00 00` + CRC |
+
+A configuration with no users emits all three in one tick. Calls after the
+final one repeat the two terminal frames. `ff fe` is escaped on the wire
+(`ff 1b fe …`); the CRC covers the six unescaped bytes.
+
+**Profile order is not archive order.** `JCLFDConfig.users` is an
+`NSMutableDictionary` keyed by the decimal string of each user's `ky`, and the
+sender walks the list built by enumerating it, so a profile's wire index
+follows Darwin's `CFBasicHash` bucket order. Five users keyed 501–505 are
+transmitted as 504, 501, 505, 502, 503. Up to three users the order is the
+identity, which is why smaller configurations never revealed it.
+`userProfileSendOrder` in `app/compile-user-profiles.ts` reproduces this with
+the existing `foundationDictionaryOrder` model; the same order applies to the
+full transfer's user stage, which walks the same list.
+
+Evidence: `tools/oracle/private/user_capture.m` drove the original method over
+synthetic archives and `tools/oracle/private/user_order.m` printed the app's
+own collection order; `tests/user-transfer.test.mjs` holds five committed cases
+(no users, one user, three users, five users with the reordering, and
+multi-chunk payloads) that require byte-identical frames. No controller reply
+to this exchange has ever been observed, so the bridge compiles and self-checks
+the frames offline and refuses to transmit them.
+
 ### Status requests (`ff f1`) — binary verified, not transmitted
 
 A second frame family. Both are nine-byte constants with CRC-16/X25 appended

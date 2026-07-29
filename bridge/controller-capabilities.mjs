@@ -30,6 +30,9 @@ const CAPABILITY_BY_MESSAGE = {
   connect: null,
   discover: null,
   transferDryRun: null,
+  // Compiles the user-profile frames offline and reports them. It writes
+  // nothing to a controller; the gated write is `userProfiles` below.
+  userProfileDryRun: null,
   transferSafetyStatus: null,
   transferCancel: null,
   transferEmergencyStop: null,

@@ -1,4 +1,5 @@
 import type { AppData, Configuration, FlexUser, Room, WallSwitch } from "./fd4cfg";
+import { foundationDictionaryOrder } from "./foundation-dictionary-order.ts";
 
 export type UserProfileCompileResult = {
   payloads: Uint8Array[];
@@ -7,6 +8,44 @@ export type UserProfileCompileResult = {
 };
 
 const BUTTON_SCENE_SLOTS = 24;
+
+/**
+ * The archive key (`ky`) each user is stored under, mirroring the exporter:
+ * an imported user keeps its key, and anything else takes the lowest unused
+ * one. This is the dictionary key the original app orders users by.
+ */
+function userArchiveKeys(users: FlexUser[]): number[] {
+  const used = new Set(
+    users.flatMap((user) =>
+      typeof user.legacyKey === "number" && user.legacyKey > 0
+        ? [user.legacyKey]
+        : [],
+    ),
+  );
+  let next = 1;
+  return users.map((user) => {
+    if (typeof user.legacyKey === "number" && user.legacyKey > 0)
+      return user.legacyKey;
+    while (used.has(next)) next += 1;
+    used.add(next);
+    return next;
+  });
+}
+
+/**
+ * User indices in the order the original app transmits profiles.
+ *
+ * `JCLFDConfig.users` is an NSMutableDictionary keyed by the decimal string of
+ * each user's `ky`, and the sender walks the list built from enumerating it —
+ * so the wire index of a profile follows Darwin's hash-bucket order, not the
+ * archive's slot order. Proven with tools/oracle/private/user_order.m: five
+ * users keyed 501..505 enumerate as 504, 501, 505, 502, 503, exactly as
+ * `foundationDictionaryOrder` predicts. Up to three users the order is the
+ * identity, which is why smaller configurations never revealed this.
+ */
+export function userProfileSendOrder(users: FlexUser[] = []): number[] {
+  return foundationDictionaryOrder(userArchiveKeys(users));
+}
 
 function channelProfileSuffix(
   hardwareType: number | undefined,
@@ -259,7 +298,7 @@ export function compileUserProfiles(data: AppData): UserProfileCompileResult {
   });
 
   return {
-    payloads,
+    payloads: userProfileSendOrder(data.users).map((index) => payloads[index]),
     complete: problems.length === 0,
     problems: [...new Set(problems)],
   };

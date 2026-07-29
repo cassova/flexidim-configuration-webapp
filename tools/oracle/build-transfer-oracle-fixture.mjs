@@ -28,6 +28,12 @@ const wirelessGatewaysArgument = process.argv.find((argument) =>
   argument.startsWith("--wireless-gateways="));
 const profileVersionsArgument = process.argv.find((argument) =>
   argument.startsWith("--profile-versions="));
+// Extra synthetic users, so user-profile framing can be exercised with more
+// than one profile and with access lists long enough to need several chunks.
+const userCountArgument = process.argv.find((argument) =>
+  argument.startsWith("--user-count="));
+const userAccessArgument = process.argv.find((argument) =>
+  argument.startsWith("--user-access="));
 if (!output) {
   console.error("usage: node --experimental-strip-types tools/oracle/build-transfer-oracle-fixture.mjs <output.fd4cfg>");
   process.exit(64);
@@ -201,6 +207,26 @@ if (!includeSwitches) {
 }
 if (!includeUsers) data.users = [];
 else {
+  const userCount = userCountArgument
+    ? Number(userCountArgument.slice("--user-count=".length))
+    : data.users.length;
+  if (!Number.isInteger(userCount) || userCount < 0)
+    throw new Error("--user-count must be a non-negative integer");
+  const template = data.users[0];
+  data.users = Array.from({ length: userCount }, (_, index) => ({
+    ...template,
+    id: template.id + index,
+    name: index === 0 ? template.name : `Occupant ${index + 1}`,
+    legacyKey: (template.legacyKey ?? 501) + index,
+  }));
+  // Which areas each user may reach. Longer lists produce longer payloads,
+  // which is how multi-chunk framing is exercised.
+  const accessRoomNames = userAccessArgument
+    ? userAccessArgument
+        .slice("--user-access=".length)
+        .split(",")
+        .filter(Boolean)
+    : ["Lounge", "Kitchen"];
   const profileVersions = profileVersionsArgument
     ? profileVersionsArgument
         .slice("--profile-versions=".length)
@@ -218,7 +244,7 @@ else {
     // at a time. Keep synthetic fixtures valid without borrowing a real key.
     user.key = "0011223344556677";
     user.securityCode = user.key;
-    user.roomAccess = ["Lounge", "Kitchen"].map((roomName) => {
+    user.roomAccess = accessRoomNames.map((roomName) => {
       const roomKey = data.rooms.find((room) => room.name === roomName)?.legacyKey;
       const switchKey = data.switches.find(
         (wallSwitch) => wallSwitch.name === `${roomName} Switch`,
@@ -228,7 +254,7 @@ else {
       return switchKey === undefined ? String(roomKey) : `${roomKey}|${switchKey}`;
     });
     user.accessCount = user.roomAccess.length;
-    user.roomIds = ["Lounge", "Kitchen"].flatMap((roomName) => {
+    user.roomIds = accessRoomNames.flatMap((roomName) => {
       const room = data.rooms.find((candidate) => candidate.name === roomName);
       return room ? [room.id] : [];
     });

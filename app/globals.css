@@ -3402,3 +3402,14 @@ footer {
   width: 64px;
   height: 42px;
 }
+.user-profile-preflight {
+  margin: 2px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #f4f4f1;
+  text-align: left;
+}
+.user-profile-preflight.failed {
+  color: #7d3b35;
+  background: #fbeceb;
+}

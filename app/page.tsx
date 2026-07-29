@@ -585,9 +585,20 @@ function now() {
     hourCycle: "h23",
   });
 }
+// Security codes match the iOS app: 16 lowercase base-36 characters stored
+// without spaces (the archive `sk` field), displayed in groups of four.
+const SECURITY_CODE_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
 function generateSecurityKey() {
-  const bytes = crypto.getRandomValues(new Uint8Array(8));
-  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  let code = "";
+  while (code.length < 16)
+    for (const byte of crypto.getRandomValues(new Uint8Array(32)))
+      // Reject bytes ≥ 252 so the modulo stays uniform across the alphabet.
+      if (code.length < 16 && byte < 252)
+        code += SECURITY_CODE_ALPHABET[byte % 36];
+  return code;
+}
+function formatSecurityCode(code: string) {
+  return /^\S{16}$/.test(code) ? code.replace(/(....)(?=.)/g, "$1 ") : code;
 }
 
 function validControllerSecurityCode(value?: string) {
@@ -816,6 +827,13 @@ export default function FlexiDimWeb() {
     kind: "room" | "switch";
     floorId: number | null;
     roomId: number | null;
+  } | null>(null);
+  const [userProfilePreflight, setUserProfilePreflight] = useState<{
+    state: string;
+    message?: string;
+    userCount?: number;
+    frameCount?: number;
+    transcriptSha256?: string;
   } | null>(null);
   const [userDrag, setUserDrag] = useState<{
     userId: number;
@@ -1355,6 +1373,14 @@ export default function FlexiDimWeb() {
                 : "Configuration differs from the Scene Controller",
             message.state === "match" ? "ok" : "warn",
           );
+        } else if (message.type === "userProfilePreflight") {
+          setUserProfilePreflight(
+            message as { state: string; message?: string; userCount?: number; frameCount?: number; transcriptSha256?: string },
+          );
+          notify(
+            message.message ?? "Offline user-profile dry run finished",
+            message.state === "passed" ? "ok" : "warn",
+          );
         } else if (message.type === "transferPreflight") {
           setTransferPreflight(message as TransferPreflight);
           setTransferProgress(null);
@@ -1624,6 +1650,27 @@ export default function FlexiDimWeb() {
       `Current local configuration CRC: ${localChecksum}. Waiting for the Scene Controller…`,
     );
     send({ type: "verify", localChecksum });
+  };
+
+  /**
+   * Compile the user-profile-only send and have the bridge build every frame
+   * offline. The frames match the original app byte-for-byte (see
+   * tests/user-transfer.test.mjs), but sending them to a controller is a write
+   * whose reply has never been observed, so this stops at the preflight.
+   */
+  const runUserProfileDryRun = () => {
+    const users = compileUserProfiles(data);
+    if (!users.complete) {
+      const message = `User profiles cannot be sent yet: ${users.problems.join(" ")}`;
+      setUserProfilePreflight({ state: "failed", message });
+      notify(message, "warn");
+      return;
+    }
+    setUserProfilePreflight(null);
+    send({
+      type: "userProfileDryRun",
+      userPayloadsBase64: users.payloads.map(bytesToBase64),
+    });
   };
 
   const runTransferDryRun = () => {
@@ -6455,7 +6502,9 @@ export default function FlexiDimWeb() {
           <button
             onClick={() => {
               navigator.clipboard?.writeText(
-                data.users.map((u) => `${u.name}: ${u.key}`).join("\n"),
+                data.users
+                  .map((u) => `${u.name}: ${formatSecurityCode(u.key)}`)
+                  .join("\n"),
               );
               addTrace("User keys copied");
             }}
@@ -6464,11 +6513,28 @@ export default function FlexiDimWeb() {
           </button>
           <button onClick={exportUserKeys}>Export keys and profiles</button>
           <button
-            disabled
-            title="Controller user-profile transfer is not protocol-verified."
+            onClick={runUserProfileDryRun}
+            title="Compile every frame the original app would send, and check it offline."
           >
-            Send user profiles — not available
+            Send user profiles
           </button>
+          {userProfilePreflight && (
+            <p
+              className={`hint user-profile-preflight ${userProfilePreflight.state}`}
+            >
+              {userProfilePreflight.state === "passed" ? (
+                <>
+                  <b>Ready to send.</b> {userProfilePreflight.userCount} profiles
+                  compile into {userProfilePreflight.frameCount} frames matching
+                  the original app. Sending to the controller stays disabled
+                  until a controller reply to this exchange has been observed on
+                  hardware.
+                </>
+              ) : (
+                userProfilePreflight.message
+              )}
+            </p>
+          )}
         </div>
       </section>
       {selectedUser && (
@@ -6517,13 +6583,15 @@ export default function FlexiDimWeb() {
             <div className="security-code-block">
               <span className="option-label">Security code</span>
               <div className="security-code">
-                <code>{selectedUser.key}</code>
+                <code>{formatSecurityCode(selectedUser.key)}</code>
                 <button
                   className="copy-code"
                   aria-label="Copy security code"
                   title="Copy security code"
                   onClick={() => {
-                    navigator.clipboard?.writeText(selectedUser.key);
+                    navigator.clipboard?.writeText(
+                      formatSecurityCode(selectedUser.key),
+                    );
                     notify("Security code copied", "ok");
                   }}
                 >
