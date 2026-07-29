@@ -10,6 +10,7 @@ import { localResponse } from "./local-responses.mjs";
 import { fallbackFirmwareProfile } from "./firmware-profiles.mjs";
 import { VerifySession } from "./verify-session.mjs";
 import { ConfigurationTransferRunner } from "./transfer-runner.mjs";
+import { UserProfileSendRunner } from "./user-profile-runner.mjs";
 import {
   SanitizedTransferAudit,
   TransferSafetyCoordinator,
@@ -30,6 +31,11 @@ const BRIDGE_HOST = String(process.env.FLEXIDIM_BRIDGE_HOST || "127.0.0.1");
 const BRIDGE_TOKEN = String(process.env.FLEXIDIM_BRIDGE_TOKEN || "");
 const BRIDGE_ORIGINS = String(process.env.FLEXIDIM_BRIDGE_ORIGINS || "")
   .split(",").map((value) => value.trim()).filter(Boolean);
+// Sending user profiles writes to the controller on a path whose reply has
+// never been observed, so it stays off until the operator turns it on for a
+// bridge process. The frames themselves are oracle-verified.
+const USER_PROFILE_SEND_ENABLED =
+  String(process.env.FLEXIDIM_ENABLE_USER_PROFILE_SEND || "") === "1";
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 if (!LOOPBACK_HOSTS.has(BRIDGE_HOST) && !BRIDGE_TOKEN) {
   throw new Error("FLEXIDIM_BRIDGE_TOKEN is required when the bridge binds beyond loopback");
@@ -37,6 +43,7 @@ if (!LOOPBACK_HOSTS.has(BRIDGE_HOST) && !BRIDGE_TOKEN) {
 const sockets = new Set();
 const controllers = new Map();
 const transfers = new Map();
+const userProfileSends = new Map();
 const clientIds = new WeakMap();
 const transferSafety = new TransferSafetyCoordinator({
   audit: new SanitizedTransferAudit(
@@ -113,7 +120,7 @@ function connectController(
   host,
   port,
   securityCode,
-  { transferRunner, onConnected, onFailed, quiet = false } = {},
+  { transferRunner, userProfileRunner, onConnected, onFailed, quiet = false } = {},
 ) {
     controllers.get(ws)?.destroy();
     if (!/^([a-z\d-]+\.)*[a-z\d-]+$|^\d{1,3}(\.\d{1,3}){3}$/i.test(host)) return emit(ws, { type: "status", state: "error", message: "Enter a valid Scene Controller address" });
@@ -130,6 +137,7 @@ function connectController(
     const controller = net.createConnection({ host, port, timeout: 7000 }); controllers.set(ws, controller);
     controller.flexidimConnection = { host, port, securityCode };
     controller.flexidimTransferRunner = transferRunner;
+    controller.flexidimUserProfileRunner = userProfileRunner;
     controller.on("connect", () => {
       // The timeout above is for establishing the TCP connection only. Leaving it
       // enabled disconnects a healthy but idle controller seven seconds later.
@@ -171,9 +179,11 @@ function connectController(
     controller.on("data", (data) => {
       const ordinaryData = controller.flexidimTransferRunner?.active
         ? controller.flexidimTransferRunner.receive(data)
-        : controller.flexidimVerifySession?.active
-          ? controller.flexidimVerifySession.receive(data)
-          : data;
+        : controller.flexidimUserProfileRunner?.active
+          ? controller.flexidimUserProfileRunner.receive(data)
+          : controller.flexidimVerifySession?.active
+            ? controller.flexidimVerifySession.receive(data)
+            : data;
       if (!ordinaryData.length) return;
       controller.flexidimRxBuffer = Buffer.concat([controller.flexidimRxBuffer ?? Buffer.alloc(0), ordinaryData]);
       const replies = parseControllerReplies(controller.flexidimRxBuffer);
@@ -216,6 +226,8 @@ function connectController(
       log(`controller connection closed${hadError ? " (after error)" : ""}${connected ? "" : " (never established)"}${diagnostic}`);
       if (controller.flexidimTransferRunner?.active)
         controller.flexidimTransferRunner.disconnected();
+      if (controller.flexidimUserProfileRunner?.active)
+        controller.flexidimUserProfileRunner.disconnected();
       if (!connected) reportFailure();
       if (!quiet && !ws.destroyed && connected && !failed) emit(ws, {
         type: "status",
@@ -308,6 +320,93 @@ function startLiveTransfer(ws, clientId, message) {
   });
   transfers.set(ws, { runner, imageChecksum: prepared.imageChecksum });
   controller.flexidimTransferRunner = runner;
+  runner.start();
+}
+
+/**
+ * Send user profiles only, with no configuration image. The frames match the
+ * original app byte-for-byte; the controller's side of the exchange has never
+ * been observed, which is why this needs the operator opt-in below.
+ */
+function startUserProfileSend(ws, clientId, message) {
+  const controller = controllers.get(ws);
+  if (!controller?.flexidimAuthenticated || controller.destroyed)
+    throw new Error("Scene Controller is not connected");
+  if (controller.flexidimVerifySession?.active)
+    throw new Error("wait for Compare to finish before sending");
+  if (transfers.get(ws)?.runner?.active)
+    throw new Error("a configuration transfer is already running");
+
+  const prepared = transferSafety.beginLiveUserProfiles(clientId, message, {
+    operatorEnabled: USER_PROFILE_SEND_ENABLED,
+  });
+  const runner = new UserProfileSendRunner({
+    userPayloads: prepared.userPayloads,
+    write: (bytes, frame) => {
+      const active = controllers.get(ws);
+      if (
+        !active ||
+        active.destroyed ||
+        !active.writable ||
+        !active.flexidimAuthenticated
+      )
+        throw new Error(`Scene Controller disconnected before ${frame.name}`);
+      active.write(bytes);
+      active.flexidimLastTx = {
+        at: Date.now(),
+        label: frame.name,
+        bytes: Buffer.alloc(0),
+      };
+      log(`→ TX user profile ${frame.name}, ${bytes.length} bytes`);
+    },
+    reconnect: ({ connected, failed }) => {
+      const connection = controller.flexidimConnection;
+      connectController(
+        ws,
+        connection.host,
+        connection.port,
+        connection.securityCode,
+        {
+          userProfileRunner: runner,
+          onConnected: () => connected(),
+          onFailed: () => failed(),
+          quiet: true,
+        },
+      );
+    },
+    ordinaryData: (data) => {
+      const active = controllers.get(ws);
+      if (!active || !data.length) return;
+      active.flexidimRxBuffer = Buffer.concat([
+        active.flexidimRxBuffer ?? Buffer.alloc(0),
+        data,
+      ]);
+    },
+    progress: (value) => emit(ws, { type: "userProfileProgress", ...value }),
+    result: (value) => {
+      userProfileSends.delete(ws);
+      transferSafety.finishLiveUserProfiles(clientId, value.outcome, {
+        frameCount: value.frameCount,
+        userCount: value.userCount,
+        // Whatever the controller said is the evidence this path was missing.
+        controllerBytes: value.controllerBytes.length,
+        normalStatusCount: value.normalStatusCount,
+      });
+      if (value.controllerBytes.length)
+        log(
+          `← RX user-profile exchange: ${value.controllerBytes
+            .map((item) => `${item.phase}:${item.hex}`)
+            .join(" ")}`,
+        );
+      emit(ws, {
+        type: "userProfileResult",
+        state: value.outcome === "completed" ? "completed" : "failed",
+        ...value,
+      });
+    },
+  });
+  userProfileSends.set(ws, { runner });
+  controller.flexidimUserProfileRunner = runner;
   runner.start();
 }
 

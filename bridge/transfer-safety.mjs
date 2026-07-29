@@ -422,6 +422,51 @@ export class TransferSafetyCoordinator {
     };
   }
 
+  /**
+   * Take the lock for a live user-profile send and hand back its payloads.
+   *
+   * The frames are oracle-verified against the original app, but no controller
+   * reply to this exchange has ever been observed, so the operator has to opt
+   * in per bridge process (FLEXIDIM_ENABLE_USER_PROFILE_SEND=1) and confirm.
+   * That acknowledgement is recorded, because the first real send is the
+   * hardware experiment that produces the missing evidence.
+   */
+  beginLiveUserProfiles(owner, request, { operatorEnabled = false } = {}) {
+    if (!operatorEnabled)
+      throw new Error(
+        "user-profile sending is not enabled on this bridge; restart it with FLEXIDIM_ENABLE_USER_PROFILE_SEND=1 to allow this unverified write",
+      );
+    if (request.confirm !== "Continue")
+      throw new Error("the send confirmation was not received");
+    const preflight = this.userProfileDryRun(owner, request);
+    const lock = this.acquire(owner, preflight.transcriptSha256);
+    lock.state = "sending-user-profiles";
+    this.audit.append("user-profile-send-started", {
+      owner,
+      userCount: preflight.userCount,
+      frameCount: preflight.frameCount,
+      transcriptSha256: preflight.transcriptSha256,
+      evidence: "oracle-only; controller reply unobserved",
+      outcome: "started",
+    });
+    return {
+      userPayloads: request.userPayloadsBase64.map((value, index) =>
+        decodeBase64(value, `user payload ${index + 1}`, 4 * 1024 * 1024, true),
+      ),
+      preflight,
+    };
+  }
+
+  /** Release the lock a user-profile send holds and record what happened. */
+  finishLiveUserProfiles(owner, outcome, detail = {}) {
+    this.audit.append("user-profile-send-finished", {
+      owner,
+      outcome,
+      ...detail,
+    });
+    this.release(outcome === "completed" ? "completed" : "failed");
+  }
+
   beginLive(owner, request) {
     if (!LIVE_WRITES_ENABLED) throw new Error("live configuration writes are disabled");
     const prepared = prepareTransferRequest(request);
