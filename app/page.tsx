@@ -13,7 +13,6 @@ import {
   migrateWorkspaceControllerCode,
   migrateWorkspaceChannelProfileOrder,
   migrateWorkspaceImportedUserAccess,
-  orderUserAccess,
   parseLegacyFd4Config,
   CONFIG_CONTENT_KEYS,
   deleteConfigEntity,
@@ -22,6 +21,7 @@ import {
   type ConfigContent,
   type DeletedItem,
   type FlexModule,
+  type FlexUser,
   type FlexiDimWorkspace,
   type Channel,
   type Room,
@@ -803,6 +803,26 @@ export default function FlexiDimWeb() {
   const [scenePickerGroupId, setScenePickerGroupId] = useState<number | null>(
     null,
   );
+  // Users drill-down: the selected user (left column) and the selected area
+  // within that user's access (centre column).
+  const [selectedUserId, setSelectedUserId] = useState<number | null>(null);
+  const [selectedUserAreaId, setSelectedUserAreaId] = useState<number | null>(
+    null,
+  );
+  // Hierarchical picker for granting a user access to an area or a switch,
+  // and the drag state while reordering a user's access lists.
+  const [userAccessPicker, setUserAccessPicker] = useState<{
+    userId: number;
+    kind: "room" | "switch";
+    floorId: number | null;
+    roomId: number | null;
+  } | null>(null);
+  const [userDrag, setUserDrag] = useState<{
+    userId: number;
+    field: "roomIds" | "switchIds";
+    id: number;
+  } | null>(null);
+  const [userDragOverId, setUserDragOverId] = useState<number | null>(null);
   const [basicFloor, setBasicFloor] = useState<number | null>(null);
   const [basicRoom, setBasicRoom] = useState<number | null>(null);
   const [basicSwitchId, setBasicSwitchId] = useState<number | null>(null);
@@ -5624,15 +5644,14 @@ export default function FlexiDimWeb() {
     </div>
   );
 
-  const sceneButtonRooms = sceneButtonFloor
-    ? (() => {
-        const children = data.rooms.filter(
-          (room) => room.parentId === sceneButtonFloor,
-        );
-        const floor = data.rooms.find((room) => room.id === sceneButtonFloor);
-        return children.length ? children : floor ? [floor] : [];
-      })()
-    : [];
+  // Rooms shown when drilling into a floor: its children, or the floor
+  // itself when it has no child areas.
+  const roomsOfFloor = (floorId: number) => {
+    const children = data.rooms.filter((room) => room.parentId === floorId);
+    const floor = data.rooms.find((room) => room.id === floorId);
+    return children.length ? children : floor ? [floor] : [];
+  };
+  const sceneButtonRooms = sceneButtonFloor ? roomsOfFloor(sceneButtonFloor) : [];
   const sceneButtonSwitches = sceneButtonRoom
     ? data.switches.filter((item) => item.roomId === sceneButtonRoom)
     : [];
@@ -6195,42 +6214,194 @@ export default function FlexiDimWeb() {
     </div>
   );
 
-  const moveUserAccess = (
+  const patchUserAccess = (
     userId: number,
     field: "roomIds" | "switchIds",
-    accessId: number,
-    direction: -1 | 1,
+    mutate: (list: number[]) => number[] | null,
   ) =>
     setData((old) => ({
       ...old,
       users: old.users.map((user) => {
         if (user.id !== userId) return user;
-        const ordered = [...(user[field] ?? [])];
-        const from = ordered.indexOf(accessId);
-        const to = from + direction;
-        if (from < 0 || to < 0 || to >= ordered.length) return user;
-        [ordered[from], ordered[to]] = [ordered[to], ordered[from]];
-        return updateUserProfile(user, { [field]: ordered });
+        const ordered = mutate([...(user[field] ?? [])]);
+        return ordered ? updateUserProfile(user, { [field]: ordered }) : user;
       }),
     }));
+  const addUserAccess = (
+    userId: number,
+    field: "roomIds" | "switchIds",
+    accessId: number,
+  ) =>
+    patchUserAccess(userId, field, (list) =>
+      list.includes(accessId) ? null : [...list, accessId],
+    );
+  // Granting an area brings all of its switches with it, mirroring the iOS
+  // app's room|switch access paths. One call covers one or many areas so a
+  // whole-floor grant bumps the profile version only once.
+  const grantUserAreas = (userId: number, areaIds: number[]) =>
+    setData((old) => ({
+      ...old,
+      users: old.users.map((user) => {
+        if (user.id !== userId) return user;
+        const roomIds = [...(user.roomIds ?? [])];
+        const switchIds = [...(user.switchIds ?? [])];
+        for (const areaId of areaIds) {
+          if (!roomIds.includes(areaId)) roomIds.push(areaId);
+          for (const wallSwitch of old.switches)
+            if (
+              wallSwitch.roomId === areaId &&
+              !switchIds.includes(wallSwitch.id)
+            )
+              switchIds.push(wallSwitch.id);
+        }
+        if (
+          roomIds.length === (user.roomIds ?? []).length &&
+          switchIds.length === (user.switchIds ?? []).length
+        )
+          return user;
+        return updateUserProfile(user, { roomIds, switchIds });
+      }),
+    }));
+  // Removing an area also revokes the user's switches inside it — access is
+  // granted as area-plus-switches paths, so a switch cannot outlive its area.
+  const removeUserAccess = (
+    userId: number,
+    field: "roomIds" | "switchIds",
+    accessId: number,
+  ) =>
+    setData((old) => ({
+      ...old,
+      users: old.users.map((user) => {
+        if (user.id !== userId || !(user[field] ?? []).includes(accessId))
+          return user;
+        const patch: Partial<FlexUser> = {
+          [field]: (user[field] ?? []).filter((id) => id !== accessId),
+        };
+        if (field === "roomIds")
+          patch.switchIds = (user.switchIds ?? []).filter((id) => {
+            const wallSwitch = old.switches.find((item) => item.id === id);
+            return wallSwitch ? wallSwitch.roomId !== accessId : true;
+          });
+        return updateUserProfile(user, patch);
+      }),
+    }));
+  const reorderUserAccess = (
+    userId: number,
+    field: "roomIds" | "switchIds",
+    dragId: number,
+    targetId: number,
+  ) =>
+    patchUserAccess(userId, field, (list) => {
+      const from = list.indexOf(dragId);
+      const to = list.indexOf(targetId);
+      if (from < 0 || to < 0 || from === to) return null;
+      list.splice(from, 1);
+      list.splice(to, 0, dragId);
+      return list;
+    });
+
+  const selectedUser = data.users.find((user) => user.id === selectedUserId);
+  const selectedUserAreas = selectedUser
+    ? (selectedUser.roomIds ?? [])
+        .map((id) => data.rooms.find((room) => room.id === id))
+        .filter((room): room is Room => Boolean(room))
+    : [];
+  const selectedUserSwitches = selectedUser
+    ? (selectedUser.switchIds ?? [])
+        .map((id) => data.switches.find((item) => item.id === id))
+        .filter((item): item is WallSwitch => Boolean(item))
+    : [];
+  const selectedUserArea = selectedUserAreas.find(
+    (room) => room.id === selectedUserAreaId,
+  );
+  const selectedUserAreaSwitches = selectedUserArea
+    ? selectedUserSwitches.filter((item) => item.roomId === selectedUserArea.id)
+    : [];
+  const userAccessItem = (
+    field: "roomIds" | "switchIds",
+    id: number,
+    icon: string,
+    title: string,
+    subtitle: string,
+    onSelect?: () => void,
+    selected?: boolean,
+  ) => {
+    if (!selectedUser) return null;
+    const isSameList =
+      userDrag?.userId === selectedUser.id && userDrag.field === field;
+    const isDragSource = isSameList && userDrag?.id === id;
+    const isDropTarget = isSameList && !isDragSource && userDragOverId === id;
+    return (
+      <div
+        key={`${field}-${id}`}
+        className={`user-access-item${onSelect ? " selectable" : ""}${selected ? " selected" : ""}${isDropTarget ? " drop-target" : ""}${isDragSource ? " dragging" : ""}`}
+        draggable={installer}
+        onClick={onSelect}
+        onDragStart={() => setUserDrag({ userId: selectedUser.id, field, id })}
+        onDragOver={(event) => {
+          if (isSameList && !isDragSource) {
+            event.preventDefault();
+            setUserDragOverId(id);
+          }
+        }}
+        onDragLeave={() =>
+          setUserDragOverId((over) => (over === id ? null : over))
+        }
+        onDrop={(event) => {
+          event.preventDefault();
+          if (isSameList && userDrag)
+            reorderUserAccess(selectedUser.id, field, userDrag.id, id);
+          setUserDrag(null);
+          setUserDragOverId(null);
+        }}
+        onDragEnd={() => {
+          setUserDrag(null);
+          setUserDragOverId(null);
+        }}
+      >
+        <span className="drag-grip" aria-hidden="true">
+          ⠿
+        </span>
+        <img src={icon} alt="" />
+        <span className="user-access-name">
+          <b>{title}</b>
+          {subtitle && <small>{subtitle}</small>}
+        </span>
+        <button
+          className="access-remove"
+          disabled={!installer}
+          aria-label={`Remove ${title}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            removeUserAccess(selectedUser.id, field, id);
+          }}
+        >
+          ✕
+        </button>
+        {onSelect && <em aria-hidden="true">›</em>}
+      </div>
+    );
+  };
 
   const usersPanel = (
-    <div className="content-grid users-grid">
-      <section className="card">
-        <div className="card-title">
+    <div className="master-detail users-drill">
+      <section className="master card users-column">
+        <div className="master-head">
           <div>
             <small>USERS</small>
-            <h2>Remote Control profiles</h2>
+            <h2>Users</h2>
           </div>
           <button
-            className="primary"
+            aria-label="New user"
+            title="New user"
             disabled={!installer}
             onClick={() => {
+              const id = newId(data.users);
               setData((old) => {
                 const key = generateSecurityKey();
                 const user = updateUserProfile(
                   {
-                    id: newId(old.users),
+                    id,
                     name: "New user",
                     remote: false,
                     changes: false,
@@ -6244,196 +6415,507 @@ export default function FlexiDimWeb() {
                 );
                 return { ...old, users: [...old.users, user] };
               });
+              setSelectedUserId(id);
+              setSelectedUserAreaId(null);
               notify("New user created", "ok");
             }}
           >
-            ＋ New user
+            ＋
           </button>
         </div>
-        <div className="user-list">
-          {data.users.map((user) => (
-            <div key={user.id}>
+        {data.users.length ? (
+          data.users.map((user) => (
+            <button
+              key={user.id}
+              className={selectedUserId === user.id ? "selected" : ""}
+              onClick={() => {
+                setSelectedUserId(user.id);
+                setSelectedUserAreaId(null);
+              }}
+            >
               <img src="/flexidim/users.png" alt="" />
+              <span>
+                <b>{user.name}</b>
+                <small>
+                  {(user.roomIds ?? []).length} areas ·{" "}
+                  {(user.switchIds ?? []).length} switches
+                </small>
+              </span>
+              <em>›</em>
+            </button>
+          ))
+        ) : (
+          <Empty>No users yet.</Empty>
+        )}
+        <div className="users-master-foot">
+          <p className="hint">
+            Security codes are kept in this browser with the rest of the local
+            configuration. Export a backup before clearing browser data.
+          </p>
+          <button
+            onClick={() => {
+              navigator.clipboard?.writeText(
+                data.users.map((u) => `${u.name}: ${u.key}`).join("\n"),
+              );
+              addTrace("User keys copied");
+            }}
+          >
+            Copy all security codes
+          </button>
+          <button onClick={exportUserKeys}>Export keys and profiles</button>
+          <button
+            disabled
+            title="Controller user-profile transfer is not protocol-verified."
+          >
+            Send user profiles — not available
+          </button>
+        </div>
+      </section>
+      {selectedUser && (
+        <section className="card users-detail-column">
+          <div className="card-title">
+            <div>
+              <small>USER</small>
+              <h2>{selectedUser.name}</h2>
+            </div>
+            <button
+              className="delete"
+              disabled={!installer}
+              onClick={() => {
+                setData((old) => ({
+                  ...old,
+                  ...deleteConfigEntity(
+                    snapshotContent(old),
+                    "user",
+                    selectedUser.id,
+                  ),
+                }));
+                setSelectedUserId(null);
+                setSelectedUserAreaId(null);
+              }}
+            >
+              Delete
+            </button>
+          </div>
+          <div className="user-config">
+            <Field label="Name">
               <input
-                value={user.name}
+                value={selectedUser.name}
                 disabled={!installer}
                 onChange={(e) =>
                   setData((old) => ({
                     ...old,
                     users: old.users.map((u) =>
-                      u.id === user.id
+                      u.id === selectedUser.id
                         ? updateUserProfile(u, { name: e.target.value })
                         : u,
                     ),
                   }))
                 }
               />
-              <code>{user.key}</code>
+            </Field>
+            <div className="security-code-block">
+              <span className="option-label">Security code</span>
+              <div className="security-code">
+                <code>{selectedUser.key}</code>
+                <button
+                  className="copy-code"
+                  aria-label="Copy security code"
+                  title="Copy security code"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(selectedUser.key);
+                    notify("Security code copied", "ok");
+                  }}
+                >
+                  ⧉
+                </button>
+                <button
+                  className="generate-code"
+                  disabled={!installer}
+                  onClick={() => {
+                    const key = generateSecurityKey();
+                    setData((old) => ({
+                      ...old,
+                      users: old.users.map((item) =>
+                        item.id === selectedUser.id
+                          ? updateUserProfile(item, { key, securityCode: key })
+                          : item,
+                      ),
+                    }));
+                    notify("New security code generated", "ok");
+                  }}
+                >
+                  Generate new security code
+                </button>
+              </div>
               <small>
-                Profile v{user.profileVersion ?? 0} ·{" "}
-                {user.profileStatus ?? (user.profileData ? "current" : "not generated")}
+                Profile v{selectedUser.profileVersion ?? 0} ·{" "}
+                {selectedUser.profileStatus ??
+                  (selectedUser.profileData ? "current" : "not generated")}
               </small>
-              <button disabled={!installer} onClick={() => {
-                const key = generateSecurityKey();
+            </div>
+            <Toggle
+              label="Remote access"
+              checked={selectedUser.remote}
+              disabled={!installer}
+              onChange={(remote) =>
                 setData((old) => ({
-                  ...old, users: old.users.map((item) => item.id === user.id
-                    ? updateUserProfile(item, { key, securityCode: key })
-                    : item),
-                }));
-              }}>Generate security key</button>
-              <Toggle
-                label="Remote access"
-                checked={user.remote}
-                disabled={!installer}
-                onChange={(remote) =>
-                  setData((old) => ({
-                    ...old,
-                    users: old.users.map((u) =>
-                      u.id === user.id ? updateUserProfile(u, { remote }) : u,
-                    ),
-                  }))
-                }
-              />
-              <Toggle
-                label="Allow changes"
-                checked={user.changes}
-                disabled={!installer}
-                onChange={(changes) =>
-                  setData((old) => ({
-                    ...old,
-                    users: old.users.map((u) =>
-                      u.id === user.id ? updateUserProfile(u, { changes }) : u,
-                    ),
-                  }))
-                }
-              />
+                  ...old,
+                  users: old.users.map((u) =>
+                    u.id === selectedUser.id
+                      ? updateUserProfile(u, { remote })
+                      : u,
+                  ),
+                }))
+              }
+            />
+          </div>
+          <div className="user-access-head">
+            <strong>Areas</strong>
+            <span className="access-buttons">
               <button
-                className="delete"
+                className="access-add"
                 disabled={!installer}
+                aria-label={`Add area for ${selectedUser.name}`}
+                title="Add area"
                 onClick={() =>
-                  setData((old) => ({
-                    ...old,
-                    ...deleteConfigEntity(
-                      snapshotContent(old),
-                      "user",
-                      user.id,
-                    ),
-                  }))
+                  setUserAccessPicker({
+                    userId: selectedUser.id,
+                    kind: "room",
+                    floorId: null,
+                    roomId: null,
+                  })
                 }
               >
-                Delete
+                <img src="/flexidim/rooms/0.png" alt="" />
+                <i>＋</i>
               </button>
-              <div className="user-access-editor">
-                <strong>Rooms</strong>
-                {orderUserAccess(data.rooms, user.roomIds).map((room) => (
-                  <label key={room.id}>
-                    <input type="checkbox" disabled={!installer} checked={user.roomIds?.includes(room.id) ?? false} onChange={(event) => setData((old) => ({
-                      ...old, users: old.users.map((item) => item.id === user.id ? {
-                        ...updateUserProfile(item, {
-                          roomIds: event.target.checked
-                            ? [...(item.roomIds ?? []), room.id]
-                            : (item.roomIds ?? []).filter((id) => id !== room.id),
-                        }),
-                      } : item),
-                    }))} />
-                    {room.name}
-                    {user.roomIds?.includes(room.id) && (
-                      <span>
-                        <button
-                          type="button"
-                          disabled={!installer || user.roomIds.indexOf(room.id) === 0}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            moveUserAccess(user.id, "roomIds", room.id, -1);
-                          }}
-                        >
-                          ↑
-                        </button>
-                        <button
-                          type="button"
-                          disabled={!installer || user.roomIds.indexOf(room.id) === user.roomIds.length - 1}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            moveUserAccess(user.id, "roomIds", room.id, 1);
-                          }}
-                        >
-                          ↓
-                        </button>
-                      </span>
-                    )}
-                  </label>
-                ))}
-                <strong>Switches</strong>
-                {orderUserAccess(
-                  data.switches.filter((wallSwitch) => !user.roomIds?.length || user.roomIds.includes(wallSwitch.roomId)),
-                  user.switchIds,
-                ).map((wallSwitch) => (
-                  <label key={wallSwitch.id}>
-                    <input type="checkbox" disabled={!installer} checked={user.switchIds?.includes(wallSwitch.id) ?? false} onChange={(event) => setData((old) => ({
-                      ...old, users: old.users.map((item) => item.id === user.id ? {
-                        ...updateUserProfile(item, {
-                          switchIds: event.target.checked
-                            ? [...(item.switchIds ?? []), wallSwitch.id]
-                            : (item.switchIds ?? []).filter((id) => id !== wallSwitch.id),
-                        }),
-                      } : item),
-                    }))} />
-                    {wallSwitch.name}
-                    {user.switchIds?.includes(wallSwitch.id) && (
-                      <span>
-                        <button
-                          type="button"
-                          disabled={!installer || user.switchIds.indexOf(wallSwitch.id) === 0}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            moveUserAccess(user.id, "switchIds", wallSwitch.id, -1);
-                          }}
-                        >
-                          ↑
-                        </button>
-                        <button
-                          type="button"
-                          disabled={!installer || user.switchIds.indexOf(wallSwitch.id) === user.switchIds.length - 1}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            moveUserAccess(user.id, "switchIds", wallSwitch.id, 1);
-                          }}
-                        >
-                          ↓
-                        </button>
-                      </span>
-                    )}
-                  </label>
-                ))}
+              <button
+                className="access-add"
+                disabled={!installer}
+                aria-label={`Add switch for ${selectedUser.name}`}
+                title="Add switch"
+                onClick={() =>
+                  setUserAccessPicker({
+                    userId: selectedUser.id,
+                    kind: "switch",
+                    floorId: null,
+                    roomId: null,
+                  })
+                }
+              >
+                <img src="/flexidim/switches.png" alt="" />
+                <i>＋</i>
+              </button>
+            </span>
+          </div>
+          <div className="user-access-list">
+            {selectedUserAreas.length ? (
+              selectedUserAreas.map((room) =>
+                userAccessItem(
+                  "roomIds",
+                  room.id,
+                  room.icon,
+                  room.name,
+                  data.rooms.find((item) => item.id === room.parentId)?.name ??
+                    "Floor",
+                  () => setSelectedUserAreaId(room.id),
+                  selectedUserArea?.id === room.id,
+                ),
+              )
+            ) : (
+              <p className="hint">
+                No areas yet — use ＋ to grant access to an area or a switch.
+              </p>
+            )}
+          </div>
+        </section>
+      )}
+      {selectedUser && selectedUserArea && (
+        <section className="card users-switches-column">
+          <div className="card-title">
+            <div>
+              <small>SWITCHES</small>
+              <h2>{selectedUserArea.name}</h2>
+            </div>
+            <button
+              className="access-add"
+              disabled={!installer}
+              aria-label={`Add switch in ${selectedUserArea.name}`}
+              title="Add switch in this area"
+              onClick={() =>
+                setUserAccessPicker({
+                  userId: selectedUser.id,
+                  kind: "switch",
+                  floorId: data.rooms.some(
+                    (room) => room.id === selectedUserArea.parentId,
+                  )
+                    ? (selectedUserArea.parentId ?? selectedUserArea.id)
+                    : selectedUserArea.id,
+                  roomId: selectedUserArea.id,
+                })
+              }
+            >
+              <img src="/flexidim/switches.png" alt="" />
+              <i>＋</i>
+            </button>
+          </div>
+          <div className="user-access-list">
+            {selectedUserAreaSwitches.length ? (
+              selectedUserAreaSwitches.map((wallSwitch) =>
+                userAccessItem(
+                  "switchIds",
+                  wallSwitch.id,
+                  "/flexidim/switches.png",
+                  wallSwitch.name,
+                  `${wallSwitch.kind} · ${wallSwitch.buttons} buttons`,
+                ),
+              )
+            ) : (
+              <p className="hint">
+                No switches from this area yet — use ＋ to add one.
+              </p>
+            )}
+          </div>
+        </section>
+      )}
+      {userAccessPicker &&
+        (() => {
+          const picker = userAccessPicker;
+          const pickerUser = data.users.find(
+            (item) => item.id === picker.userId,
+          );
+          if (!pickerUser) return null;
+          const close = () => setUserAccessPicker(null);
+          const heading =
+            picker.roomId != null
+              ? roomName(picker.roomId)
+              : picker.floorId != null
+                ? roomName(picker.floorId)
+                : picker.kind === "room"
+                  ? "Add area"
+                  : "Add switch";
+          const pickRoom = (roomId: number) => {
+            grantUserAreas(picker.userId, [roomId]);
+            if (picker.userId === selectedUserId)
+              setSelectedUserAreaId(roomId);
+            close();
+          };
+          // Granting a switch also grants its area, mirroring the iOS app.
+          const pickSwitch = (switchId: number) => {
+            const wallSwitch = data.switches.find(
+              (item) => item.id === switchId,
+            );
+            if (wallSwitch) {
+              addUserAccess(picker.userId, "roomIds", wallSwitch.roomId);
+              addUserAccess(picker.userId, "switchIds", switchId);
+              if (picker.userId === selectedUserId)
+                setSelectedUserAreaId(wallSwitch.roomId);
+            }
+            close();
+          };
+          const roomEntry = (room: Room, subtitle: string) => {
+            const added = pickerUser.roomIds?.includes(room.id) ?? false;
+            return (
+              <button
+                key={`room-${room.id}`}
+                className={`scene-picker-scene${added ? " added" : ""}`}
+                disabled={added}
+                onClick={() => pickRoom(room.id)}
+              >
+                <img src={room.icon} alt="" />
+                <span>
+                  <b>{room.name}</b>
+                  <small>{added ? "Already added" : subtitle}</small>
+                </span>
+              </button>
+            );
+          };
+          return (
+            <div className="scene-picker-overlay" onClick={close}>
+              <div
+                className="scene-picker"
+                role="dialog"
+                aria-label={
+                  picker.kind === "room" ? "Add an area" : "Add a switch"
+                }
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="scene-picker-head">
+                  {picker.floorId != null ? (
+                    <button
+                      className="scene-picker-back"
+                      onClick={() =>
+                        setUserAccessPicker(
+                          picker.roomId != null
+                            ? { ...picker, roomId: null }
+                            : { ...picker, floorId: null },
+                        )
+                      }
+                    >
+                      ‹ Back
+                    </button>
+                  ) : (
+                    <span />
+                  )}
+                  <strong>{heading}</strong>
+                  <button
+                    className="scene-picker-close"
+                    aria-label="Close"
+                    onClick={close}
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div className="scene-picker-list">
+                  {picker.floorId == null ? (
+                    rootAreas.length ? (
+                      rootAreas.map((floor) => {
+                        const descendantIds = new Set(
+                          areaDescendants(floor.id),
+                        );
+                        const switchCount = data.switches.filter((item) =>
+                          descendantIds.has(item.roomId),
+                        ).length;
+                        return (
+                          <button
+                            key={`floor-${floor.id}`}
+                            className="scene-picker-group"
+                            onClick={() =>
+                              setUserAccessPicker({
+                                ...picker,
+                                floorId: floor.id,
+                              })
+                            }
+                          >
+                            <img src={floor.icon} alt="" />
+                            <span>
+                              <b>{floor.name}</b>
+                              <small>
+                                {picker.kind === "room"
+                                  ? `${descendantIds.size - 1 || 1} areas`
+                                  : `${switchCount} switches`}
+                              </small>
+                            </span>
+                            <em>›</em>
+                          </button>
+                        );
+                      })
+                    ) : (
+                      <p className="hint">No areas defined yet.</p>
+                    )
+                  ) : picker.kind === "room" ? (
+                    (() => {
+                      const floor = data.rooms.find(
+                        (room) => room.id === picker.floorId,
+                      );
+                      const rooms = roomsOfFloor(picker.floorId);
+                      const includeFloor =
+                        floor && !rooms.some((room) => room.id === floor.id);
+                      const floorSwitchCount = data.switches.filter((item) =>
+                        rooms.some((room) => room.id === item.roomId),
+                      ).length;
+                      const allAdded = rooms.every(
+                        (room) => pickerUser.roomIds?.includes(room.id) ?? false,
+                      );
+                      return (
+                        <>
+                          {includeFloor && (
+                            <button
+                              className={`scene-picker-scene${allAdded ? " added" : ""}`}
+                              disabled={allAdded}
+                              onClick={() => {
+                                grantUserAreas(
+                                  picker.userId,
+                                  rooms.map((room) => room.id),
+                                );
+                                close();
+                              }}
+                            >
+                              <img src={floor.icon} alt="" />
+                              <span>
+                                <b>All of {floor.name}</b>
+                                <small>
+                                  {allAdded
+                                    ? "Already added"
+                                    : `Adds ${rooms.length} areas · ${floorSwitchCount} switches`}
+                                </small>
+                              </span>
+                            </button>
+                          )}
+                          {rooms.map((room) =>
+                            roomEntry(
+                              room,
+                              `${
+                                data.switches.filter(
+                                  (item) => item.roomId === room.id,
+                                ).length
+                              } switches`,
+                            ),
+                          )}
+                        </>
+                      );
+                    })()
+                  ) : picker.roomId == null ? (
+                    roomsOfFloor(picker.floorId).map((room) => (
+                      <button
+                        key={`room-${room.id}`}
+                        className="scene-picker-group"
+                        onClick={() =>
+                          setUserAccessPicker({ ...picker, roomId: room.id })
+                        }
+                      >
+                        <img src={room.icon} alt="" />
+                        <span>
+                          <b>{room.name}</b>
+                          <small>
+                            {
+                              data.switches.filter(
+                                (item) => item.roomId === room.id,
+                              ).length
+                            } switches
+                          </small>
+                        </span>
+                        <em>›</em>
+                      </button>
+                    ))
+                  ) : (
+                    (() => {
+                      const switches = data.switches.filter(
+                        (item) => item.roomId === picker.roomId,
+                      );
+                      if (!switches.length)
+                        return <p className="hint">No switches in this area.</p>;
+                      return switches.map((wallSwitch) => {
+                        const added =
+                          pickerUser.switchIds?.includes(wallSwitch.id) ??
+                          false;
+                        return (
+                          <button
+                            key={`switch-${wallSwitch.id}`}
+                            className={`scene-picker-scene${added ? " added" : ""}`}
+                            disabled={added}
+                            onClick={() => pickSwitch(wallSwitch.id)}
+                          >
+                            <img src="/flexidim/switches.png" alt="" />
+                            <span>
+                              <b>{wallSwitch.name}</b>
+                              <small>
+                                {added
+                                  ? "Already added"
+                                  : `${wallSwitch.kind} · ${wallSwitch.buttons} buttons`}
+                              </small>
+                            </span>
+                          </button>
+                        );
+                      });
+                    })()
+                  )}
+                </div>
               </div>
             </div>
-          ))}
-        </div>
-      </section>
-      <section className="card user-info">
-        <img src="/flexidim/icon.png" alt="FlexiDim" />
-        <h2>User security keys</h2>
-        <p>
-          Keys are kept in this browser with the rest of the local
-          configuration. Export a backup before clearing browser data.
-        </p>
-        <button
-          onClick={() => {
-            navigator.clipboard?.writeText(
-              data.users.map((u) => `${u.name}: ${u.key}`).join("\n"),
-            );
-            addTrace("User keys copied");
-          }}
-        >
-          Copy all keys
-        </button>
-        <button onClick={exportUserKeys}>
-          Export keys and profiles
-        </button>
-        <button disabled title="Controller user-profile transfer is not protocol-verified.">
-          Send user profiles — not available
-        </button>
-      </section>
+          );
+        })()}
     </div>
   );
 
