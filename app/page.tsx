@@ -835,6 +835,24 @@ export default function FlexiDimWeb() {
     frameCount?: number;
     transcriptSha256?: string;
   } | null>(null);
+  const [userProfileDialog, setUserProfileDialog] = useState<
+    "closed" | "warning" | "running" | "result"
+  >("closed");
+  const [userProfileProgress, setUserProfileProgress] = useState<{
+    state?: string;
+    message?: string;
+    userIndex?: number;
+    userCount?: number;
+  } | null>(null);
+  const [userProfileResult, setUserProfileResult] = useState<{
+    state: string;
+    outcome?: string;
+    message?: string;
+    frameCount?: number;
+    userCount?: number;
+    replyObserved?: boolean;
+    controllerBytes?: { phase: string; hex: string }[];
+  } | null>(null);
   const [userDrag, setUserDrag] = useState<{
     userId: number;
     field: "roomIds" | "switchIds";
@@ -1404,6 +1422,28 @@ export default function FlexiDimWeb() {
             message.message ?? "Offline user-profile dry run finished",
             message.state === "passed" ? "ok" : "warn",
           );
+        } else if (message.type === "userProfileProgress") {
+          setUserProfileProgress(
+            message as { state?: string; message?: string; userIndex?: number; userCount?: number },
+          );
+          addTrace(message.message ?? `User-profile state: ${message.state}`);
+        } else if (message.type === "userProfileResult") {
+          const profileResult = message as {
+            state: string;
+            outcome?: string;
+            message?: string;
+            frameCount?: number;
+            userCount?: number;
+            replyObserved?: boolean;
+            controllerBytes?: { phase: string; hex: string }[];
+          };
+          setUserProfileResult(profileResult);
+          setUserProfileDialog("result");
+          setUserProfileProgress(null);
+          notify(
+            profileResult.message ?? "User-profile send finished",
+            profileResult.state === "completed" ? "ok" : "warn",
+          );
         } else if (message.type === "transferPreflight") {
           setTransferPreflight(message as TransferPreflight);
           setTransferProgress(null);
@@ -1699,6 +1739,39 @@ export default function FlexiDimWeb() {
     setUserProfilePreflight(null);
     send({
       type: "userProfileDryRun",
+      userPayloadsBase64: users.payloads.map(bytesToBase64),
+    });
+  };
+
+  /**
+   * The live user-profile send. The bridge re-runs the offline dry run over
+   * these exact payloads before any byte is written, so the preflight check
+   * here is a courtesy gate, not the safety boundary.
+   */
+  const beginUserProfileSend = () => {
+    const users = compileUserProfiles(data);
+    if (!users.complete) {
+      notify(
+        `User profiles cannot be sent yet: ${users.problems.join(" ")}`,
+        "warn",
+      );
+      return;
+    }
+    if (userProfilePreflight?.state !== "passed") {
+      notify("Run the offline user-profile check first.", "warn");
+      return;
+    }
+    setUserProfileResult(null);
+    setUserProfileProgress({
+      state: "sending",
+      message: `Sending user profile 1 of ${users.payloads.length}`,
+      userIndex: 0,
+      userCount: users.payloads.length,
+    });
+    setUserProfileDialog("running");
+    send({
+      type: "userProfiles",
+      confirm: "Continue",
       userPayloadsBase64: users.payloads.map(bytesToBase64),
     });
   };
@@ -6547,6 +6620,17 @@ export default function FlexiDimWeb() {
             onClick={runUserProfileDryRun}
             title="Compile every frame the original app would send, and check it offline."
           >
+            Check user profiles
+          </button>
+          <button
+            className="primary"
+            disabled={
+              userProfilePreflight?.state !== "passed" ||
+              connection !== "connected"
+            }
+            onClick={() => setUserProfileDialog("warning")}
+            title="Send the checked profiles to the connected Scene Controller."
+          >
             Send user profiles
           </button>
           {userProfilePreflight && (
@@ -6557,9 +6641,9 @@ export default function FlexiDimWeb() {
                 <>
                   <b>Ready to send.</b> {userProfilePreflight.userCount} profiles
                   compile into {userProfilePreflight.frameCount} frames matching
-                  the original app. Sending to the controller stays disabled
-                  until a controller reply to this exchange has been observed on
-                  hardware.
+                  the original app. “Send user profiles” transmits them to the
+                  connected Scene Controller, which resets afterwards; every
+                  byte the controller sends back is captured.
                 </>
               ) : (
                 userProfilePreflight.message
@@ -7209,6 +7293,91 @@ export default function FlexiDimWeb() {
                   <button
                     className="primary"
                     onClick={() => setTransferDialog("closed")}
+                  >
+                    OK
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+      {userProfileDialog !== "closed" && (
+        <div className="transfer-dialog-overlay">
+          <div
+            className="transfer-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="user-profile-dialog-title"
+          >
+            {userProfileDialog === "warning" ? (
+              <>
+                <h2 id="user-profile-dialog-title">
+                  Ready to send user profiles to Scene Controller
+                </h2>
+                <p>
+                  Continuing will send every user profile to the Scene
+                  Controller. After the last profile is sent, the app stops and
+                  the Scene Controller saves the profiles and resets itself —
+                  this can take a few minutes, during which switches will not
+                  respond and light levels may change or go off.
+                </p>
+                <p>
+                  Do not send commands or make changes until it has returned to
+                  normal. Everything the controller sends back is captured and
+                  shown in the result.
+                </p>
+                <div className="transfer-dialog-actions">
+                  <button onClick={() => setUserProfileDialog("closed")}>
+                    Cancel
+                  </button>
+                  <button className="primary" onClick={beginUserProfileSend}>
+                    Continue
+                  </button>
+                </div>
+              </>
+            ) : userProfileDialog === "running" ? (
+              <>
+                <h2 id="user-profile-dialog-title">
+                  Send user profiles to Scene Controller
+                </h2>
+                <p className="transfer-phase">
+                  {userProfileProgress?.message ?? "Sending user profiles"}
+                </p>
+                {userProfileProgress?.state === "awaiting-reply" && (
+                  <p className="transfer-wait">
+                    Nothing more is being sent to the controller.
+                  </p>
+                )}
+              </>
+            ) : (
+              <>
+                <h2 id="user-profile-dialog-title">
+                  {userProfileResult?.state === "completed"
+                    ? "User profiles sent successfully"
+                    : "User-profile send stopped"}
+                </h2>
+                <p>{userProfileResult?.message}</p>
+                <p className="hint">
+                  {userProfileResult?.controllerBytes?.length
+                    ? `Captured ${userProfileResult.controllerBytes.length} controller ${
+                        userProfileResult.controllerBytes.length === 1
+                          ? "reply"
+                          : "replies"
+                      } during the exchange — keep this as protocol evidence:`
+                    : "The Scene Controller sent no bytes during the exchange."}
+                </p>
+                {userProfileResult?.controllerBytes?.length ? (
+                  <pre className="user-profile-capture">
+                    {userProfileResult.controllerBytes
+                      .map((item) => `[${item.phase}] ${item.hex}`)
+                      .join("\n")}
+                  </pre>
+                ) : null}
+                <div className="transfer-dialog-actions">
+                  <button
+                    className="primary"
+                    onClick={() => setUserProfileDialog("closed")}
                   >
                     OK
                   </button>

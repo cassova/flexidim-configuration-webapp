@@ -563,6 +563,33 @@ This gate may generate bytes but must not open a socket.
       validated normal controller status records have completed.
 - [ ] On failure, state whether any image blocks were accepted and present the
       tested recovery procedure.
+- [ ] Add the iOS app's yellow "connected but not normal" indicator to the
+      web app's connection status. The original app ships two connection icons
+      (`connected.png` and `connectedY.png`) and shows the yellow one when it
+      has a live authenticated session but the controller is not reporting
+      normal status. Observed for real on 2026-07-29: after a user-profile
+      send, the installed controller sat in suspended-transfer mode for 10+
+      minutes emitting periodic `f3` records (`f3 0e 0c 0d`) instead of the
+      ordinary `f2`/`f4` status stream, acknowledged `dim` commands without
+      executing them, ignored physical switches, and recovered only on power
+      cycle. The web app showed a plain "connected" state throughout, which
+      hid exactly the condition the operator needed to see.
+      **When to show yellow:** authenticated controller session AND either
+      (a) no checksum-valid ordinary `f2`/`f4` status record received within
+      the last ~10 seconds (normal firmware streams them passively — the
+      compose smoke test observed passive `f2` within seconds), or (b) `f3`
+      records are arriving. **When to show normal:** authenticated and
+      recent valid `f2`/`f4` traffic. **When to clear to offline/error:**
+      unchanged from today. Implementation: the bridge already parses every
+      reply (`parseControllerReplies`); track a last-normal-status timestamp
+      per controller connection, include a `normalStatus` flag in the status
+      messages it already emits, and give the UI status pill a yellow state
+      with the explanation "Connected — Scene Controller is not reporting
+      normal status; physical switches may be suspended and command
+      acknowledgements may not reflect real output changes."
+      **When to do this:** before the next live user-profile send attempt —
+      it is the operator's primary cue that the controller is stuck in
+      transfer mode and needs recovery.
 
 ---
 

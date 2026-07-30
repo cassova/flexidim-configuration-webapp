@@ -1,60 +1,73 @@
-// Drive the user-profile-only send against a live controller, and report what
-// happens the way the full transfer does.
+// Drive the user-profile-only send against a live controller, mirroring what
+// the original iOS app actually does — no more, no less.
 //
-// Two halves, with very different evidence behind them.
+// THE WRITE HALF is oracle-proven. The app writes this fixed conversation on a
+// 50 ms timer (JCLTabViewController -processUsDownload:) and never gates a write
+// on a reply: the oracle completed a whole pass with no controller bytes
+// supplied at all (tools/oracle/private/user_capture.m), and feeding the real
+// captured replies to its reply ivar produced byte-identical frames. So the
+// frames and their cadence are fixed, and one tick is one timer fire.
 //
-// The WRITE half is oracle-proven. The original app writes this conversation on
-// its 100 ms timer and never gates a write on a reply: the oracle completed a
-// whole pass with no controller bytes supplied at all
-// (tools/oracle/private/user_capture.m). So the frames and their cadence are
-// fixed, and one session tick is one timer fire.
+// WHAT THE APP DOES AFTER THE SEND (recovered 2026-07-29 from the disassembly of
+// -processUsDownload: at 0x1000a8bf8): when -sendUserData:userOnly: reports it
+// has sent the terminal `ff fe`, the app stops its timer, stops and hides its
+// activity indicator, and RETURNS. It does not disconnect, does not read the
+// controller, does not wait for a reset, does not count status records. It goes
+// silent and leaves the connection idle. The controller commits `ff fe` and
+// resets itself on its own timer afterwards.
 //
-// The OBSERVE half reuses signals that are already hardware-verified from the
-// full transfer, and is why this runner exists rather than a bare write loop.
-// The trailing `ff fe` makes the profiles permanent, and an operator has since
-// observed a real controller resetting after an iPad user-profile send — the
-// same thing that ends a successful full transfer. So after the last frame this
-// runner waits exactly as the full transfer's reset wait does: it watches for
-// the disconnect, reconnects on the original app's 1 s + 2 s schedule, and
-// counts validated `f2`/`f4` status records until the controller is running
-// normally again.
+// An earlier version of this runner copied the FULL transfer's ending —
+// reset-wait, reconnect, ten status records — which the user-only path does not
+// have. Combined with the bridge keeping the link busy, that pinned a real
+// controller in suspended-transfer mode until it was power-cycled. This runner
+// therefore does exactly what the app does: send, then go silent.
 //
-// Everything the controller sends is captured verbatim throughout, including
-// during the write phase. Whether that phase draws per-frame replies has never
-// been observed; capturing it is how that question gets answered.
+// The ONE thing this adds over the app, and only for feedback and evidence, is a
+// passive listen after the last frame. Listening transmits nothing, so it is
+// safe. The controller replied within a fraction of a second on the first
+// hardware run (an `f2` status record and an `06` ack); observing that reply is
+// what lets the UI say "uploaded, now resetting" instead of the app's silence.
+// It is a courtesy window with a hard timeout — never a wait the send depends on.
 
-import { parseControllerReplies } from "./controller-replies.mjs";
 import { UserProfileTransferSession } from "./user-transfer.mjs";
 import { validateTransferFrame } from "./transfer-safety.mjs";
 
-const TICK_MS = 100;
-const RECONNECT_DELAY_MS = 3_000;
-// The full transfer's own completion rule: ten validated status records.
-const NORMAL_STATUS_COUNT = 10;
-// 1,201 ticks at 100 ms, matching the original app's reset patience.
-const RESET_TIMEOUT_TICKS = 1201;
+// The app's own user-only tick interval.
+const TICK_MS = 50;
+// How long to listen for the controller's reply after the last frame before
+// reporting the send as complete-without-a-reply. The app waits zero; this is
+// purely for feedback, so it is short and bounded.
+const REPLY_WINDOW_MS = 10_000;
+// Once the first reply byte arrives, gather the rest of the burst (the observed
+// reply was `f2 …` immediately followed by `06`) before finishing, so the
+// captured evidence is the whole exchange rather than its first packet.
+const REPLY_SETTLE_MS = 2_000;
 
 const USER_PROFILE_MESSAGES = Object.freeze({
   sending: (index, count) => `Sending user profile ${index} of ${count}`,
-  makingPermanent: "Making permanent - this takes up to 60 seconds",
-  resetting: "User profiles sent - resetting Scene Controller",
-  resetDuration: "This takes about 60 seconds",
-  reconnecting: "Scene Controller reset detected; reconnecting in 3 seconds",
-  resetWait: "Reconnected; waiting for normal Scene Controller status",
-  retrying: "Scene Controller has not returned; retrying the iOS reconnect cycle",
-  resetNotDetected: "Scene controller reset not detected",
-  resetAdvisory:
-    "The Scene Controller will reset automatically in a few minutes, if it is not already working normally.",
-  completed: "User profiles sent successfully",
-  runningNormally: "Scene controller running normally",
+  sent: "User profiles sent - waiting for the Scene Controller to respond",
+  responded: "Scene Controller responded - finishing",
+  // Terminal, dismissible wording. Deliberately does not promise the reset
+  // completes on its own: the one hardware run so far did not self-reset, so the
+  // power-cycle fallback stays until a silent send is observed to recover.
+  uploaded:
+    "User profiles uploaded. The Scene Controller is now saving them and should reset itself, which can take a few minutes. Do not send commands or make changes until it has finished. If it has not returned to normal after several minutes, it may need to be power-cycled.",
+  resetStarted:
+    "User profiles uploaded and the Scene Controller has started to reset. This can take a few minutes, during which switches will not respond. Do not send commands or make changes until it has finished.",
+  noReply:
+    "User profiles were sent, but the Scene Controller did not respond within the wait window. It should save them and reset shortly. Do not send commands or make changes until it has returned to normal; if it has not after several minutes, it may need to be power-cycled.",
+  unexpectedDisconnect:
+    "The Scene Controller disconnected before every profile had been sent.",
 });
+
+// Outcomes where every frame reached the controller. All are surfaced as a
+// completed send; only their wording differs.
+const SENT_OUTCOMES = new Set(["completed", "reset-started", "sent-no-reply"]);
 
 export class UserProfileSendRunner {
   constructor({
     userPayloads = [],
     write,
-    reconnect = () => undefined,
-    close = () => undefined,
     progress = () => undefined,
     result = () => undefined,
     ordinaryData = () => undefined,
@@ -67,8 +80,6 @@ export class UserProfileSendRunner {
       throw new TypeError("user-profile runner requires a write function");
     this.session = new UserProfileTransferSession({ userPayloads });
     this.write = write;
-    this.reconnect = reconnect;
-    this.close = close;
     this.progress = progress;
     this.result = result;
     this.ordinaryData = ordinaryData;
@@ -79,12 +90,9 @@ export class UserProfileSendRunner {
     this.frames = [];
     this.messages = [];
     // Bytes the controller sent, tagged with the phase they arrived in. This is
-    // the unobserved half of the exchange; it is always recorded.
+    // the half of the exchange the app never observed; it is always recorded.
     this.controllerBytes = [];
-    this.statusBuffer = Buffer.alloc(0);
-    this.normalStatusCount = 0;
-    this.resetTicks = 0;
-    this.connected = true;
+    this.replySeen = false;
     this.phase = "idle";
     this.finished = false;
   }
@@ -113,47 +121,44 @@ export class UserProfileSendRunner {
   }
 
   /**
-   * Bytes from the controller. During the write phase they are recorded but
-   * never allowed to steer the send, because the original app does not consult
-   * them there. During the reset wait they drive completion, exactly as the
-   * full transfer's final-status counting does.
+   * Bytes from the controller. Always captured; nothing here is allowed to throw
+   * into the socket data handler, and nothing is ever written in response.
    */
   receive(bytes) {
     const data = Buffer.from(bytes ?? []);
     if (!this.active || !data.length) return data;
     this.controllerBytes.push({ phase: this.phase, hex: data.toString("hex") });
-    if (this.phase === "sending") {
-      this.report(
-        `Scene Controller sent ${data.length} bytes during the user-profile send`,
-        { reply: data.toString("hex") },
+    try {
+      if (this.phase === "sending") {
+        // The app consults nothing here, so this cannot steer the send. It is
+        // recorded because it is the missing evidence.
+        this.report(
+          `Scene Controller sent ${data.length} bytes during the user-profile send`,
+          { reply: data.toString("hex") },
+        );
+      } else if (this.phase === "awaiting-reply" && !this.replySeen) {
+        // The reply we were listening for. Gather the rest of the burst, then
+        // finish as a confirmed upload.
+        this.replySeen = true;
+        this.report(USER_PROFILE_MESSAGES.responded);
+        if (this.replyWindowTimer) this.clearTimeoutFn(this.replyWindowTimer);
+        this.settleTimer = this.setTimeoutFn(
+          () => this.finish("completed"),
+          REPLY_SETTLE_MS,
+        );
+      }
+    } catch (error) {
+      this.messages.push(
+        `Controller bytes were captured but could not be interpreted: ${error.message}`,
       );
-      return Buffer.alloc(0);
     }
-    this.statusBuffer = Buffer.concat([this.statusBuffer, data]);
-    const parsed = parseControllerReplies(this.statusBuffer);
-    this.statusBuffer = Buffer.from(parsed.rest);
-    this.normalStatusCount += parsed.transferStatuses.length;
-    const passthrough = Buffer.concat([...parsed.visible, ...parsed.invalid]);
-    if (passthrough.length) this.ordinaryData(passthrough);
-    if (this.normalStatusCount >= NORMAL_STATUS_COUNT) {
-      this.report(USER_PROFILE_MESSAGES.runningNormally);
-      this.stop("completed");
-    }
+    // Consume everything: the runner owns the socket until it finishes, and the
+    // bytes are already captured.
     return Buffer.alloc(0);
   }
 
   tick() {
-    if (!this.active) return;
-    if (this.phase === "reset-wait") {
-      this.resetTicks += 1;
-      if (this.resetTicks >= RESET_TIMEOUT_TICKS) {
-        this.report(USER_PROFILE_MESSAGES.resetNotDetected);
-        this.report(USER_PROFILE_MESSAGES.resetAdvisory);
-        // The profiles were written; only the reset was not seen.
-        this.stop("reset-not-detected");
-      }
-      return;
-    }
+    if (!this.active || this.phase !== "sending") return;
     try {
       const { frames, snapshot } = this.session.next();
       for (const frame of frames) {
@@ -169,94 +174,79 @@ export class UserProfileSendRunner {
         );
         return;
       }
-      this.phase = "reset-wait";
-      this.resetTicks = 0;
-      this.report(USER_PROFILE_MESSAGES.makingPermanent);
-      this.report(USER_PROFILE_MESSAGES.resetting);
-      this.report(USER_PROFILE_MESSAGES.resetDuration);
+      // Every frame is out, including the terminal `ff fe`. Stop transmitting —
+      // exactly what the app does — and listen passively for a bounded window.
+      if (this.timer) this.clearIntervalFn(this.timer);
+      this.phase = "awaiting-reply";
+      this.report(USER_PROFILE_MESSAGES.sent);
+      this.replyWindowTimer = this.setTimeoutFn(
+        () => this.finish("sent-no-reply"),
+        REPLY_WINDOW_MS,
+      );
     } catch (error) {
       this.failureMessage = error.message;
-      this.stop("failed");
+      this.finish("failed");
     }
   }
 
-  /** The controller dropping the link after `ff fe` is the reset starting. */
+  /**
+   * The controller dropping the link. Before the send is complete that is a
+   * failure; during the listen window it is the reset actually starting — the
+   * best outcome there is.
+   */
   disconnected() {
-    if (!this.active || !this.connected) return;
-    this.connected = false;
-    if (this.phase !== "reset-wait") {
-      this.failureMessage =
-        "The Scene Controller disconnected before every profile had been sent.";
-      this.stop("unexpected-disconnect");
+    if (!this.active) return;
+    if (this.phase === "awaiting-reply") {
+      this.finish("reset-started");
       return;
     }
-    this.report(USER_PROFILE_MESSAGES.reconnecting);
-    this.scheduleReconnect();
-  }
-
-  scheduleReconnect() {
-    if (!this.active || this.connected || this.reconnectTimer) return;
-    this.reconnectTimer = this.setTimeoutFn(() => {
-      this.reconnectTimer = undefined;
-      if (!this.active || this.connected) return;
-      this.reconnect({
-        connected: () => this.reconnected(),
-        failed: () => this.reconnectFailed(),
-      });
-    }, RECONNECT_DELAY_MS);
-  }
-
-  reconnected() {
-    if (!this.active || this.phase !== "reset-wait") return false;
-    this.connected = true;
-    this.report(USER_PROFILE_MESSAGES.resetWait);
-    return true;
-  }
-
-  reconnectFailed() {
-    if (!this.active || this.connected) return;
-    this.report(USER_PROFILE_MESSAGES.retrying);
-    this.scheduleReconnect();
+    this.failureMessage = USER_PROFILE_MESSAGES.unexpectedDisconnect;
+    this.finish("unexpected-disconnect");
   }
 
   cancel(reason = "operator") {
     if (!this.active) return false;
     this.failureMessage = `User-profile send cancelled: ${reason}`;
-    this.stop("cancelled");
+    this.finish("cancelled");
     return true;
   }
 
-  stop(outcome) {
+  finish(outcome) {
     if (this.finished) return;
     this.finished = true;
     this.phase = "stopped";
     if (this.timer) this.clearIntervalFn(this.timer);
-    if (this.reconnectTimer) this.clearTimeoutFn(this.reconnectTimer);
-    if (outcome === "completed") this.messages.push(USER_PROFILE_MESSAGES.completed);
+    if (this.replyWindowTimer) this.clearTimeoutFn(this.replyWindowTimer);
+    if (this.settleTimer) this.clearTimeoutFn(this.settleTimer);
+    const sent = SENT_OUTCOMES.has(outcome);
+    const message =
+      outcome === "completed"
+        ? USER_PROFILE_MESSAGES.uploaded
+        : outcome === "reset-started"
+          ? USER_PROFILE_MESSAGES.resetStarted
+          : outcome === "sent-no-reply"
+            ? USER_PROFILE_MESSAGES.noReply
+            : (this.failureMessage ?? `User-profile send stopped: ${outcome}`);
+    this.messages.push(message);
     this.result({
       outcome,
+      state: sent ? "completed" : "failed",
       frameCount: this.frames.length,
       frameNames: Object.freeze([...this.frames]),
       userCount: this.session.userPayloads.length,
-      // Every byte the controller sent, so an operator can hand back the first
-      // real observation of this exchange.
+      replyObserved: this.replySeen,
+      // Every byte the controller sent, so an operator has the first real
+      // observation of this exchange.
       controllerBytes: Object.freeze([...this.controllerBytes]),
-      normalStatusCount: this.normalStatusCount,
       messages: Object.freeze([...this.messages]),
-      message:
-        outcome === "completed"
-          ? `${USER_PROFILE_MESSAGES.completed}. ${USER_PROFILE_MESSAGES.runningNormally}.`
-          : outcome === "reset-not-detected"
-            ? `${this.session.userPayloads.length} profiles were sent, but ${USER_PROFILE_MESSAGES.resetNotDetected.toLowerCase()}. ${USER_PROFILE_MESSAGES.resetAdvisory}`
-            : (this.failureMessage ?? `User-profile send stopped: ${outcome}`),
+      message,
     });
   }
 }
 
 export const USER_PROFILE_RUNNER_TIMING = Object.freeze({
   tickMs: TICK_MS,
-  reconnectDelayMs: RECONNECT_DELAY_MS,
-  normalStatusCount: NORMAL_STATUS_COUNT,
-  resetTimeoutTicks: RESET_TIMEOUT_TICKS,
+  replyWindowMs: REPLY_WINDOW_MS,
+  replySettleMs: REPLY_SETTLE_MS,
 });
 export { USER_PROFILE_MESSAGES };

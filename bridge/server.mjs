@@ -32,10 +32,10 @@ const BRIDGE_TOKEN = String(process.env.FLEXIDIM_BRIDGE_TOKEN || "");
 const BRIDGE_ORIGINS = String(process.env.FLEXIDIM_BRIDGE_ORIGINS || "")
   .split(",").map((value) => value.trim()).filter(Boolean);
 // Sending user profiles writes to the controller on a path whose reply has
-// never been observed, so it stays off until the operator turns it on for a
-// bridge process. The frames themselves are oracle-verified.
-const USER_PROFILE_SEND_ENABLED =
-  String(process.env.FLEXIDIM_ENABLE_USER_PROFILE_SEND || "") === "1";
+// never been observed. The operator authorised the first live run on
+// 2026-07-29 to capture that reply, so the gate is baked open; every byte the
+// controller sends during the exchange is still recorded and returned.
+const USER_PROFILE_SEND_ENABLED = true;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 if (!LOOPBACK_HOSTS.has(BRIDGE_HOST) && !BRIDGE_TOKEN) {
   throw new Error("FLEXIDIM_BRIDGE_TOKEN is required when the bridge binds beyond loopback");
@@ -326,7 +326,7 @@ function startLiveTransfer(ws, clientId, message) {
 /**
  * Send user profiles only, with no configuration image. The frames match the
  * original app byte-for-byte; the controller's side of the exchange has never
- * been observed, which is why this needs the operator opt-in below.
+ * been observed, which is why every byte it sends is captured and returned.
  */
 function startUserProfileSend(ws, clientId, message) {
   const controller = controllers.get(ws);
@@ -359,38 +359,18 @@ function startUserProfileSend(ws, clientId, message) {
       };
       log(`→ TX user profile ${frame.name}, ${bytes.length} bytes`);
     },
-    reconnect: ({ connected, failed }) => {
-      const connection = controller.flexidimConnection;
-      connectController(
-        ws,
-        connection.host,
-        connection.port,
-        connection.securityCode,
-        {
-          userProfileRunner: runner,
-          onConnected: () => connected(),
-          onFailed: () => failed(),
-          quiet: true,
-        },
-      );
-    },
-    ordinaryData: (data) => {
-      const active = controllers.get(ws);
-      if (!active || !data.length) return;
-      active.flexidimRxBuffer = Buffer.concat([
-        active.flexidimRxBuffer ?? Buffer.alloc(0),
-        data,
-      ]);
-    },
+    // No reconnect callback: the app never reconnects after this send, and doing
+    // so is what pinned a real controller in transfer mode. The runner goes
+    // silent after `ff fe` and only listens.
     progress: (value) => emit(ws, { type: "userProfileProgress", ...value }),
     result: (value) => {
       userProfileSends.delete(ws);
       transferSafety.finishLiveUserProfiles(clientId, value.outcome, {
         frameCount: value.frameCount,
         userCount: value.userCount,
+        replyObserved: value.replyObserved,
         // Whatever the controller said is the evidence this path was missing.
         controllerBytes: value.controllerBytes.length,
-        normalStatusCount: value.normalStatusCount,
       });
       if (value.controllerBytes.length)
         log(
@@ -398,11 +378,7 @@ function startUserProfileSend(ws, clientId, message) {
             .map((item) => `${item.phase}:${item.hex}`)
             .join(" ")}`,
         );
-      emit(ws, {
-        type: "userProfileResult",
-        state: value.outcome === "completed" ? "completed" : "failed",
-        ...value,
-      });
+      emit(ws, { type: "userProfileResult", ...value });
     },
   });
   userProfileSends.set(ws, { runner });
@@ -422,6 +398,33 @@ function handleMessage(ws, raw) {
   // precise reason rather than a generic profile error.
   const local = localResponse(message);
   if (local) return emit(ws, local);
+  // Dispatched ahead of the capability refusal: the fallback profile still
+  // says `userProfiles: false` because no controller reply to this exchange
+  // has been captured — capturing one is what this operator-authorised send
+  // is for. `beginLiveUserProfiles` enforces the remaining preconditions.
+  if (message.type === "userProfiles") {
+    const clientId = clientIds.get(ws);
+    try {
+      startUserProfileSend(ws, clientId, message);
+    } catch (error) {
+      // The preflight may have acquired the transfer lock before failing;
+      // release it only when this send is the holder.
+      if (
+        transferSafety.active?.owner === clientId &&
+        transferSafety.active?.state === "sending-user-profiles"
+      )
+        transferSafety.finishLiveUserProfiles(clientId, "failed", {
+          reason: error.message,
+        });
+      emit(ws, {
+        type: "userProfileResult",
+        state: "failed",
+        outcome: "preflight-failed",
+        message: `User-profile send blocked: ${error.message}`,
+      });
+    }
+    return;
+  }
   if (!capabilityFor(message.type)) {
     return emit(ws, {
       type: "status", state: "error",
@@ -619,6 +622,11 @@ server.on("upgrade", (request, socket) => {
     heartbeat.remove(socket);
     transfers.get(socket)?.runner.cancel("web app disconnected");
     transfers.delete(socket);
+    // Cancelled before the controller socket is destroyed below, so the
+    // runner is inactive by the time the close handler would otherwise ask it
+    // to reconnect on behalf of a browser that has gone away.
+    userProfileSends.get(socket)?.runner.cancel("web app disconnected");
+    userProfileSends.delete(socket);
     sockets.delete(socket);
     controllers.get(socket)?.destroy();
     controllers.delete(socket);

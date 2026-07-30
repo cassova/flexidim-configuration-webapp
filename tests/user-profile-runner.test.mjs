@@ -1,10 +1,11 @@
 // The live user-profile send and the feedback it reports.
 //
 // The write half is fixed by the oracle (see tests/user-transfer.test.mjs).
-// These tests cover the observable half: per-profile progress, the reset wait
-// after `ff fe`, reconnect, the ten-record "running normally" rule, and the
-// capture of anything the controller sends — including during the write phase,
-// where the original app consults nothing.
+// These tests cover the observable half, which now mirrors the original app:
+// send every frame, then go silent and listen. The app does not disconnect,
+// reconnect, count status records, or react to replies (recovered from
+// -processUsDownload:). The runner adds only a bounded, passive listen window so
+// the UI can report the upload and capture whatever the controller says.
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -37,9 +38,9 @@ function harness(userPayloads, { failWriteOn } = {}) {
   const written = [];
   const progress = [];
   const results = [];
-  const intervals = [];
-  const timeouts = [];
-  let reconnects = 0;
+  let intervalCallback = null;
+  const timeouts = new Map();
+  let nextTimeoutId = 0;
   const runner = new UserProfileSendRunner({
     userPayloads,
     write: (bytes, frame) => {
@@ -47,22 +48,23 @@ function harness(userPayloads, { failWriteOn } = {}) {
         throw new Error(`Scene Controller disconnected before ${frame.name}`);
       written.push({ name: frame.name, bytes });
     },
-    reconnect: ({ connected }) => {
-      reconnects += 1;
-      connected();
-    },
     progress: (value) => progress.push(value),
     result: (value) => results.push(value),
     setIntervalFn: (callback) => {
-      intervals.push(callback);
-      return intervals.length;
+      intervalCallback = callback;
+      return 1;
     },
-    clearIntervalFn: () => undefined,
+    clearIntervalFn: () => {
+      intervalCallback = null;
+    },
     setTimeoutFn: (callback) => {
-      timeouts.push(callback);
-      return timeouts.length;
+      const id = ++nextTimeoutId;
+      timeouts.set(id, callback);
+      return id;
     },
-    clearTimeoutFn: () => undefined,
+    clearTimeoutFn: (id) => {
+      timeouts.delete(id);
+    },
   });
   return {
     runner,
@@ -70,27 +72,19 @@ function harness(userPayloads, { failWriteOn } = {}) {
     progress,
     results,
     tick: (times = 1) => {
-      for (let index = 0; index < times; index += 1) intervals[0]();
+      for (let index = 0; index < times; index += 1) intervalCallback?.();
     },
+    // Fire whatever timeouts are currently registered (a cleared one is gone).
     fireTimeouts: () => {
-      const pending = timeouts.splice(0);
-      for (const callback of pending) callback();
+      for (const callback of [...timeouts.values()]) callback();
     },
-    get reconnects() {
-      return reconnects;
-    },
+    pendingTimeouts: () => timeouts.size,
   };
 }
 
-/**
- * A valid f2 channel-status record, the kind a controller emits when it is
- * running normally. The check byte is a seven-bit additive sum.
- */
-function statusRecord(channel = 3, level = 0) {
-  const body = [0xf2, channel, level];
-  const check = body.reduce((total, byte) => (total + byte) & 0x7f, 0);
-  return Buffer.from([...body, check]);
-}
+test("the tick uses the app's 50 ms user-only interval", () => {
+  assert.equal(USER_PROFILE_RUNNER_TIMING.tickMs, 50);
+});
 
 test("each profile is written on its own tick, with progress for each", () => {
   const payloads = goldenPayloads();
@@ -118,7 +112,7 @@ test("each profile is written on its own tick, with progress for each", () => {
   );
 });
 
-test("after the last frame it reports making permanent and waits for the reset", () => {
+test("after the last frame it goes silent and waits for a reply", () => {
   const h = harness(goldenPayloads());
   h.runner.start();
   h.tick(4);
@@ -126,49 +120,62 @@ test("after the last frame it reports making permanent and waits for the reset",
     "all-users-complete",
     "make-user-data-permanent",
   ]);
-  const messages = h.progress.map((item) => item.message);
-  assert.ok(messages.some((text) => /Making permanent/.test(text)));
-  assert.ok(messages.some((text) => /resetting Scene Controller/.test(text)));
-  assert.equal(h.results.length, 0, "the send is not finished at the last frame");
-  assert.equal(h.runner.phase, "reset-wait");
+  assert.equal(h.runner.phase, "awaiting-reply");
+  assert.ok(
+    h.progress.some((item) => /waiting for the Scene Controller/.test(item.message)),
+  );
+  assert.equal(h.results.length, 0, "the send is not finished until it stops listening");
+
+  // Going silent: further ticks transmit nothing.
+  const writtenAfter = h.written.length;
+  h.tick(10);
+  assert.equal(h.written.length, writtenAfter, "no frames are sent after ff fe");
 });
 
-test("the reset, reconnect and ten status records complete the send", () => {
+test("a reply during the listen window completes the send as an upload", () => {
   const h = harness(goldenPayloads());
   h.runner.start();
   h.tick(4);
-
-  // The controller drops the link while it resets, exactly as it does at the
-  // end of a full transfer.
-  h.runner.disconnected();
-  assert.ok(
-    h.progress.some((item) => /reconnecting in 3 seconds/.test(item.message)),
-  );
+  // The controller answers immediately, as it did on hardware: an f2 record then 06.
+  h.runner.receive(Buffer.from([0xf2, 0x0b, 0x00, 0x7d]));
+  h.runner.receive(Buffer.from([0x06]));
+  assert.equal(h.results.length, 0, "it settles briefly before finishing");
   h.fireTimeouts();
-  assert.equal(h.reconnects, 1);
-  assert.ok(h.progress.some((item) => /waiting for normal/.test(item.message)));
-
-  for (let index = 0; index < USER_PROFILE_RUNNER_TIMING.normalStatusCount; index += 1)
-    h.runner.receive(statusRecord(index + 1, 0));
 
   assert.equal(h.results.length, 1);
   assert.equal(h.results[0].outcome, "completed");
-  assert.match(h.results[0].message, /running normally/i);
-  assert.equal(
-    h.results[0].normalStatusCount,
-    USER_PROFILE_RUNNER_TIMING.normalStatusCount,
-  );
+  assert.equal(h.results[0].state, "completed");
+  assert.equal(h.results[0].replyObserved, true);
+  assert.match(h.results[0].message, /uploaded/i);
+  assert.match(h.results[0].message, /reset/i);
+  assert.deepEqual(h.results[0].controllerBytes, [
+    { phase: "awaiting-reply", hex: "f20b007d" },
+    { phase: "awaiting-reply", hex: "06" },
+  ]);
 });
 
-test("a reset that never completes still reports the profiles as sent", () => {
+test("no reply within the window still reports the profiles as sent", () => {
   const h = harness(goldenPayloads());
   h.runner.start();
   h.tick(4);
-  h.tick(USER_PROFILE_RUNNER_TIMING.resetTimeoutTicks);
+  assert.equal(h.pendingTimeouts(), 1, "the reply window is armed");
+  h.fireTimeouts();
   assert.equal(h.results.length, 1);
-  assert.equal(h.results[0].outcome, "reset-not-detected");
-  assert.match(h.results[0].message, /profiles were sent/);
-  assert.match(h.results[0].message, /reset automatically/);
+  assert.equal(h.results[0].outcome, "sent-no-reply");
+  assert.equal(h.results[0].state, "completed");
+  assert.equal(h.results[0].replyObserved, false);
+  assert.match(h.results[0].message, /did not respond/);
+});
+
+test("the controller dropping the link while listening is the reset starting", () => {
+  const h = harness(goldenPayloads());
+  h.runner.start();
+  h.tick(4);
+  h.runner.disconnected();
+  assert.equal(h.results.length, 1);
+  assert.equal(h.results[0].outcome, "reset-started");
+  assert.equal(h.results[0].state, "completed");
+  assert.match(h.results[0].message, /started to reset/);
 });
 
 test("bytes the controller sends during the send are captured, not obeyed", () => {
@@ -189,9 +196,8 @@ test("bytes the controller sends during the send are captured, not obeyed", () =
     "all-users-complete",
     "make-user-data-permanent",
   ]);
-  h.tick(USER_PROFILE_RUNNER_TIMING.resetTimeoutTicks);
-  const captured = h.results[0].controllerBytes;
-  assert.deepEqual(captured, [{ phase: "sending", hex: "06" }]);
+  h.fireTimeouts();
+  assert.deepEqual(h.results[0].controllerBytes, [{ phase: "sending", hex: "06" }]);
   assert.ok(
     h.progress.some((item) => /sent 1 bytes during the user-profile send/.test(item.message)),
   );
@@ -204,6 +210,7 @@ test("losing the controller mid-send fails instead of reporting success", () => 
   h.runner.disconnected();
   assert.equal(h.results.length, 1);
   assert.equal(h.results[0].outcome, "unexpected-disconnect");
+  assert.equal(h.results[0].state, "failed");
   assert.match(h.results[0].message, /before every profile had been sent/);
 });
 
@@ -213,10 +220,11 @@ test("a write failure stops the send and says which frame failed", () => {
   h.tick(4);
   assert.equal(h.results.length, 1);
   assert.equal(h.results[0].outcome, "failed");
+  assert.equal(h.results[0].state, "failed");
   assert.match(h.results[0].message, /make-user-data-permanent/);
 });
 
-test("a configuration with no users still completes the whole lifecycle", () => {
+test("a configuration with no users still sends and goes silent", () => {
   const h = harness([]);
   h.runner.start();
   h.tick();
@@ -225,5 +233,5 @@ test("a configuration with no users still completes the whole lifecycle", () => 
     "all-users-complete",
     "make-user-data-permanent",
   ]);
-  assert.equal(h.runner.phase, "reset-wait");
+  assert.equal(h.runner.phase, "awaiting-reply");
 });

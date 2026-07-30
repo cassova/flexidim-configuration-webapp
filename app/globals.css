@@ -833,6 +833,20 @@ i.help-icon {
   color: #fff;
   background: var(--blue);
 }
+/* Captured controller bytes shown after a user-profile send. */
+.user-profile-capture {
+  max-height: 180px;
+  margin: 0 0 12px;
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid #d4dbe1;
+  border-radius: 6px;
+  background: #f4f6f8;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 .hint-inline {
   font-weight: 400;
   color: #6b6f72;
