@@ -255,6 +255,115 @@ the offline sender oracle. The pure model implements this framing, but the live
 bridge does not use it. Exact compilation of every hardware-specific user
 profile suffix is still incomplete, so user transfer remains gated.
 
+#### The user-only send — sender-oracle verified; transmitted under operator opt-in (2026-07-29)
+
+The same method also serves the app's "send user profiles" action, which sends
+profiles without recompiling or re-sending the configuration image. Its
+signature is `-(BOOL)sendUserData:(NSInteger *)cursor userOnly:(BOOL)`, where
+the cursor is an in/out user index and the result reports whether more remains.
+One call is one timer tick, and a complete pass is:
+
+| Tick | Frames written |
+| --- | --- |
+| cursor `0` | `ff fc 00 00 00 00` + CRC, then every chunk of the first profile |
+| while users remain | every chunk of the profile at the cursor, which then advances |
+| cursor spent | `ff f2 e0 7f 7f` + 256 zero bytes, then `ff fe 00 00 00 00` + CRC |
+
+A configuration with no users emits all three in one tick. Calls after the
+final one repeat the two terminal frames. `ff fe` is escaped on the wire
+(`ff 1b fe …`); the CRC covers the six unescaped bytes.
+
+**Profile order is not archive order.** `JCLFDConfig.users` is an
+`NSMutableDictionary` keyed by the decimal string of each user's `ky`, and the
+sender walks the list built by enumerating it, so a profile's wire index
+follows Darwin's `CFBasicHash` bucket order. Five users keyed 501–505 are
+transmitted as 504, 501, 505, 502, 503. Up to three users the order is the
+identity, which is why smaller configurations never revealed it.
+`userProfileSendOrder` in `app/compile-user-profiles.ts` reproduces this with
+the existing `foundationDictionaryOrder` model; the same order applies to the
+full transfer's user stage, which walks the same list.
+
+Evidence: `tools/oracle/private/user_capture.m` drove the original method over
+synthetic archives and `tools/oracle/private/user_order.m` printed the app's
+own collection order; `tests/user-transfer.test.mjs` holds five committed cases
+(no users, one user, three users, five users with the reordering, and
+multi-chunk payloads) that require byte-identical frames. Feeding the real
+captured controller replies (below) back into `user_capture.m`'s reply ivar
+produced byte-identical frames, confirming the send never consults the reply.
+
+#### After the last frame — the app goes silent — disassembly verified
+
+Recovered from `-processUsDownload:` (0x1000a8bf8), the 50 ms timer tick that
+drives the user-only send. Each tick calls `-sendUserData:userOnly:`; when that
+reports the terminal `ff fe` has been sent, the tick **stops its timer, stops
+and hides the activity indicator, and returns**. It does not disconnect, does
+not read the controller, does not wait for a reset, and does not count status
+records. The app transmits the fixed frame sequence and goes idle, leaving the
+connection open. (Contrast the full transfer's `-processDownload:`, which does
+have a reset-wait / reconnect / ten-status-record completion stage; the
+user-only path has none of it.)
+
+#### After the send — controller reset and recovery — HARDWARE OBSERVED (2026-07-29/30)
+
+The first live user-profile sends from the web app, plus timed runs of the
+original iOS app, established the controller's behaviour after `ff fe`. Timing
+is relative to the moment the send frames go out (t=0; all ten frames leave in
+~0.5 s). Confidence is tagged per line because sample sizes are small.
+
+| Time from send | Event | Confidence |
+| --- | --- | --- |
+| < 1 s | Controller replies with an `f2` status record then an `06` ack (captured `f2 0b 00 7d`, `06`). The send ignores it. | observed once (web capture) |
+| ~1:42 – 1:47 | House lights turn **ON**; the controller enters a suspended / pending-commit state — physical switches stop responding, lights stay on. | observed twice (iOS 1:42, web 1:47) — consistent |
+| ~1:42 | iOS connection icon turns **YELLOW** (connected-but-not-normal). Through the suspension the controller emits `f3` records (`f3 0e 0c 0d`) roughly once a minute, in place of the normal `f2`/`f4` stream. | icon: iOS once; `f3` cadence: web logs |
+| ~5:10 | iOS icon returns to **GREEN** (normal `f2`/`f4` status resumes) **while switches are still dead**. Green means "reporting normal status", NOT "reset complete / safe to operate". | observed once (iOS) |
+| ≥ 15 min, no action | Reset does **NOT** complete on its own. Waiting alone — and opening/closing or reconnecting the app — never finishes it. | negative control (iOS 15 min); app open/close (iOS) |
+| Compare + ~30 s | Running **Compare configuration** (the controller read-back, `processVerify:`) triggers completion: house lights turn **OFF** ~30 s after the Compare (reset finishes), and physical switches work ~30 s after that. | strongly indicated — 2 positive (iOS) + the 15-min negative control |
+
+**The iOS yellow icon is a lagged snapshot, not a live light.** Disassembly:
+the app draws `connectedY.png` (yellow) when `netState == 1` and `connected.png`
+(green) otherwise. `netState` is a connection state machine (values 0,1,2,4,5,7)
+updated on socket events in `stream0:/stream1:handleEvent:`, but the icon is
+repainted from it in `viewWillAppear:` and per-screen refreshes — NOT on a
+timer. So the icon reflects `netState` as of the last time a view appeared (tab
+switch, navigation, app foreground); a state change while one screen stays
+visible may not repaint until the app is navigated or reopened. This was seen
+directly: on 2026-07-30 a send left the icon GREEN for 6 min with switches dead,
+never turning yellow, until a Compare resolved it — whereas an earlier run went
+yellow at ~1:42. The likely difference is icon repaint timing, not the
+underlying state. Consequence for the web app: do NOT mimic this lagged icon;
+setting the pill yellow proactively on send-completion (when suspension is known)
+is more honest, and the "~5:10 green while dead" mark above may itself be repaint
+lag rather than a true status change.
+
+**The held connection goes quiet after a send; reconnect to read status.** On a
+third web run (2026-07-30 18:26) the controller emitted NO `f3` for the whole
+~9-minute suspension — the bridge saw the connection stay "normal" the entire
+time — yet a Compare over that same held connection still completed the reset.
+So the suspended state is not reliably visible on the connection that sent the
+profiles; it is re-surfaced by reopening the session (the same reason the iOS
+icon only shows yellow after an app restart). ~56 s after that Compare the
+controller briefly went not-normal (`f3 07 0c 06`) then streamed an `f4` channel
+scan and returned to normal — the reset transient, observable on the wire. The
+web recovery flow is therefore reconnect-driven: it reopens the controller
+session to read the real status, Compares to complete, and reopens again to
+confirm the return to normal.
+
+**What this means.** Completion is **Compare-triggered, not time-triggered**: a
+Compare read-back is what finishes the reset, within ~30 s; waiting does not
+(≥15 min proven). This also explains the web app's early stuck runs — after the
+send it sent dim commands and reconnected but never ran a Compare, so the
+controller stayed suspended until it was power-cycled. Compare is a read-only
+operation, so using it to complete the reset is within the read/compare bounds
+the operator has always permitted.
+
+**Still to pin down (do not assume):** whether it is Compare specifically versus
+any read-back; the minimum delay after a send before a Compare will "take";
+whether the ~1:42 and ~5:10 marks are stable across runs; and whether web-side
+interference (dim commands, reconnects) shifts them. Confirm on iOS before
+building the Compare step into the web recovery flow. The bridge transmits the
+send only under the operator opt-in and captures every controller byte; the
+frame model itself is oracle-exact (above).
+
 ### Status requests (`ff f1`) — binary verified, not transmitted
 
 A second frame family. Both are nine-byte constants with CRC-16/X25 appended

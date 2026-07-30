@@ -237,7 +237,7 @@ test("cannot connect with starter credentials before server storage loads", asyn
   );
   assert.match(
     page,
-    /className=\{`connection-chip \$\{connection\}`\}[\s\S]*disabled=\{!storageLoaded\}[\s\S]*onClick=\{\(\) => connect\(\)\}/,
+    /className=\{`connection-chip \$\{controllerNotNormal \? "connected not-normal" : connection\}`\}[\s\S]*disabled=\{!storageLoaded\}[\s\S]*onClick=\{\(\) => connect\(\)\}/,
   );
   // The startup attempt reads the controller address and security code out of
   // the loaded workspace, so it must wait for the same gate.

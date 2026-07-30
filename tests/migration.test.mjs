@@ -950,6 +950,14 @@ test("user profile edits preserve explicit access order and version their data",
   assert.deepEqual(JSON.parse(updated.profileData).user.switchIds, [10, 20]);
   assert.equal(updated.profileData, buildUserProfileData(updated));
 
+  // Further edits before the next sync fold into the same pending revision;
+  // the version counts revisions (matching the iOS app's small `ve` values),
+  // not individual edits.
+  const editedAgain = updateUserProfile(updated, { remote: false });
+  assert.equal(editedAgain.profileVersion, 5);
+  assert.equal(editedAgain.profileStatus, "pending");
+  assert.equal(JSON.parse(editedAgain.profileData).user.remote, false);
+
   const items = [{ id: 1 }, { id: 2 }, { id: 3 }];
   assert.deepEqual(
     orderUserAccess(items, [3, 1]).map((item) => item.id),

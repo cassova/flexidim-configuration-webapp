@@ -13,7 +13,6 @@ import {
   migrateWorkspaceControllerCode,
   migrateWorkspaceChannelProfileOrder,
   migrateWorkspaceImportedUserAccess,
-  orderUserAccess,
   parseLegacyFd4Config,
   CONFIG_CONTENT_KEYS,
   deleteConfigEntity,
@@ -22,6 +21,7 @@ import {
   type ConfigContent,
   type DeletedItem,
   type FlexModule,
+  type FlexUser,
   type FlexiDimWorkspace,
   type Channel,
   type Room,
@@ -45,6 +45,7 @@ import { buildLegacyArchive } from "./fd4cfg-export";
 import { transferReadiness } from "./transfer-readiness";
 import { compileConfig, formatChecksum } from "./compile-config";
 import { compileUserProfiles } from "./compile-user-profiles";
+import { UserProfileRecovery, type RecoveryView } from "./user-profile-recovery";
 import { onOffPriority } from "./basic-assignment";
 import {
   UTILITY_BUTTON_PROMPT,
@@ -585,9 +586,20 @@ function now() {
     hourCycle: "h23",
   });
 }
+// Security codes match the iOS app: 16 lowercase base-36 characters stored
+// without spaces (the archive `sk` field), displayed in groups of four.
+const SECURITY_CODE_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
 function generateSecurityKey() {
-  const bytes = crypto.getRandomValues(new Uint8Array(8));
-  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  let code = "";
+  while (code.length < 16)
+    for (const byte of crypto.getRandomValues(new Uint8Array(32)))
+      // Reject bytes ≥ 252 so the modulo stays uniform across the alphabet.
+      if (code.length < 16 && byte < 252)
+        code += SECURITY_CODE_ALPHABET[byte % 36];
+  return code;
+}
+function formatSecurityCode(code: string) {
+  return /^\S{16}$/.test(code) ? code.replace(/(....)(?=.)/g, "$1 ") : code;
 }
 
 function validControllerSecurityCode(value?: string) {
@@ -641,21 +653,21 @@ function restoreAreaHierarchy(data: AppData): AppData {
     const position = legacyModuleOrder.indexOf(channel.moduleId ?? -1);
     return position > 0 && channel.moduleIndex != null &&
       channel.controllerChannel ===
-        ((position << 4) | (channel.moduleIndex & 0x0f));
+      ((position << 4) | (channel.moduleIndex & 0x0f));
   });
   const channels = hasLegacyAddresses
     ? normalizedChannels.map((channel) => {
-        const position = legacyModuleOrder.indexOf(channel.moduleId ?? -1);
-        return position >= 0 && channel.moduleIndex != null
-          ? {
-              ...channel,
-              controllerChannel: controllerChannelAddress(
-                position,
-                channel.moduleIndex,
-              ),
-            }
-          : channel;
-      })
+      const position = legacyModuleOrder.indexOf(channel.moduleId ?? -1);
+      return position >= 0 && channel.moduleIndex != null
+        ? {
+          ...channel,
+          controllerChannel: controllerChannelAddress(
+            position,
+            channel.moduleIndex,
+          ),
+        }
+        : channel;
+    })
     : normalizedChannels;
   const restoredSceneGroups: SceneGroup[] = data.sceneGroups?.length
     ? data.sceneGroups
@@ -707,17 +719,17 @@ function restoreAreaHierarchy(data: AppData): AppData {
     data.configurations?.length
       ? data.configurations
       : [
-          {
-            id: 1,
-            siteId: data.site.id,
-            name: data.site.name,
-            description: data.site.description,
-            lastUpdated: "",
-          },
-        ];
+        {
+          id: 1,
+          siteId: data.site.id,
+          name: data.site.name,
+          description: data.site.description,
+          lastUpdated: "",
+        },
+      ];
   const activeConfigId =
     data.activeConfigId &&
-    configurations.some((config) => config.id === data.activeConfigId)
+      configurations.some((config) => config.id === data.activeConfigId)
       ? data.activeConfigId
       : configurations[0].id;
   return {
@@ -735,12 +747,12 @@ function restoreAreaHierarchy(data: AppData): AppData {
       data.modules?.length
         ? data.modules
         : moduleIds.map((id) => ({
-            id,
-            name: `Module ${id}`,
-            bus: "A" as const,
-            enabled: true,
-            pending: false,
-          })),
+          id,
+          name: `Module ${id}`,
+          bus: "A" as const,
+          enabled: true,
+          pending: false,
+        })),
     deletedItems: data.deletedItems ?? [],
     site: {
       ...data.site,
@@ -803,6 +815,50 @@ export default function FlexiDimWeb() {
   const [scenePickerGroupId, setScenePickerGroupId] = useState<number | null>(
     null,
   );
+  // Users drill-down: the selected user (left column) and the selected area
+  // within that user's access (centre column).
+  const [selectedUserId, setSelectedUserId] = useState<number | null>(null);
+  const [selectedUserAreaId, setSelectedUserAreaId] = useState<number | null>(
+    null,
+  );
+  // Hierarchical picker for granting a user access to an area or a switch,
+  // and the drag state while reordering a user's access lists.
+  const [userAccessPicker, setUserAccessPicker] = useState<{
+    userId: number;
+    kind: "room" | "switch";
+    floorId: number | null;
+    roomId: number | null;
+  } | null>(null);
+  const [userProfileDialog, setUserProfileDialog] = useState<
+    "closed" | "warning" | "running" | "recovering" | "result"
+  >("closed");
+  const [userProfileRecovery, setUserProfileRecovery] =
+    useState<RecoveryView | null>(null);
+  const [recoveryCountdown, setRecoveryCountdown] = useState<{
+    phase?: string;
+    seconds: number;
+  } | null>(null);
+  const [userProfileProgress, setUserProfileProgress] = useState<{
+    state?: string;
+    message?: string;
+    userIndex?: number;
+    userCount?: number;
+  } | null>(null);
+  const [userProfileResult, setUserProfileResult] = useState<{
+    state: string;
+    outcome?: string;
+    message?: string;
+    frameCount?: number;
+    userCount?: number;
+    replyObserved?: boolean;
+    controllerBytes?: { phase: string; hex: string }[];
+  } | null>(null);
+  const [userDrag, setUserDrag] = useState<{
+    userId: number;
+    field: "roomIds" | "switchIds";
+    id: number;
+  } | null>(null);
+  const [userDragOverId, setUserDragOverId] = useState<number | null>(null);
   const [basicFloor, setBasicFloor] = useState<number | null>(null);
   const [basicRoom, setBasicRoom] = useState<number | null>(null);
   const [basicSwitchId, setBasicSwitchId] = useState<number | null>(null);
@@ -816,6 +872,7 @@ export default function FlexiDimWeb() {
   const [connection, setConnection] = useState<
     "offline" | "bridge" | "connecting" | "connected" | "error"
   >("offline");
+  const [controllerNormal, setControllerNormal] = useState(true);
   const [bridgeProfile, setBridgeProfile] = useState<Record<
     string,
     unknown
@@ -849,6 +906,9 @@ export default function FlexiDimWeb() {
   const connectionRef = useRef(connection);
   const socket = useRef<WebSocket | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
+  const recoveryRef = useRef<UserProfileRecovery | null>(null);
+  const recoverySelfCloseRef = useRef(false);
+  const recoveryChecksumRef = useRef<string>("");
   const serverReady = useRef(false);
   // Whether edits are actually reaching server storage. A transient toast is not
   // enough: if storage is unavailable the app keeps accepting edits that are
@@ -880,6 +940,50 @@ export default function FlexiDimWeb() {
     addTrace(text, tone);
     showToast(text, tone);
   };
+
+  /**
+   * Copy text and say so. The clipboard is absent outside a secure context and
+   * the write can be refused, so report what actually happened rather than
+   * assuming success — a silent copy button is indistinguishable from a broken
+   * one.
+   */
+  const copyToClipboard = async (text: string, description: string) => {
+    if (!text) {
+      notify(`Nothing to copy — ${description} is empty`, "warn");
+      return;
+    }
+    try {
+      if (!navigator.clipboard) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+      notify(`${description} copied`, "ok");
+    } catch {
+      notify(
+        `Could not copy ${description} — this browser blocked clipboard access`,
+        "warn",
+      );
+    }
+  };
+
+  const recoveryPhase = userProfileRecovery?.phase;
+  const recoveryCountdownMs = userProfileRecovery?.countdownMs;
+  useEffect(() => {
+    if (recoveryPhase !== "waiting" || !recoveryCountdownMs) return;
+    const until = Date.now() + recoveryCountdownMs;
+    const id = setInterval(() => {
+      setRecoveryCountdown({
+        phase: recoveryPhase,
+        seconds: Math.max(0, Math.ceil((until - Date.now()) / 1000)),
+      });
+    }, 250);
+    return () => clearInterval(id);
+  }, [recoveryPhase, recoveryCountdownMs]);
+  // Until the first tick lands, show the full duration — never a stale value.
+  const recoveryCountdownSeconds =
+    recoveryPhase !== "waiting" || !recoveryCountdownMs
+      ? null
+      : recoveryCountdown && recoveryCountdown.phase === recoveryPhase
+        ? recoveryCountdown.seconds
+        : Math.round(recoveryCountdownMs / 1000);
 
   useEffect(() => {
     let active = true;
@@ -944,7 +1048,7 @@ export default function FlexiDimWeb() {
             if (!migrationResponse.ok)
               throw new Error(
                 migrated.error ??
-                  "Could not migrate retained configuration metadata",
+                "Could not migrate retained configuration metadata",
               );
             revision = Number(migrated.revision);
           }
@@ -976,8 +1080,7 @@ export default function FlexiDimWeb() {
         if (!active) return;
         setStorageState("unavailable");
         notify(
-          `Server storage unavailable: ${
-            error instanceof Error ? error.message : "unknown error"
+          `Server storage unavailable: ${error instanceof Error ? error.message : "unknown error"
           }`,
           "warn",
         );
@@ -1058,8 +1161,7 @@ export default function FlexiDimWeb() {
     } catch (error) {
       setStorageState("unavailable");
       notify(
-        `Configuration not saved: ${
-          error instanceof Error ? error.message : "unknown error"
+        `Configuration not saved: ${error instanceof Error ? error.message : "unknown error"
         }`,
         "warn",
       );
@@ -1131,21 +1233,21 @@ export default function FlexiDimWeb() {
   const equipmentModules: FlexModule[] = data.modules?.length
     ? data.modules
     : [
-        ...new Set(
-          data.channels
-            .map((channel) => {
-              const match = channel.module.match(/Module\s+(\d+)/i);
-              return channel.moduleId ?? (match ? Number(match[1]) : undefined);
-            })
-            .filter((id): id is number => id !== undefined),
-        ),
-      ].map((id) => ({
-        id,
-        name: `Module ${id}`,
-        bus: "A",
-        enabled: true,
-        pending: false,
-      }));
+      ...new Set(
+        data.channels
+          .map((channel) => {
+            const match = channel.module.match(/Module\s+(\d+)/i);
+            return channel.moduleId ?? (match ? Number(match[1]) : undefined);
+          })
+          .filter((id): id is number => id !== undefined),
+      ),
+    ].map((id) => ({
+      id,
+      name: `Module ${id}`,
+      bus: "A",
+      enabled: true,
+      pending: false,
+    }));
   const currentScene = data.scenes.find((scene) => scene.id === selectedScene);
   // Which wall switches run this scene, so an installer can see what a change
   // affects before making it.
@@ -1180,6 +1282,36 @@ export default function FlexiDimWeb() {
     if (socket.current?.readyState === WebSocket.OPEN)
       socket.current.send(JSON.stringify(payload));
     else addTrace("Command not sent — local bridge is offline", "warn");
+  };
+
+  // ---- User-profile send recovery -----------------------------------------
+  // After the frames are sent the controller suspends and only completes its
+  // reset when it receives a Compare read-back (PROTOCOL.md). The pure machine
+  // in app/user-profile-recovery.ts drives it; here we just wire its callbacks
+  // to the socket and the popup.
+
+  const stopUserProfileRecovery = () => {
+    recoveryRef.current?.stop();
+    recoveryRef.current = null;
+  };
+
+  const startUserProfileRecovery = () => {
+    recoveryRef.current?.stop();
+    recoveryRef.current = new UserProfileRecovery({
+      onView: (view) => {
+        setUserProfileRecovery(view);
+        addTrace(view.message, view.phase === "unsure" ? "warn" : undefined);
+      },
+      reconnect: () => {
+        recoverySelfCloseRef.current = true;
+        connect({ auto: true });
+      },
+      sendVerify: () => {
+        if (recoveryChecksumRef.current)
+          send({ type: "verify", localChecksum: recoveryChecksumRef.current });
+      },
+    });
+    recoveryRef.current.start();
   };
 
   /**
@@ -1266,7 +1398,7 @@ export default function FlexiDimWeb() {
             message.state === "connected"
               ? "connected"
               : message.state === "connecting" ||
-                  message.state === "discovering"
+                message.state === "discovering"
                 ? "connecting"
                 : message.state === "bridge"
                   ? "bridge"
@@ -1279,10 +1411,30 @@ export default function FlexiDimWeb() {
                 ? ("warn" as const)
                 : undefined;
           addTrace(message.message, tone);
-          if (message.state === "connected")
+          if (message.state === "connected" || message.state === "error")
+            setControllerNormal(true);
+          if (message.state === "connected") {
             showToast("Connected to the Scene Controller", "ok");
-          else if (message.state === "error")
+            recoveryRef.current?.connectionEstablished();
+          } else if (message.state === "error") {
             showToast(message.message, "warn");
+            recoveryRef.current?.reconnectFailed();
+          }
+        } else if (message.type === "controllerStatus") {
+          const normal = Boolean(message.normalStatus);
+          setControllerNormal(normal);
+          addTrace(
+            message.message ??
+            (normal
+              ? "Scene Controller reporting normal status"
+              : "Scene Controller connected but not reporting normal status"),
+            normal ? "ok" : "warn",
+          );
+          if (!normal)
+            showToast(
+              "Scene Controller is not reporting normal status — it may be resetting. Don't send commands until it recovers.",
+              "warn",
+            );
         } else if (message.type === "discovered") {
           updateSite({ ip: message.host, port: Number(message.port) });
           addTrace(
@@ -1317,12 +1469,12 @@ export default function FlexiDimWeb() {
           setComparisonMatch(
             message.state === "match"
               ? {
-                  localChecksum: String(message.localChecksum || "").toLowerCase(),
-                  controllerChecksum: String(
-                    message.controllerChecksum || "",
-                  ).toLowerCase(),
-                  version: String(message.version || ""),
-                }
+                localChecksum: String(message.localChecksum || "").toLowerCase(),
+                controllerChecksum: String(
+                  message.controllerChecksum || "",
+                ).toLowerCase(),
+                version: String(message.version || ""),
+              }
               : null,
           );
           // Toast the outcome too — the inline state sits in a panel of similar
@@ -1335,6 +1487,32 @@ export default function FlexiDimWeb() {
                 : "Configuration differs from the Scene Controller",
             message.state === "match" ? "ok" : "warn",
           );
+          recoveryRef.current?.compareResult(String(message.state ?? "error"));
+        } else if (message.type === "userProfileProgress") {
+          setUserProfileProgress(
+            message as { state?: string; message?: string; userIndex?: number; userCount?: number },
+          );
+          addTrace(message.message ?? `User-profile state: ${message.state}`);
+        } else if (message.type === "userProfileResult") {
+          const profileResult = message as {
+            state: string;
+            outcome?: string;
+            message?: string;
+            frameCount?: number;
+            userCount?: number;
+            replyObserved?: boolean;
+            controllerBytes?: { phase: string; hex: string }[];
+          };
+          setUserProfileResult(profileResult);
+          setUserProfileProgress(null);
+          if (profileResult.state === "completed") {
+            setUserProfileDialog("recovering");
+            startUserProfileRecovery();
+            notify(profileResult.message ?? "User profiles sent", "ok");
+          } else {
+            setUserProfileDialog("result");
+            notify(profileResult.message ?? "User-profile send failed", "warn");
+          }
         } else if (message.type === "transferPreflight") {
           setTransferPreflight(message as TransferPreflight);
           setTransferProgress(null);
@@ -1373,14 +1551,19 @@ export default function FlexiDimWeb() {
       else notify(message, "warn");
     };
     ws.onclose = () => {
+      const deliberate = recoverySelfCloseRef.current;
+      recoverySelfCloseRef.current = false;
       if (
-        connectionRef.current === "connected" ||
-        connectionRef.current === "bridge"
+        !deliberate &&
+        (connectionRef.current === "connected" ||
+          connectionRef.current === "bridge")
       )
         showToast("Disconnected from the Scene Controller", "warn");
       setConnection((state) => (state === "error" ? state : "offline"));
+      setControllerNormal(true);
     };
   };
+
 
 
   // A range slider fires onChange on every pixel of a drag. Transmitting a
@@ -1555,7 +1738,7 @@ export default function FlexiDimWeb() {
       );
       const configurations = patch.id && patch.id !== old.site.id
         ? (old.configurations ?? []).map((config) =>
-            config.siteId === old.site.id ? { ...config, siteId: patch.id! } : config)
+          config.siteId === old.site.id ? { ...config, siteId: patch.id! } : config)
         : old.configurations;
       return { ...old, site: updated, sites, configurations };
     });
@@ -1604,6 +1787,45 @@ export default function FlexiDimWeb() {
       `Current local configuration CRC: ${localChecksum}. Waiting for the Scene Controller…`,
     );
     send({ type: "verify", localChecksum });
+  };
+
+  /**
+   * Compile the user-profile-only send and have the bridge build every frame
+   * offline. The frames match the original app byte-for-byte (see
+   * tests/user-transfer.test.mjs), but sending them to a controller is a write
+   * whose reply has never been observed, so this stops at the preflight.
+   */
+  /**
+   * The live user-profile send. The bridge re-runs the offline dry run over
+   * these exact payloads and refuses the write if it fails, so that — not
+   * anything here — is the safety boundary.
+   */
+  const beginUserProfileSend = () => {
+    const users = compileUserProfiles(data);
+    if (!users.complete) {
+      notify(
+        `User profiles cannot be sent yet: ${users.problems.join(" ")}`,
+        "warn",
+      );
+      return;
+    }
+    const compiled = compileConfig(data);
+    recoveryChecksumRef.current = compiled.complete
+      ? formatChecksum(compiled.checksum)
+      : "";
+    setUserProfileResult(null);
+    setUserProfileProgress({
+      state: "sending",
+      message: `Sending user profile 1 of ${users.payloads.length}`,
+      userIndex: 0,
+      userCount: users.payloads.length,
+    });
+    setUserProfileDialog("running");
+    send({
+      type: "userProfiles",
+      confirm: "Continue",
+      userPayloadsBase64: users.payloads.map(bytesToBase64),
+    });
   };
 
   const runTransferDryRun = () => {
@@ -2134,22 +2356,22 @@ export default function FlexiDimWeb() {
       switches: old.switches.map((wallSwitch) =>
         switches.some((candidate) => candidate.id === wallSwitch.id)
           ? {
-              ...wallSwitch,
-              basic: {
-                channelIds: old.channels
-                  .filter((channel) => channel.roomId === wallSwitch.roomId)
-                  .map((channel) => channel.id),
-                assignOn: true,
-                assignOff: true,
-                assignDimming: true,
-                assignChannelDimming: false,
-                onTime: 0,
-                offTime: 0,
-                offPriority: 0,
-                onPriority: false,
-                channelSettings: {},
-              },
-            }
+            ...wallSwitch,
+            basic: {
+              channelIds: old.channels
+                .filter((channel) => channel.roomId === wallSwitch.roomId)
+                .map((channel) => channel.id),
+              assignOn: true,
+              assignOff: true,
+              assignDimming: true,
+              assignChannelDimming: false,
+              onTime: 0,
+              offTime: 0,
+              offPriority: 0,
+              onPriority: false,
+              channelSettings: {},
+            },
+          }
           : wallSwitch,
       ),
     }));
@@ -2307,8 +2529,7 @@ export default function FlexiDimWeb() {
       button: controllerButton,
     });
     addTrace(
-      `${wallSwitch.name}: ${press} press of button ${controllerButton} sent (${
-        buttonPressMode === "live" ? "live system" : "latest settings"
+      `${wallSwitch.name}: ${press} press of button ${controllerButton} sent (${buttonPressMode === "live" ? "live system" : "latest settings"
       })`,
     );
   };
@@ -2322,22 +2543,22 @@ export default function FlexiDimWeb() {
       switches: old.switches.map((wallSwitch) =>
         wallSwitch.id === switchId
           ? {
-              ...wallSwitch,
-              basic: {
-                channelIds: [],
-                assignOn: false,
-                assignOff: false,
-                assignDimming: false,
-                assignChannelDimming: false,
-                onTime: 0,
-                offTime: 0,
-                offPriority: 0,
-                onPriority: false,
-                channelSettings: {},
-                ...wallSwitch.basic,
-                ...patch,
-              },
-            }
+            ...wallSwitch,
+            basic: {
+              channelIds: [],
+              assignOn: false,
+              assignOff: false,
+              assignDimming: false,
+              assignChannelDimming: false,
+              onTime: 0,
+              offTime: 0,
+              offPriority: 0,
+              onPriority: false,
+              channelSettings: {},
+              ...wallSwitch.basic,
+              ...patch,
+            },
+          }
           : wallSwitch,
       ),
     }));
@@ -2688,8 +2909,8 @@ export default function FlexiDimWeb() {
       }
       setSelectedRoom(
         imported.rooms.find((room) => room.parentId)?.id ??
-          imported.rooms[0]?.id ??
-          0,
+        imported.rooms[0]?.id ??
+        0,
       );
       setSelectedScene(imported.scenes[0]?.id ?? 0);
       setAreaMenuParent(null);
@@ -2785,14 +3006,23 @@ export default function FlexiDimWeb() {
     !storageLoaded
       ? "Loading…"
       : connection === "connected"
-      ? "Connected"
-      : connection === "connecting"
-        ? "Connecting…"
-        : connection === "bridge"
-          ? "Bridge ready"
-          : connection === "error"
-            ? "Connection failed"
-            : "Offline";
+        ? "Connected"
+        : connection === "connecting"
+          ? "Connecting…"
+          : connection === "bridge"
+            ? "Bridge ready"
+            : connection === "error"
+              ? "Connection failed"
+              : "Offline";
+
+  const controllerNotNormal = connection === "connected" && !controllerNormal;
+  const pillClass = controllerNotNormal ? "connected not-normal" : connection;
+  const pillLabel = controllerNotNormal
+    ? "Connected — not normal"
+    : connectionLabel;
+  const pillTitle = controllerNotNormal
+    ? "The Scene Controller is connected but not reporting normal status. It is most likely saving profiles and resetting after a transfer, or otherwise suspended: physical switches may not respond, and command acknowledgements may not reflect real output changes. Wait for it to return to normal — do not send commands or make changes until it does. If it does not recover after several minutes, it may need to be power-cycled."
+    : undefined;
 
   const availableSites = data.sites?.length ? data.sites : [data.site];
 
@@ -2809,10 +3039,10 @@ export default function FlexiDimWeb() {
     return Number.isNaN(parsed.getTime())
       ? iso
       : parsed.toLocaleDateString("en-GB", {
-          year: "numeric",
-          month: "short",
-          day: "numeric",
-        });
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+      });
   };
   const latitudeValue = Number(data.site.latitude);
   const longitudeValue = Number(data.site.longitude);
@@ -2821,11 +3051,11 @@ export default function FlexiDimWeb() {
     : { sunrise: undefined, sunset: undefined };
   const formatSiteTime = (date?: Date) => date
     ? new Intl.DateTimeFormat("en-GB", {
-        hour: "2-digit",
-        minute: "2-digit",
-        hourCycle: "h23",
-        timeZone: normalizeSiteTimeZone(data.site.timezone, data.site.dst),
-      }).format(date)
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+      timeZone: normalizeSiteTimeZone(data.site.timezone, data.site.dst),
+    }).format(date)
     : "—";
   const locateSite = () => {
     if (!navigator.geolocation) return notify("Location is not available in this browser", "warn");
@@ -2876,8 +3106,8 @@ export default function FlexiDimWeb() {
             <small>ACTIVE SITE</small>
             <h2>{data.site.name}</h2>
           </div>
-          <span className={`status-pill ${connection}`}>
-            ● {connectionLabel}
+          <span className={`status-pill ${pillClass}`} title={pillTitle}>
+            ● {pillLabel}
           </span>
           {availableSites.length > 1 && (
             <button
@@ -2955,7 +3185,7 @@ export default function FlexiDimWeb() {
           {(data.site.addressLines ?? [data.site.address, "", "", ""]).map((line, index) => (
             <Field key={index} label={`Address ${index + 1}`}>
               <input value={line} disabled={!installer} placeholder="Optional" onChange={(event) => {
-                const addressLines = [...(data.site.addressLines ?? [data.site.address, "", "", ""] )];
+                const addressLines = [...(data.site.addressLines ?? [data.site.address, "", "", ""])];
                 addressLines[index] = event.target.value;
                 updateSite({ addressLines, address: addressLines.filter(Boolean).join(", ") });
               }} />
@@ -3347,7 +3577,7 @@ export default function FlexiDimWeb() {
                 transferStopped
                   ? "The emergency stop is latched. Restart the bridge before another offline dry run."
                   : readiness.blockers[0] ??
-                    "Compile every outgoing byte, replay the recovered sender offline, and self-check every frame. This never writes to the controller."
+                  "Compile every outgoing byte, replay the recovered sender offline, and self-check every frame. This never writes to the controller."
               }
               onClick={runTransferDryRun}
             >
@@ -3440,9 +3670,9 @@ export default function FlexiDimWeb() {
                         .map((message) =>
                           message.startsWith("Downloading block ")
                             ? message.replace(
-                                /^Downloading block \d+$/,
-                                `Downloading blocks 1–${transferPreflight.blockCount}`,
-                              )
+                              /^Downloading block \d+$/,
+                              `Downloading blocks 1–${transferPreflight.blockCount}`,
+                            )
                             : message
                         )
                         .filter((message, index, all) =>
@@ -3537,12 +3767,12 @@ export default function FlexiDimWeb() {
   // from its position within its OWN bus, not its position in the merged list.
   const selectedModuleNumber = selectedEquipmentModule
     ? controllerModuleNumber(
-        selectedEquipmentModule.bus,
-        equipmentModules
-          .filter((module) => module.bus === selectedEquipmentModule.bus)
-          .sort((left, right) => (left.position ?? 0) - (right.position ?? 0))
-          .findIndex((module) => module.id === selectedEquipmentModule.id),
-      )
+      selectedEquipmentModule.bus,
+      equipmentModules
+        .filter((module) => module.bus === selectedEquipmentModule.bus)
+        .sort((left, right) => (left.position ?? 0) - (right.position ?? 0))
+        .findIndex((module) => module.id === selectedEquipmentModule.id),
+    )
     : -1;
 
   // Which hardware family a module belongs to was not recovered from the iOS
@@ -3674,7 +3904,7 @@ export default function FlexiDimWeb() {
                 key={module.id}
                 className={
                   equipmentSelection?.type === "module" &&
-                  equipmentSelection.id === module.id
+                    equipmentSelection.id === module.id
                     ? "selected"
                     : ""
                 }
@@ -3707,7 +3937,7 @@ export default function FlexiDimWeb() {
                 key={item.id}
                 className={
                   equipmentSelection?.type === "switch" &&
-                  equipmentSelection.id === item.id
+                    equipmentSelection.id === item.id
                     ? "selected"
                     : ""
                 }
@@ -4131,8 +4361,8 @@ export default function FlexiDimWeb() {
                 <select
                   value={String(
                     selectedChannelTypeOption?.displayPosition ??
-                      selectedEquipmentLight.hardwareType ??
-                      "",
+                    selectedEquipmentLight.hardwareType ??
+                    "",
                   )}
                   disabled={!allowEquipment}
                   data-testid="channel-output-type"
@@ -4474,15 +4704,15 @@ export default function FlexiDimWeb() {
                         switches: old.switches.map((s) =>
                           s.id === item.id
                             ? {
-                                ...s,
-                                kind: e.target.value,
-                                type: switchTypeByName(e.target.value)?.code,
-                                hardwareType: switchTypeByName(e.target.value)
-                                  ?.code,
-                                buttons:
-                                  switchTypeByName(e.target.value)?.buttons ??
-                                  s.buttons,
-                              }
+                              ...s,
+                              kind: e.target.value,
+                              type: switchTypeByName(e.target.value)?.code,
+                              hardwareType: switchTypeByName(e.target.value)
+                                ?.code,
+                              buttons:
+                                switchTypeByName(e.target.value)?.buttons ??
+                                s.buttons,
+                            }
                             : s,
                         ),
                       }))
@@ -4503,12 +4733,12 @@ export default function FlexiDimWeb() {
 
   const basicRooms = basicFloor
     ? (() => {
-        const children = data.rooms.filter(
-          (room) => room.parentId === basicFloor,
-        );
-        const floor = data.rooms.find((room) => room.id === basicFloor);
-        return children.length ? children : floor ? [floor] : [];
-      })()
+      const children = data.rooms.filter(
+        (room) => room.parentId === basicFloor,
+      );
+      const floor = data.rooms.find((room) => room.id === basicFloor);
+      return children.length ? children : floor ? [floor] : [];
+    })()
     : [];
   const basicSwitches = basicRoom
     ? data.switches.filter((item) => item.roomId === basicRoom)
@@ -4518,8 +4748,8 @@ export default function FlexiDimWeb() {
   );
   const basicChannels = currentBasicSwitch
     ? data.channels.filter(
-        (channel) => channel.roomId === currentBasicSwitch.roomId,
-      )
+      (channel) => channel.roomId === currentBasicSwitch.roomId,
+    )
     : [];
   const basicSettings = currentBasicSwitch?.basic ?? {
     channelIds: [],
@@ -4545,15 +4775,15 @@ export default function FlexiDimWeb() {
   );
   const selectedBasicChannelSettings = selectedBasicChannel
     ? (basicSettings.channelSettings?.[selectedBasicChannel.id] ?? {
-        assignOn: basicSettings.assignOn,
-        assignOff: basicSettings.assignOff ?? false,
-        assignDimming: basicSettings.assignDimming,
-        assignChannelDimming: basicSettings.assignChannelDimming,
-        onPriority: basicSettings.onPriority ?? false,
-        offPriority: Boolean(basicSettings.offPriority),
-        onFade: basicSettings.onTime,
-        offFade: basicSettings.offTime,
-      })
+      assignOn: basicSettings.assignOn,
+      assignOff: basicSettings.assignOff ?? false,
+      assignDimming: basicSettings.assignDimming,
+      assignChannelDimming: basicSettings.assignChannelDimming,
+      onPriority: basicSettings.onPriority ?? false,
+      offPriority: Boolean(basicSettings.offPriority),
+      onFade: basicSettings.onTime,
+      offFade: basicSettings.offTime,
+    })
     : undefined;
   const fadeTimes = [
     ...new Set([
@@ -5014,9 +5244,9 @@ export default function FlexiDimWeb() {
 
   const assignedSceneChannels = currentScene
     ? Object.keys(currentScene.levels).flatMap((channelId) => {
-        const channel = data.channels.find((item) => item.id === Number(channelId));
-        return channel ? [channel] : [];
-      })
+      const channel = data.channels.find((item) => item.id === Number(channelId));
+      return channel ? [channel] : [];
+    })
     : [];
   const unassignedSceneChannels = currentScene
     ? data.channels.filter((channel) => currentScene.levels[channel.id] === undefined)
@@ -5026,15 +5256,15 @@ export default function FlexiDimWeb() {
   );
   const selectedSceneChannelSettings = currentScene && selectedSceneChannel
     ? (currentScene.channelSettings?.[selectedSceneChannel.id] ?? {
-        brightness: currentScene.levels[selectedSceneChannel.id] ?? 100,
-        fadeTime: currentScene.fade,
-        relativePercent: false,
-        use100PercentTime: false,
-        delay: 0,
-        flags: 0,
-        color: undefined,
-        kelvin: undefined,
-      })
+      brightness: currentScene.levels[selectedSceneChannel.id] ?? 100,
+      fadeTime: currentScene.fade,
+      relativePercent: false,
+      use100PercentTime: false,
+      delay: 0,
+      flags: 0,
+      color: undefined,
+      kelvin: undefined,
+    })
     : undefined;
   // Colour capability comes from the channel's archived output type, not from
   // whether colour data happens to be present.
@@ -5507,100 +5737,100 @@ export default function FlexiDimWeb() {
               </div>
               {sceneRulePanel === "rules" ? (
                 <>
-            <div className="scene-sequence-sections">
-              <section className="scene-sequence-card">
-                <div className="scene-sequence-heading"><small>SEQUENCE</small><h3>Additional process</h3><p>Only used if the main scene runs.</p></div>
-                <div className="scene-sequence-controls">
-                  <Field label="Mode" help="Choose when the additional scene runs, or choose a sequence control action.">
-                    <select value={currentSceneTimerMode} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { nextSceneMode: Number(event.target.value) })}>
-                      <option value="-1">No additional process</option>
-                      {sceneTimerModes.map((mode, index) => <option key={mode} value={index}>{mode}</option>)}
-                    </select>
-                  </Field>
-                  {currentSceneTimerMode === 0 && (
-                    <Field label="Minutes : Seconds" help="Wait this long after the main scene runs before continuing the sequence.">
-                      <span className="scene-timer-value">
-                        <select
-                          aria-label="Delay minutes"
-                          value={Math.min(59, currentSceneDelayMinutes)}
-                          disabled={!installer}
-                          onChange={(event) => updateScene(currentScene.id, { nextSceneTime: Number(event.target.value) * 30 + currentSceneDelaySeconds / 2 })}
-                        >
-                          {timerMinutes.map((value) => <option key={value} value={value}>{twoDigits(value)}m</option>)}
-                        </select>
-                        <b>:</b>
-                        <select
-                          aria-label="Delay seconds"
-                          value={currentSceneDelaySeconds}
-                          disabled={!installer}
-                          onChange={(event) => updateScene(currentScene.id, { nextSceneTime: currentSceneDelayMinutes * 30 + Number(event.target.value) / 2 })}
-                        >
-                          {timerSeconds.map((value) => <option key={value} value={value}>{twoDigits(value)}s</option>)}
-                        </select>
-                      </span>
-                    </Field>
-                  )}
-                  {currentSceneTimerMode >= 1 && currentSceneTimerMode <= 5 && (
-                    <Field
-                      label={currentSceneTimerMode === 1 ? "Time" : "Offset"}
-                      help={currentSceneTimerMode === 1 ? "The clock time when this scene should run." : "The amount of time before or after the selected sunrise or sunset event."}
-                    >
-                      <span className="scene-timer-value">
-                        <select
-                          aria-label={currentSceneTimerMode === 1 ? "Timer hour" : "Offset hours"}
-                          value={Math.min(23, currentSceneTimerHour)}
-                          disabled={!installer}
-                          onChange={(event) => updateScene(currentScene.id, { nextSceneTime: (Number(event.target.value) << 8) | currentSceneTimerMinute })}
-                        >
-                          {timerHours.map((value) => <option key={value} value={value}>{twoDigits(value)}h</option>)}
-                        </select>
-                        <b>:</b>
-                        <select
-                          aria-label={currentSceneTimerMode === 1 ? "Timer minute" : "Offset minutes"}
-                          value={Math.min(59, currentSceneTimerMinute)}
-                          disabled={!installer}
-                          onChange={(event) => updateScene(currentScene.id, { nextSceneTime: (currentSceneTimerHour << 8) | Number(event.target.value) })}
-                        >
-                          {timerMinutes.map((value) => <option key={value} value={value}>{twoDigits(value)}m</option>)}
-                        </select>
-                      </span>
-                    </Field>
-                  )}
-                  {currentSceneTimerMode >= 1 && currentSceneTimerMode <= 5 && (
-                    <Field label="On day(s)" help="Limit this timer to the selected day or group of days.">
-                      <select value={currentScene.nextSceneDay ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { nextSceneDay: Number(event.target.value) })}>
-                        {sceneTimerDays.map((day, index) => <option key={day} value={index}>{day}</option>)}
+                  <div className="scene-sequence-sections">
+                    <section className="scene-sequence-card">
+                      <div className="scene-sequence-heading"><small>SEQUENCE</small><h3>Additional process</h3><p>Only used if the main scene runs.</p></div>
+                      <div className="scene-sequence-controls">
+                        <Field label="Mode" help="Choose when the additional scene runs, or choose a sequence control action.">
+                          <select value={currentSceneTimerMode} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { nextSceneMode: Number(event.target.value) })}>
+                            <option value="-1">No additional process</option>
+                            {sceneTimerModes.map((mode, index) => <option key={mode} value={index}>{mode}</option>)}
+                          </select>
+                        </Field>
+                        {currentSceneTimerMode === 0 && (
+                          <Field label="Minutes : Seconds" help="Wait this long after the main scene runs before continuing the sequence.">
+                            <span className="scene-timer-value">
+                              <select
+                                aria-label="Delay minutes"
+                                value={Math.min(59, currentSceneDelayMinutes)}
+                                disabled={!installer}
+                                onChange={(event) => updateScene(currentScene.id, { nextSceneTime: Number(event.target.value) * 30 + currentSceneDelaySeconds / 2 })}
+                              >
+                                {timerMinutes.map((value) => <option key={value} value={value}>{twoDigits(value)}m</option>)}
+                              </select>
+                              <b>:</b>
+                              <select
+                                aria-label="Delay seconds"
+                                value={currentSceneDelaySeconds}
+                                disabled={!installer}
+                                onChange={(event) => updateScene(currentScene.id, { nextSceneTime: currentSceneDelayMinutes * 30 + Number(event.target.value) / 2 })}
+                              >
+                                {timerSeconds.map((value) => <option key={value} value={value}>{twoDigits(value)}s</option>)}
+                              </select>
+                            </span>
+                          </Field>
+                        )}
+                        {currentSceneTimerMode >= 1 && currentSceneTimerMode <= 5 && (
+                          <Field
+                            label={currentSceneTimerMode === 1 ? "Time" : "Offset"}
+                            help={currentSceneTimerMode === 1 ? "The clock time when this scene should run." : "The amount of time before or after the selected sunrise or sunset event."}
+                          >
+                            <span className="scene-timer-value">
+                              <select
+                                aria-label={currentSceneTimerMode === 1 ? "Timer hour" : "Offset hours"}
+                                value={Math.min(23, currentSceneTimerHour)}
+                                disabled={!installer}
+                                onChange={(event) => updateScene(currentScene.id, { nextSceneTime: (Number(event.target.value) << 8) | currentSceneTimerMinute })}
+                              >
+                                {timerHours.map((value) => <option key={value} value={value}>{twoDigits(value)}h</option>)}
+                              </select>
+                              <b>:</b>
+                              <select
+                                aria-label={currentSceneTimerMode === 1 ? "Timer minute" : "Offset minutes"}
+                                value={Math.min(59, currentSceneTimerMinute)}
+                                disabled={!installer}
+                                onChange={(event) => updateScene(currentScene.id, { nextSceneTime: (currentSceneTimerHour << 8) | Number(event.target.value) })}
+                              >
+                                {timerMinutes.map((value) => <option key={value} value={value}>{twoDigits(value)}m</option>)}
+                              </select>
+                            </span>
+                          </Field>
+                        )}
+                        {currentSceneTimerMode >= 1 && currentSceneTimerMode <= 5 && (
+                          <Field label="On day(s)" help="Limit this timer to the selected day or group of days.">
+                            <select value={currentScene.nextSceneDay ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { nextSceneDay: Number(event.target.value) })}>
+                              {sceneTimerDays.map((day, index) => <option key={day} value={index}>{day}</option>)}
+                            </select>
+                          </Field>
+                        )}
+                        <Toggle label="Begin a new sequence" help="Start the additional process as a new independent sequence." checked={currentScene.beginNewSequence ?? false} disabled={!installer} onChange={(beginNewSequence) => updateScene(currentScene.id, { beginNewSequence })} />
+                      </div>
+                    </section>
+                    <section className="scene-sequence-card">
+                      <div className="scene-sequence-heading"><small>LINKED SCENE</small><h3>Additionally run scene</h3><p>Choose the linked or extender scene separately.</p></div>
+                      <div className="scene-sequence-controls">
+                        <Field label="Scene">
+                          <select value={currentScene.nextSceneId ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { nextSceneId: Number(event.target.value) || undefined })}>
+                            <option value="0">None</option>{data.scenes.filter((scene) => scene.id !== currentScene.id).map((scene) => <option key={scene.id} value={scene.id}>{scene.name}</option>)}
+                          </select>
+                        </Field>
+                        <Field label="Extender scene">
+                          <select value={currentScene.extenderSceneId ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { extenderSceneId: Number(event.target.value) || undefined })}>
+                            <option value="0">None</option>{data.scenes.filter((scene) => scene.id !== currentScene.id).map((scene) => <option key={scene.id} value={scene.id}>{scene.name}</option>)}
+                          </select>
+                        </Field>
+                        <Toggle label="Run additional scene first" help="Run the extender scene before the main scene rather than after it." checked={currentScene.runExtenderFirst ?? false} disabled={!installer} onChange={(runExtenderFirst) => updateScene(currentScene.id, { runExtenderFirst })} />
+                      </div>
+                    </section>
+                  </div>
+                  <div className="scene-rule-panel-body">
+                    <Field label="Only when last scene was" help="Restrict this scene to run only after the selected previous scene.">
+                      <select value={currentScene.previousSceneId ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { previousSceneId: Number(event.target.value) || undefined })}>
+                        <option value="0">Any scene</option>
+                        {data.scenes.filter((scene) => scene.id !== currentScene.id).map((scene) => <option key={scene.id} value={scene.id}>{scene.name}</option>)}
                       </select>
                     </Field>
-                  )}
-                  <Toggle label="Begin a new sequence" help="Start the additional process as a new independent sequence." checked={currentScene.beginNewSequence ?? false} disabled={!installer} onChange={(beginNewSequence) => updateScene(currentScene.id, { beginNewSequence })} />
-                </div>
-              </section>
-              <section className="scene-sequence-card">
-                <div className="scene-sequence-heading"><small>LINKED SCENE</small><h3>Additionally run scene</h3><p>Choose the linked or extender scene separately.</p></div>
-                <div className="scene-sequence-controls">
-                  <Field label="Scene">
-                    <select value={currentScene.nextSceneId ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { nextSceneId: Number(event.target.value) || undefined })}>
-                      <option value="0">None</option>{data.scenes.filter((scene) => scene.id !== currentScene.id).map((scene) => <option key={scene.id} value={scene.id}>{scene.name}</option>)}
-                    </select>
-                  </Field>
-                  <Field label="Extender scene">
-                    <select value={currentScene.extenderSceneId ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { extenderSceneId: Number(event.target.value) || undefined })}>
-                      <option value="0">None</option>{data.scenes.filter((scene) => scene.id !== currentScene.id).map((scene) => <option key={scene.id} value={scene.id}>{scene.name}</option>)}
-                    </select>
-                  </Field>
-                  <Toggle label="Run additional scene first" help="Run the extender scene before the main scene rather than after it." checked={currentScene.runExtenderFirst ?? false} disabled={!installer} onChange={(runExtenderFirst) => updateScene(currentScene.id, { runExtenderFirst })} />
-                </div>
-              </section>
-            </div>
-            <div className="scene-rule-panel-body">
-              <Field label="Only when last scene was" help="Restrict this scene to run only after the selected previous scene.">
-                <select value={currentScene.previousSceneId ?? 0} disabled={!installer} onChange={(event) => updateScene(currentScene.id, { previousSceneId: Number(event.target.value) || undefined })}>
-                  <option value="0">Any scene</option>
-                  {data.scenes.filter((scene) => scene.id !== currentScene.id).map((scene) => <option key={scene.id} value={scene.id}>{scene.name}</option>)}
-                </select>
-              </Field>
-            </div>
+                  </div>
                 </>
               ) : sceneRulePanel === "periods" ? (
                 <div className="scene-rule-panel-body scene-period-grid">
@@ -5624,15 +5854,14 @@ export default function FlexiDimWeb() {
     </div>
   );
 
-  const sceneButtonRooms = sceneButtonFloor
-    ? (() => {
-        const children = data.rooms.filter(
-          (room) => room.parentId === sceneButtonFloor,
-        );
-        const floor = data.rooms.find((room) => room.id === sceneButtonFloor);
-        return children.length ? children : floor ? [floor] : [];
-      })()
-    : [];
+  // Rooms shown when drilling into a floor: its children, or the floor
+  // itself when it has no child areas.
+  const roomsOfFloor = (floorId: number) => {
+    const children = data.rooms.filter((room) => room.parentId === floorId);
+    const floor = data.rooms.find((room) => room.id === floorId);
+    return children.length ? children : floor ? [floor] : [];
+  };
+  const sceneButtonRooms = sceneButtonFloor ? roomsOfFloor(sceneButtonFloor) : [];
   const sceneButtonSwitches = sceneButtonRoom
     ? data.switches.filter((item) => item.roomId === sceneButtonRoom)
     : [];
@@ -5656,10 +5885,10 @@ export default function FlexiDimWeb() {
     : undefined;
   const sceneButtonStartGroupId = sceneButtonSwitchRoom
     ? (sceneGroups.find(
-        (group) =>
-          group.name.trim().toLowerCase() ===
-          sceneButtonSwitchRoom.name.trim().toLowerCase(),
-      )?.id ?? null)
+      (group) =>
+        group.name.trim().toLowerCase() ===
+        sceneButtonSwitchRoom.name.trim().toLowerCase(),
+    )?.id ?? null)
     : null;
   const sceneBreadcrumb = (scene: Scene) =>
     (scene.folderPath?.length
@@ -6089,13 +6318,13 @@ export default function FlexiDimWeb() {
                         ? e.target.value
                           ? { ...p, name: e.target.value }
                           : {
-                              ...p,
-                              name: "",
-                              start: "00:00",
-                              end: "00:00",
-                              startMode: 0,
-                              endMode: 0,
-                            }
+                            ...p,
+                            name: "",
+                            start: "00:00",
+                            end: "00:00",
+                            startMode: 0,
+                            endMode: 0,
+                          }
                         : p,
                     ),
                   }))
@@ -6195,42 +6424,194 @@ export default function FlexiDimWeb() {
     </div>
   );
 
-  const moveUserAccess = (
+  const patchUserAccess = (
     userId: number,
     field: "roomIds" | "switchIds",
-    accessId: number,
-    direction: -1 | 1,
+    mutate: (list: number[]) => number[] | null,
   ) =>
     setData((old) => ({
       ...old,
       users: old.users.map((user) => {
         if (user.id !== userId) return user;
-        const ordered = [...(user[field] ?? [])];
-        const from = ordered.indexOf(accessId);
-        const to = from + direction;
-        if (from < 0 || to < 0 || to >= ordered.length) return user;
-        [ordered[from], ordered[to]] = [ordered[to], ordered[from]];
-        return updateUserProfile(user, { [field]: ordered });
+        const ordered = mutate([...(user[field] ?? [])]);
+        return ordered ? updateUserProfile(user, { [field]: ordered }) : user;
       }),
     }));
+  const addUserAccess = (
+    userId: number,
+    field: "roomIds" | "switchIds",
+    accessId: number,
+  ) =>
+    patchUserAccess(userId, field, (list) =>
+      list.includes(accessId) ? null : [...list, accessId],
+    );
+  // Granting an area brings all of its switches with it, mirroring the iOS
+  // app's room|switch access paths. One call covers one or many areas so a
+  // whole-floor grant bumps the profile version only once.
+  const grantUserAreas = (userId: number, areaIds: number[]) =>
+    setData((old) => ({
+      ...old,
+      users: old.users.map((user) => {
+        if (user.id !== userId) return user;
+        const roomIds = [...(user.roomIds ?? [])];
+        const switchIds = [...(user.switchIds ?? [])];
+        for (const areaId of areaIds) {
+          if (!roomIds.includes(areaId)) roomIds.push(areaId);
+          for (const wallSwitch of old.switches)
+            if (
+              wallSwitch.roomId === areaId &&
+              !switchIds.includes(wallSwitch.id)
+            )
+              switchIds.push(wallSwitch.id);
+        }
+        if (
+          roomIds.length === (user.roomIds ?? []).length &&
+          switchIds.length === (user.switchIds ?? []).length
+        )
+          return user;
+        return updateUserProfile(user, { roomIds, switchIds });
+      }),
+    }));
+  // Removing an area also revokes the user's switches inside it — access is
+  // granted as area-plus-switches paths, so a switch cannot outlive its area.
+  const removeUserAccess = (
+    userId: number,
+    field: "roomIds" | "switchIds",
+    accessId: number,
+  ) =>
+    setData((old) => ({
+      ...old,
+      users: old.users.map((user) => {
+        if (user.id !== userId || !(user[field] ?? []).includes(accessId))
+          return user;
+        const patch: Partial<FlexUser> = {
+          [field]: (user[field] ?? []).filter((id) => id !== accessId),
+        };
+        if (field === "roomIds")
+          patch.switchIds = (user.switchIds ?? []).filter((id) => {
+            const wallSwitch = old.switches.find((item) => item.id === id);
+            return wallSwitch ? wallSwitch.roomId !== accessId : true;
+          });
+        return updateUserProfile(user, patch);
+      }),
+    }));
+  const reorderUserAccess = (
+    userId: number,
+    field: "roomIds" | "switchIds",
+    dragId: number,
+    targetId: number,
+  ) =>
+    patchUserAccess(userId, field, (list) => {
+      const from = list.indexOf(dragId);
+      const to = list.indexOf(targetId);
+      if (from < 0 || to < 0 || from === to) return null;
+      list.splice(from, 1);
+      list.splice(to, 0, dragId);
+      return list;
+    });
+
+  const selectedUser = data.users.find((user) => user.id === selectedUserId);
+  const selectedUserAreas = selectedUser
+    ? (selectedUser.roomIds ?? [])
+      .map((id) => data.rooms.find((room) => room.id === id))
+      .filter((room): room is Room => Boolean(room))
+    : [];
+  const selectedUserSwitches = selectedUser
+    ? (selectedUser.switchIds ?? [])
+      .map((id) => data.switches.find((item) => item.id === id))
+      .filter((item): item is WallSwitch => Boolean(item))
+    : [];
+  const selectedUserArea = selectedUserAreas.find(
+    (room) => room.id === selectedUserAreaId,
+  );
+  const selectedUserAreaSwitches = selectedUserArea
+    ? selectedUserSwitches.filter((item) => item.roomId === selectedUserArea.id)
+    : [];
+  const userAccessItem = (
+    field: "roomIds" | "switchIds",
+    id: number,
+    icon: string,
+    title: string,
+    subtitle: string,
+    onSelect?: () => void,
+    selected?: boolean,
+  ) => {
+    if (!selectedUser) return null;
+    const isSameList =
+      userDrag?.userId === selectedUser.id && userDrag.field === field;
+    const isDragSource = isSameList && userDrag?.id === id;
+    const isDropTarget = isSameList && !isDragSource && userDragOverId === id;
+    return (
+      <div
+        key={`${field}-${id}`}
+        className={`user-access-item${onSelect ? " selectable" : ""}${selected ? " selected" : ""}${isDropTarget ? " drop-target" : ""}${isDragSource ? " dragging" : ""}`}
+        draggable={installer}
+        onClick={onSelect}
+        onDragStart={() => setUserDrag({ userId: selectedUser.id, field, id })}
+        onDragOver={(event) => {
+          if (isSameList && !isDragSource) {
+            event.preventDefault();
+            setUserDragOverId(id);
+          }
+        }}
+        onDragLeave={() =>
+          setUserDragOverId((over) => (over === id ? null : over))
+        }
+        onDrop={(event) => {
+          event.preventDefault();
+          if (isSameList && userDrag)
+            reorderUserAccess(selectedUser.id, field, userDrag.id, id);
+          setUserDrag(null);
+          setUserDragOverId(null);
+        }}
+        onDragEnd={() => {
+          setUserDrag(null);
+          setUserDragOverId(null);
+        }}
+      >
+        <span className="drag-grip" aria-hidden="true">
+          ⠿
+        </span>
+        <img src={icon} alt="" />
+        <span className="user-access-name">
+          <b>{title}</b>
+          {subtitle && <small>{subtitle}</small>}
+        </span>
+        <button
+          className="access-remove"
+          disabled={!installer}
+          aria-label={`Remove ${title}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            removeUserAccess(selectedUser.id, field, id);
+          }}
+        >
+          ✕
+        </button>
+        {onSelect && <em aria-hidden="true">›</em>}
+      </div>
+    );
+  };
 
   const usersPanel = (
-    <div className="content-grid users-grid">
-      <section className="card">
-        <div className="card-title">
+    <div className="master-detail users-drill">
+      <section className="master card users-column">
+        <div className="master-head">
           <div>
             <small>USERS</small>
-            <h2>Remote Control profiles</h2>
+            <h2>Users</h2>
           </div>
           <button
-            className="primary"
+            aria-label="New user"
+            title="New user"
             disabled={!installer}
             onClick={() => {
+              const id = newId(data.users);
               setData((old) => {
                 const key = generateSecurityKey();
                 const user = updateUserProfile(
                   {
-                    id: newId(old.users),
+                    id,
                     name: "New user",
                     remote: false,
                     changes: false,
@@ -6244,196 +6625,516 @@ export default function FlexiDimWeb() {
                 );
                 return { ...old, users: [...old.users, user] };
               });
+              setSelectedUserId(id);
+              setSelectedUserAreaId(null);
               notify("New user created", "ok");
             }}
           >
-            ＋ New user
+            ＋
           </button>
         </div>
-        <div className="user-list">
-          {data.users.map((user) => (
-            <div key={user.id}>
+        {data.users.length ? (
+          data.users.map((user) => (
+            <button
+              key={user.id}
+              className={selectedUserId === user.id ? "selected" : ""}
+              onClick={() => {
+                setSelectedUserId(user.id);
+                setSelectedUserAreaId(null);
+              }}
+            >
               <img src="/flexidim/users.png" alt="" />
+              <span>
+                <b>{user.name}</b>
+                <small>
+                  {(user.roomIds ?? []).length} areas ·{" "}
+                  {(user.switchIds ?? []).length} switches
+                </small>
+              </span>
+              <em>›</em>
+            </button>
+          ))
+        ) : (
+          <Empty>No users yet.</Empty>
+        )}
+        <div className="users-master-foot">
+          <p className="hint">
+            Security codes are kept in this browser with the rest of the local
+            configuration. Export a backup before clearing browser data.
+          </p>
+          <button
+            disabled={!data.users.length}
+            onClick={() =>
+              copyToClipboard(
+                data.users
+                  .map((u) => `${u.name}: ${formatSecurityCode(u.key)}`)
+                  .join("\n"),
+                `${data.users.length} security ${data.users.length === 1 ? "code" : "codes"}`,
+              )
+            }
+          >
+            Copy all security codes
+          </button>
+          <button onClick={exportUserKeys}>Export keys and profiles</button>
+          {/* The bridge re-runs the offline dry run over these exact payloads
+              before a single byte is written, so the send needs no separate
+              check step in the UI — only the global edit gate. */}
+          <button
+            className="primary"
+            disabled={!installer}
+            onClick={() => setUserProfileDialog("warning")}
+            title="Send the user profiles to the connected Scene Controller."
+          >
+            Send user profiles
+          </button>
+        </div>
+      </section>
+      {selectedUser && (
+        <section className="card users-detail-column">
+          <div className="card-title">
+            <div>
+              <small>USER</small>
+              <h2>{selectedUser.name}</h2>
+            </div>
+            <button
+              className="delete"
+              disabled={!installer}
+              onClick={() => {
+                setData((old) => ({
+                  ...old,
+                  ...deleteConfigEntity(
+                    snapshotContent(old),
+                    "user",
+                    selectedUser.id,
+                  ),
+                }));
+                setSelectedUserId(null);
+                setSelectedUserAreaId(null);
+              }}
+            >
+              Delete
+            </button>
+          </div>
+          <div className="user-config">
+            <Field label="Name">
               <input
-                value={user.name}
+                value={selectedUser.name}
                 disabled={!installer}
                 onChange={(e) =>
                   setData((old) => ({
                     ...old,
                     users: old.users.map((u) =>
-                      u.id === user.id
+                      u.id === selectedUser.id
                         ? updateUserProfile(u, { name: e.target.value })
                         : u,
                     ),
                   }))
                 }
               />
-              <code>{user.key}</code>
+            </Field>
+            <div className="security-code-block">
+              <span className="option-label">Security code</span>
+              <div className="security-code">
+                <code>{formatSecurityCode(selectedUser.key)}</code>
+                <button
+                  className="copy-code"
+                  aria-label="Copy security code"
+                  title="Copy security code"
+                  onClick={() =>
+                    copyToClipboard(
+                      formatSecurityCode(selectedUser.key),
+                      "Security code",
+                    )
+                  }
+                >
+                  ⧉
+                </button>
+                <button
+                  className="generate-code"
+                  disabled={!installer}
+                  onClick={() => {
+                    const key = generateSecurityKey();
+                    setData((old) => ({
+                      ...old,
+                      users: old.users.map((item) =>
+                        item.id === selectedUser.id
+                          ? updateUserProfile(item, { key, securityCode: key })
+                          : item,
+                      ),
+                    }));
+                    notify("New security code generated", "ok");
+                  }}
+                >
+                  Generate new security code
+                </button>
+              </div>
               <small>
-                Profile v{user.profileVersion ?? 0} ·{" "}
-                {user.profileStatus ?? (user.profileData ? "current" : "not generated")}
+                Profile v{selectedUser.profileVersion ?? 0} ·{" "}
+                {selectedUser.profileStatus ??
+                  (selectedUser.profileData ? "current" : "not generated")}
               </small>
-              <button disabled={!installer} onClick={() => {
-                const key = generateSecurityKey();
+            </div>
+            <Toggle
+              label="Remote access"
+              checked={selectedUser.remote}
+              disabled={!installer}
+              onChange={(remote) =>
                 setData((old) => ({
-                  ...old, users: old.users.map((item) => item.id === user.id
-                    ? updateUserProfile(item, { key, securityCode: key })
-                    : item),
-                }));
-              }}>Generate security key</button>
-              <Toggle
-                label="Remote access"
-                checked={user.remote}
-                disabled={!installer}
-                onChange={(remote) =>
-                  setData((old) => ({
-                    ...old,
-                    users: old.users.map((u) =>
-                      u.id === user.id ? updateUserProfile(u, { remote }) : u,
-                    ),
-                  }))
-                }
-              />
-              <Toggle
-                label="Allow changes"
-                checked={user.changes}
-                disabled={!installer}
-                onChange={(changes) =>
-                  setData((old) => ({
-                    ...old,
-                    users: old.users.map((u) =>
-                      u.id === user.id ? updateUserProfile(u, { changes }) : u,
-                    ),
-                  }))
-                }
-              />
+                  ...old,
+                  users: old.users.map((u) =>
+                    u.id === selectedUser.id
+                      ? updateUserProfile(u, { remote })
+                      : u,
+                  ),
+                }))
+              }
+            />
+          </div>
+          <div className="user-access-head">
+            <strong>Areas</strong>
+            <span className="access-buttons">
               <button
-                className="delete"
+                className="access-add"
                 disabled={!installer}
+                aria-label={`Add area for ${selectedUser.name}`}
+                title="Add area"
                 onClick={() =>
-                  setData((old) => ({
-                    ...old,
-                    ...deleteConfigEntity(
-                      snapshotContent(old),
-                      "user",
-                      user.id,
-                    ),
-                  }))
+                  setUserAccessPicker({
+                    userId: selectedUser.id,
+                    kind: "room",
+                    floorId: null,
+                    roomId: null,
+                  })
                 }
               >
-                Delete
+                <img src="/flexidim/rooms/0.png" alt="" />
+                <i>＋</i>
               </button>
-              <div className="user-access-editor">
-                <strong>Rooms</strong>
-                {orderUserAccess(data.rooms, user.roomIds).map((room) => (
-                  <label key={room.id}>
-                    <input type="checkbox" disabled={!installer} checked={user.roomIds?.includes(room.id) ?? false} onChange={(event) => setData((old) => ({
-                      ...old, users: old.users.map((item) => item.id === user.id ? {
-                        ...updateUserProfile(item, {
-                          roomIds: event.target.checked
-                            ? [...(item.roomIds ?? []), room.id]
-                            : (item.roomIds ?? []).filter((id) => id !== room.id),
-                        }),
-                      } : item),
-                    }))} />
-                    {room.name}
-                    {user.roomIds?.includes(room.id) && (
-                      <span>
-                        <button
-                          type="button"
-                          disabled={!installer || user.roomIds.indexOf(room.id) === 0}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            moveUserAccess(user.id, "roomIds", room.id, -1);
-                          }}
-                        >
-                          ↑
-                        </button>
-                        <button
-                          type="button"
-                          disabled={!installer || user.roomIds.indexOf(room.id) === user.roomIds.length - 1}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            moveUserAccess(user.id, "roomIds", room.id, 1);
-                          }}
-                        >
-                          ↓
-                        </button>
-                      </span>
-                    )}
-                  </label>
-                ))}
-                <strong>Switches</strong>
-                {orderUserAccess(
-                  data.switches.filter((wallSwitch) => !user.roomIds?.length || user.roomIds.includes(wallSwitch.roomId)),
-                  user.switchIds,
-                ).map((wallSwitch) => (
-                  <label key={wallSwitch.id}>
-                    <input type="checkbox" disabled={!installer} checked={user.switchIds?.includes(wallSwitch.id) ?? false} onChange={(event) => setData((old) => ({
-                      ...old, users: old.users.map((item) => item.id === user.id ? {
-                        ...updateUserProfile(item, {
-                          switchIds: event.target.checked
-                            ? [...(item.switchIds ?? []), wallSwitch.id]
-                            : (item.switchIds ?? []).filter((id) => id !== wallSwitch.id),
-                        }),
-                      } : item),
-                    }))} />
-                    {wallSwitch.name}
-                    {user.switchIds?.includes(wallSwitch.id) && (
-                      <span>
-                        <button
-                          type="button"
-                          disabled={!installer || user.switchIds.indexOf(wallSwitch.id) === 0}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            moveUserAccess(user.id, "switchIds", wallSwitch.id, -1);
-                          }}
-                        >
-                          ↑
-                        </button>
-                        <button
-                          type="button"
-                          disabled={!installer || user.switchIds.indexOf(wallSwitch.id) === user.switchIds.length - 1}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            moveUserAccess(user.id, "switchIds", wallSwitch.id, 1);
-                          }}
-                        >
-                          ↓
-                        </button>
-                      </span>
-                    )}
-                  </label>
-                ))}
+              <button
+                className="access-add"
+                disabled={!installer}
+                aria-label={`Add switch for ${selectedUser.name}`}
+                title="Add switch"
+                onClick={() =>
+                  setUserAccessPicker({
+                    userId: selectedUser.id,
+                    kind: "switch",
+                    floorId: null,
+                    roomId: null,
+                  })
+                }
+              >
+                <img src="/flexidim/switches.png" alt="" />
+                <i>＋</i>
+              </button>
+            </span>
+          </div>
+          <div className="user-access-list">
+            {selectedUserAreas.length ? (
+              selectedUserAreas.map((room) =>
+                userAccessItem(
+                  "roomIds",
+                  room.id,
+                  room.icon,
+                  room.name,
+                  data.rooms.find((item) => item.id === room.parentId)?.name ??
+                  "Floor",
+                  () => setSelectedUserAreaId(room.id),
+                  selectedUserArea?.id === room.id,
+                ),
+              )
+            ) : (
+              <p className="hint">
+                No areas yet — use ＋ to grant access to an area or a switch.
+              </p>
+            )}
+          </div>
+        </section>
+      )}
+      {selectedUser && selectedUserArea && (
+        <section className="card users-switches-column">
+          <div className="card-title">
+            <div>
+              <small>SWITCHES</small>
+              <h2>{selectedUserArea.name}</h2>
+            </div>
+            <button
+              className="access-add"
+              disabled={!installer}
+              aria-label={`Add switch in ${selectedUserArea.name}`}
+              title="Add switch in this area"
+              onClick={() =>
+                setUserAccessPicker({
+                  userId: selectedUser.id,
+                  kind: "switch",
+                  floorId: data.rooms.some(
+                    (room) => room.id === selectedUserArea.parentId,
+                  )
+                    ? (selectedUserArea.parentId ?? selectedUserArea.id)
+                    : selectedUserArea.id,
+                  roomId: selectedUserArea.id,
+                })
+              }
+            >
+              <img src="/flexidim/switches.png" alt="" />
+              <i>＋</i>
+            </button>
+          </div>
+          <div className="user-access-list">
+            {selectedUserAreaSwitches.length ? (
+              selectedUserAreaSwitches.map((wallSwitch) =>
+                userAccessItem(
+                  "switchIds",
+                  wallSwitch.id,
+                  "/flexidim/switches.png",
+                  wallSwitch.name,
+                  `${wallSwitch.kind} · ${wallSwitch.buttons} buttons`,
+                ),
+              )
+            ) : (
+              <p className="hint">
+                No switches from this area yet — use ＋ to add one.
+              </p>
+            )}
+          </div>
+        </section>
+      )}
+      {userAccessPicker &&
+        (() => {
+          const picker = userAccessPicker;
+          const pickerUser = data.users.find(
+            (item) => item.id === picker.userId,
+          );
+          if (!pickerUser) return null;
+          const close = () => setUserAccessPicker(null);
+          const heading =
+            picker.roomId != null
+              ? roomName(picker.roomId)
+              : picker.floorId != null
+                ? roomName(picker.floorId)
+                : picker.kind === "room"
+                  ? "Add area"
+                  : "Add switch";
+          const pickRoom = (roomId: number) => {
+            grantUserAreas(picker.userId, [roomId]);
+            if (picker.userId === selectedUserId)
+              setSelectedUserAreaId(roomId);
+            close();
+          };
+          // Granting a switch also grants its area, mirroring the iOS app.
+          const pickSwitch = (switchId: number) => {
+            const wallSwitch = data.switches.find(
+              (item) => item.id === switchId,
+            );
+            if (wallSwitch) {
+              addUserAccess(picker.userId, "roomIds", wallSwitch.roomId);
+              addUserAccess(picker.userId, "switchIds", switchId);
+              if (picker.userId === selectedUserId)
+                setSelectedUserAreaId(wallSwitch.roomId);
+            }
+            close();
+          };
+          const roomEntry = (room: Room, subtitle: string) => {
+            const added = pickerUser.roomIds?.includes(room.id) ?? false;
+            return (
+              <button
+                key={`room-${room.id}`}
+                className={`scene-picker-scene${added ? " added" : ""}`}
+                disabled={added}
+                onClick={() => pickRoom(room.id)}
+              >
+                <img src={room.icon} alt="" />
+                <span>
+                  <b>{room.name}</b>
+                  <small>{added ? "Already added" : subtitle}</small>
+                </span>
+              </button>
+            );
+          };
+          return (
+            <div className="scene-picker-overlay" onClick={close}>
+              <div
+                className="scene-picker"
+                role="dialog"
+                aria-label={
+                  picker.kind === "room" ? "Add an area" : "Add a switch"
+                }
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="scene-picker-head">
+                  {picker.floorId != null ? (
+                    <button
+                      className="scene-picker-back"
+                      onClick={() =>
+                        setUserAccessPicker(
+                          picker.roomId != null
+                            ? { ...picker, roomId: null }
+                            : { ...picker, floorId: null },
+                        )
+                      }
+                    >
+                      ‹ Back
+                    </button>
+                  ) : (
+                    <span />
+                  )}
+                  <strong>{heading}</strong>
+                  <button
+                    className="scene-picker-close"
+                    aria-label="Close"
+                    onClick={close}
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div className="scene-picker-list">
+                  {picker.floorId == null ? (
+                    rootAreas.length ? (
+                      rootAreas.map((floor) => {
+                        const descendantIds = new Set(
+                          areaDescendants(floor.id),
+                        );
+                        const switchCount = data.switches.filter((item) =>
+                          descendantIds.has(item.roomId),
+                        ).length;
+                        return (
+                          <button
+                            key={`floor-${floor.id}`}
+                            className="scene-picker-group"
+                            onClick={() =>
+                              setUserAccessPicker({
+                                ...picker,
+                                floorId: floor.id,
+                              })
+                            }
+                          >
+                            <img src={floor.icon} alt="" />
+                            <span>
+                              <b>{floor.name}</b>
+                              <small>
+                                {picker.kind === "room"
+                                  ? `${descendantIds.size - 1 || 1} areas`
+                                  : `${switchCount} switches`}
+                              </small>
+                            </span>
+                            <em>›</em>
+                          </button>
+                        );
+                      })
+                    ) : (
+                      <p className="hint">No areas defined yet.</p>
+                    )
+                  ) : picker.kind === "room" ? (
+                    (() => {
+                      const floor = data.rooms.find(
+                        (room) => room.id === picker.floorId,
+                      );
+                      const rooms = roomsOfFloor(picker.floorId);
+                      const includeFloor =
+                        floor && !rooms.some((room) => room.id === floor.id);
+                      const floorSwitchCount = data.switches.filter((item) =>
+                        rooms.some((room) => room.id === item.roomId),
+                      ).length;
+                      const allAdded = rooms.every(
+                        (room) => pickerUser.roomIds?.includes(room.id) ?? false,
+                      );
+                      return (
+                        <>
+                          {includeFloor && (
+                            <button
+                              className={`scene-picker-scene${allAdded ? " added" : ""}`}
+                              disabled={allAdded}
+                              onClick={() => {
+                                grantUserAreas(
+                                  picker.userId,
+                                  rooms.map((room) => room.id),
+                                );
+                                close();
+                              }}
+                            >
+                              <img src={floor.icon} alt="" />
+                              <span>
+                                <b>All of {floor.name}</b>
+                                <small>
+                                  {allAdded
+                                    ? "Already added"
+                                    : `Adds ${rooms.length} areas · ${floorSwitchCount} switches`}
+                                </small>
+                              </span>
+                            </button>
+                          )}
+                          {rooms.map((room) =>
+                            roomEntry(
+                              room,
+                              `${data.switches.filter(
+                                (item) => item.roomId === room.id,
+                              ).length
+                              } switches`,
+                            ),
+                          )}
+                        </>
+                      );
+                    })()
+                  ) : picker.roomId == null ? (
+                    roomsOfFloor(picker.floorId).map((room) => (
+                      <button
+                        key={`room-${room.id}`}
+                        className="scene-picker-group"
+                        onClick={() =>
+                          setUserAccessPicker({ ...picker, roomId: room.id })
+                        }
+                      >
+                        <img src={room.icon} alt="" />
+                        <span>
+                          <b>{room.name}</b>
+                          <small>
+                            {
+                              data.switches.filter(
+                                (item) => item.roomId === room.id,
+                              ).length
+                            } switches
+                          </small>
+                        </span>
+                        <em>›</em>
+                      </button>
+                    ))
+                  ) : (
+                    (() => {
+                      const switches = data.switches.filter(
+                        (item) => item.roomId === picker.roomId,
+                      );
+                      if (!switches.length)
+                        return <p className="hint">No switches in this area.</p>;
+                      return switches.map((wallSwitch) => {
+                        const added =
+                          pickerUser.switchIds?.includes(wallSwitch.id) ??
+                          false;
+                        return (
+                          <button
+                            key={`switch-${wallSwitch.id}`}
+                            className={`scene-picker-scene${added ? " added" : ""}`}
+                            disabled={added}
+                            onClick={() => pickSwitch(wallSwitch.id)}
+                          >
+                            <img src="/flexidim/switches.png" alt="" />
+                            <span>
+                              <b>{wallSwitch.name}</b>
+                              <small>
+                                {added
+                                  ? "Already added"
+                                  : `${wallSwitch.kind} · ${wallSwitch.buttons} buttons`}
+                              </small>
+                            </span>
+                          </button>
+                        );
+                      });
+                    })()
+                  )}
+                </div>
               </div>
             </div>
-          ))}
-        </div>
-      </section>
-      <section className="card user-info">
-        <img src="/flexidim/icon.png" alt="FlexiDim" />
-        <h2>User security keys</h2>
-        <p>
-          Keys are kept in this browser with the rest of the local
-          configuration. Export a backup before clearing browser data.
-        </p>
-        <button
-          onClick={() => {
-            navigator.clipboard?.writeText(
-              data.users.map((u) => `${u.name}: ${u.key}`).join("\n"),
-            );
-            addTrace("User keys copied");
-          }}
-        >
-          Copy all keys
-        </button>
-        <button onClick={exportUserKeys}>
-          Export keys and profiles
-        </button>
-        <button disabled title="Controller user-profile transfer is not protocol-verified.">
-          Send user profiles — not available
-        </button>
-      </section>
+          );
+        })()}
     </div>
   );
 
@@ -6509,12 +7210,13 @@ export default function FlexiDimWeb() {
           <small>{data.site.id}</small>
         </div>
         <button
-          className={`connection-chip ${connection}`}
+          className={`connection-chip ${controllerNotNormal ? "connected not-normal" : connection}`}
           disabled={!storageLoaded}
           onClick={() => connect()}
+          title={pillTitle}
         >
           <i />
-          {connectionLabel}
+          {pillLabel}
         </button>
         <div className="header-changes">
           <span>Allow changes</span>
@@ -6550,8 +7252,8 @@ export default function FlexiDimWeb() {
             <h1>{tab}</h1>
           </div>
           {tab !== "Sites" && (
-            <span className={`status-pill ${connection}`}>
-              ● {connectionLabel}
+            <span className={`status-pill ${pillClass}`} title={pillTitle}>
+              ● {pillLabel}
             </span>
           )}
         </div>
@@ -6628,6 +7330,159 @@ export default function FlexiDimWeb() {
                   <button
                     className="primary"
                     onClick={() => setTransferDialog("closed")}
+                  >
+                    OK
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+      {userProfileDialog !== "closed" && (
+        <div className="transfer-dialog-overlay">
+          <div
+            className="transfer-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="user-profile-dialog-title"
+          >
+            {userProfileDialog === "warning" ? (
+              <>
+                <h2 id="user-profile-dialog-title">
+                  Ready to send user profiles to Scene Controller
+                </h2>
+                <p>
+                  Continuing will send every user profile to the Scene
+                  Controller. After the last profile is sent, the app stops and
+                  the Scene Controller saves the profiles and resets itself —
+                  this can take a few minutes, during which switches will not
+                  respond and light levels may change or go off.
+                </p>
+                <p>
+                  Do not send commands or make changes until it has returned to
+                  normal. Everything the controller sends back is captured and
+                  shown in the result.
+                </p>
+                <div className="transfer-dialog-actions">
+                  <button onClick={() => setUserProfileDialog("closed")}>
+                    Cancel
+                  </button>
+                  <button className="primary" onClick={beginUserProfileSend}>
+                    Continue
+                  </button>
+                </div>
+              </>
+            ) : userProfileDialog === "running" ? (
+              <>
+                <h2 id="user-profile-dialog-title">
+                  Send user profiles to Scene Controller
+                </h2>
+                <p className="transfer-phase">
+                  {userProfileProgress?.message ?? "Sending user profiles"}
+                </p>
+                {userProfileProgress?.state === "awaiting-reply" && (
+                  <p className="transfer-wait">
+                    Nothing more is being sent to the controller.
+                  </p>
+                )}
+              </>
+            ) : userProfileDialog === "recovering" ? (
+              (() => {
+                const phase = userProfileRecovery?.phase;
+                const done = phase === "success";
+                const closeRecovery = () => {
+                  stopUserProfileRecovery();
+                  setUserProfileRecovery(null);
+                  setUserProfileDialog("closed");
+                };
+                return (
+                  <>
+                    <h2 id="user-profile-dialog-title">
+                      {done
+                        ? "User profiles sent — reset triggered"
+                        : phase === "failed"
+                          ? "User profiles sent — sync did not complete"
+                          : "User profiles sent — Scene Controller restarting"}
+                    </h2>
+                    <p className="transfer-phase">
+                      {userProfileRecovery?.message ??
+                        "Waiting for the Scene Controller…"}
+                    </p>
+                    {recoveryCountdownSeconds !== null ? (
+                      <p className="transfer-count">
+                        Reconnect &amp; Sync available in{" "}
+                        {Math.floor(recoveryCountdownSeconds / 60)}:
+                        {String(recoveryCountdownSeconds % 60).padStart(2, "0")}
+                      </p>
+                    ) : null}
+                    {!done ? (
+                      <p className="transfer-wait">
+                        Please don&rsquo;t send commands or make changes until this
+                        finishes.
+                      </p>
+                    ) : null}
+                    {done && userProfileResult?.controllerBytes?.length ? (
+                      <>
+                        <p className="hint">
+                          Captured{" "}
+                          {userProfileResult.controllerBytes.length} controller{" "}
+                          {userProfileResult.controllerBytes.length === 1
+                            ? "reply"
+                            : "replies"}{" "}
+                          during the send — kept as protocol evidence:
+                        </p>
+                        <pre className="user-profile-capture">
+                          {userProfileResult.controllerBytes
+                            .map((item) => `[${item.phase}] ${item.hex}`)
+                            .join("\n")}
+                        </pre>
+                      </>
+                    ) : null}
+                    <div className="transfer-dialog-actions">
+                      <button onClick={closeRecovery}>
+                        {done ? "Close" : "Stop and close"}
+                      </button>
+                      {!done ? (
+                        <button
+                          className="primary"
+                          disabled={!userProfileRecovery?.canSync}
+                          onClick={() => recoveryRef.current?.reconnectAndSync()}
+                        >
+                          Reconnect &amp; Sync
+                        </button>
+                      ) : null}
+                    </div>
+                  </>
+                );
+              })()
+            ) : (
+              <>
+                <h2 id="user-profile-dialog-title">
+                  {userProfileResult?.state === "completed"
+                    ? "User profiles sent successfully"
+                    : "User-profile send stopped"}
+                </h2>
+                <p>{userProfileResult?.message}</p>
+                <p className="hint">
+                  {userProfileResult?.controllerBytes?.length
+                    ? `Captured ${userProfileResult.controllerBytes.length} controller ${userProfileResult.controllerBytes.length === 1
+                      ? "reply"
+                      : "replies"
+                    } during the exchange — keep this as protocol evidence:`
+                    : "The Scene Controller sent no bytes during the exchange."}
+                </p>
+                {userProfileResult?.controllerBytes?.length ? (
+                  <pre className="user-profile-capture">
+                    {userProfileResult.controllerBytes
+                      .map((item) => `[${item.phase}] ${item.hex}`)
+                      .join("\n")}
+                  </pre>
+                ) : null}
+                <div className="transfer-dialog-actions">
+                  <button
+                    className="primary"
+                    onClick={() => setUserProfileDialog("closed")}
                   >
                     OK
                   </button>

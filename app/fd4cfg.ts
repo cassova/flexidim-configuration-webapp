@@ -1045,7 +1045,16 @@ export function updateUserProfile(
   const next = {
     ...user,
     ...patch,
-    profileVersion: (user.profileVersion ?? 0) + 1,
+    // The version (`ve` in the archive) counts revisions, not edits: it bumps
+    // when a profile that was in sync ("current"/"imported") is first edited,
+    // and further edits fold into that same pending revision. Reference
+    // archives show single-digit values after years of use, so per-edit
+    // increments would drift from the iOS app and risk overflowing the
+    // controller-side integer.
+    profileVersion:
+      user.profileStatus === "pending"
+        ? (user.profileVersion ?? 0)
+        : (user.profileVersion ?? 0) + 1,
     profileStatus: "pending" as const,
   };
   return { ...next, profileData: buildUserProfileData(next) };

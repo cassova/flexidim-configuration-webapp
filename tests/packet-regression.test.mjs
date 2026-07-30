@@ -109,6 +109,29 @@ test("an f2 record with a wrong check is rejected, not silently trusted", () => 
   assert.equal(replies.invalid.length, 1);
 });
 
+test("an f3 record is decoded as a not-normal status, not swallowed as unknown", () => {
+  // Observed on hardware while the controller was suspended after a send.
+  // f3 0e 0c sums to 0x0d, its transmitted check.
+  const replies = parseControllerReplies(bytes("f3 0e 0c 0d"));
+  assert.equal(replies.abnormalStatuses.length, 1);
+  assert.equal(replies.statuses.length, 0);
+  assert.equal(replies.invalid.length, 0);
+  assert.equal(replies.rest.length, 0);
+  assert.deepEqual([...replies.abnormalStatuses[0].record], [0xf3, 0x0e, 0x0c, 0x0d]);
+});
+
+test("consecutive f3 records are each parsed rather than dumped together", () => {
+  const replies = parseControllerReplies(bytes("f3 0e 0c 0d f3 0e 0c 0d"));
+  assert.equal(replies.abnormalStatuses.length, 2);
+  assert.equal(replies.visible.length, 0);
+});
+
+test("an f3 record with a wrong check is rejected", () => {
+  const replies = parseControllerReplies(bytes("f3 0e 0c 0e"));
+  assert.equal(replies.abnormalStatuses.length, 0);
+  assert.equal(replies.invalid.length, 1);
+});
+
 test("f2 receive addresses are one less than transmit addresses", () => {
   // PROTOCOL.md: f2 address 0x10 reports TX channel 17.
   const sum = (0xf2 + 0x10 + 0x64) & 0x7f;
