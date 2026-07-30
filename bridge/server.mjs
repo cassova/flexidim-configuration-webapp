@@ -76,6 +76,24 @@ const heartbeat = new WebSocketHeartbeat({
   },
 });
 
+function setControllerNormalStatus(ws, controller, normal, detail = "") {
+  if (controller.flexidimNormalStatus === normal) return;
+  controller.flexidimNormalStatus = normal;
+  emit(ws, {
+    type: "controllerStatus",
+    normalStatus: normal,
+    message: normal
+      ? "Scene Controller is reporting normal status"
+      : "Scene Controller is connected but not reporting normal status — it is probably resetting or suspended after a transfer. Wait for it to return to normal before sending commands or making changes.",
+    detail,
+  });
+  log(
+    normal
+      ? "◉ controller reporting normal status"
+      : `◐ controller NOT reporting normal status${detail ? ` [${detail}]` : ""}`,
+  );
+}
+
 function queueControllerStatus(ws, controller, statuses) {
   controller.flexidimPendingLevels ??= {};
   controller.flexidimKnownLevels ??= new Map();
@@ -122,119 +140,119 @@ function connectController(
   securityCode,
   { transferRunner, userProfileRunner, onConnected, onFailed, quiet = false } = {},
 ) {
-    controllers.get(ws)?.destroy();
-    if (!/^([a-z\d-]+\.)*[a-z\d-]+$|^\d{1,3}(\.\d{1,3}){3}$/i.test(host)) return emit(ws, { type: "status", state: "error", message: "Enter a valid Scene Controller address" });
-    log(`connect → ${host}:${port}`);
-    if (!quiet)
-      emit(ws, { type: "status", state: "connecting", message: `Connecting to ${host}:${port}` });
-    let connected = false; let failed = false; let connectedAt = 0;
-    let failureReported = false;
-    const reportFailure = () => {
-      if (failureReported) return;
-      failureReported = true;
-      onFailed?.();
-    };
-    const controller = net.createConnection({ host, port, timeout: 7000 }); controllers.set(ws, controller);
-    controller.flexidimConnection = { host, port, securityCode };
-    controller.flexidimTransferRunner = transferRunner;
-    controller.flexidimUserProfileRunner = userProfileRunner;
-    controller.on("connect", () => {
-      // The timeout above is for establishing the TCP connection only. Leaving it
-      // enabled disconnects a healthy but idle controller seven seconds later.
-      controller.setTimeout(0);
-      controller.setKeepAlive(true, 3000);
-      let login;
-      try {
-        login = authenticationRecord(securityCode);
-      } catch (error) {
-        failed = true;
-        log(`✗ controller authentication not sent: ${error.message}`);
-        emit(ws, { type: "status", state: "error", message: error.message });
-        controller.destroy();
-        reportFailure();
-        return;
-      }
-      connected = true;
-      connectedAt = Date.now();
-      // Recovered from stream0:handleEvent: in the iOS app. A site-type-0
-      // session starts with key + six-digit random nonce + 0xff. The app only
-      // enters tcpState 3 (command-ready) after writing this record.
-      controller.write(login);
-      controller.flexidimAuthenticated = true;
-      log(`→ TX controller authentication [16-byte key redacted + ${login.subarray(16, 22).toString("ascii")} + ff]`);
-      log(`✓ controller authenticated: ${host}:${port}`);
-      if (!quiet) {
-        emit(ws, { type: "trace", message: "Controller authentication sent (security code redacted)" });
-        emit(ws, { type: "status", state: "connected", message: `Authenticated with Scene Controller at ${host}:${port}` });
-      }
-      onConnected?.(controller);
-      // Do not add an application-level poll here. The controller volunteers its
-      // f2 level scan unprompted (confirmed by a 50s passive capture), so no poll
-      // is needed. The period-flag request is `ff f1 00` and stays gated until a
-      // reply has been observed; 0x05 — previously misattributed here as a poll —
-      // is actually the channel-search command, whose payload packing is not
-      // fully traced. Sending either as a guess has already been seen to make a
-      // real controller terminate the stream.
-    });
-    controller.on("data", (data) => {
-      const ordinaryData = controller.flexidimTransferRunner?.active
-        ? controller.flexidimTransferRunner.receive(data)
-        : controller.flexidimUserProfileRunner?.active
-          ? controller.flexidimUserProfileRunner.receive(data)
-          : controller.flexidimVerifySession?.active
-            ? controller.flexidimVerifySession.receive(data)
-            : data;
-      if (!ordinaryData.length) return;
-      controller.flexidimRxBuffer = Buffer.concat([controller.flexidimRxBuffer ?? Buffer.alloc(0), ordinaryData]);
-      const replies = parseControllerReplies(controller.flexidimRxBuffer);
-      controller.flexidimRxBuffer = Buffer.from(replies.rest);
-      if (replies.invalid.length) {
-        log(`✗ controller reply integrity check failed [${hex(Buffer.concat(replies.invalid))}]`);
-        emit(ws, { type: "trace", message: `Controller reply failed integrity check · ${hex(Buffer.concat(replies.invalid))}` });
-      }
-      if (replies.statuses.length) queueControllerStatus(ws, controller, replies.statuses);
-      if (replies.visible.length) {
-        const visible = Buffer.concat(replies.visible);
-        log(`← RX controller reply  [${hex(visible)}]`);
-        emit(ws, { type: "trace", message: `Controller reply · ${hex(visible)}` });
-      }
-    });
-    controller.on("timeout", () => {
+  controllers.get(ws)?.destroy();
+  if (!/^([a-z\d-]+\.)*[a-z\d-]+$|^\d{1,3}(\.\d{1,3}){3}$/i.test(host)) return emit(ws, { type: "status", state: "error", message: "Enter a valid Scene Controller address" });
+  log(`connect → ${host}:${port}`);
+  if (!quiet)
+    emit(ws, { type: "status", state: "connecting", message: `Connecting to ${host}:${port}` });
+  let connected = false; let failed = false; let connectedAt = 0;
+  let failureReported = false;
+  const reportFailure = () => {
+    if (failureReported) return;
+    failureReported = true;
+    onFailed?.();
+  };
+  const controller = net.createConnection({ host, port, timeout: 7000 }); controllers.set(ws, controller);
+  controller.flexidimConnection = { host, port, securityCode };
+  controller.flexidimTransferRunner = transferRunner;
+  controller.flexidimUserProfileRunner = userProfileRunner;
+  controller.on("connect", () => {
+    controller.setTimeout(0);
+    controller.setKeepAlive(true, 3000);
+    let login;
+    try {
+      login = authenticationRecord(securityCode);
+    } catch (error) {
       failed = true;
-      log(`✗ controller timed out (${host}:${port})`);
+      log(`✗ controller authentication not sent: ${error.message}`);
+      emit(ws, { type: "status", state: "error", message: error.message });
       controller.destroy();
-      if (!quiet)
-        emit(ws, { type: "status", state: "error", message: "Scene Controller connection timed out" });
       reportFailure();
+      return;
+    }
+    connected = true;
+    connectedAt = Date.now();
+    // Recovered from stream0:handleEvent: in the iOS app. A site-type-0
+    // session starts with key + six-digit random nonce + 0xff. The app only
+    // enters tcpState 3 (command-ready) after writing this record.
+    controller.write(login);
+    controller.flexidimAuthenticated = true;
+    controller.flexidimNormalStatus = undefined;
+    log(`→ TX controller authentication [16-byte key redacted + ${login.subarray(16, 22).toString("ascii")} + ff]`);
+    log(`✓ controller authenticated: ${host}:${port}`);
+    if (!quiet) {
+      emit(ws, { type: "trace", message: "Controller authentication sent (security code redacted)" });
+      emit(ws, { type: "status", state: "connected", message: `Authenticated with Scene Controller at ${host}:${port}` });
+    }
+    onConnected?.(controller);
+  });
+  controller.on("data", (data) => {
+    const ordinaryData = controller.flexidimTransferRunner?.active
+      ? controller.flexidimTransferRunner.receive(data)
+      : controller.flexidimUserProfileRunner?.active
+        ? controller.flexidimUserProfileRunner.receive(data)
+        : controller.flexidimVerifySession?.active
+          ? controller.flexidimVerifySession.receive(data)
+          : data;
+    if (!ordinaryData.length) return;
+    controller.flexidimRxBuffer = Buffer.concat([controller.flexidimRxBuffer ?? Buffer.alloc(0), ordinaryData]);
+    const replies = parseControllerReplies(controller.flexidimRxBuffer);
+    controller.flexidimRxBuffer = Buffer.from(replies.rest);
+    if (replies.invalid.length) {
+      log(`✗ controller reply integrity check failed [${hex(Buffer.concat(replies.invalid))}]`);
+      emit(ws, { type: "trace", message: `Controller reply failed integrity check · ${hex(Buffer.concat(replies.invalid))}` });
+    }
+    if (replies.statuses.length) queueControllerStatus(ws, controller, replies.statuses);
+    if (replies.abnormalStatuses?.length) {
+      const raw = hex(Buffer.concat(replies.abnormalStatuses.map((item) => item.record)));
+      log(`← RX controller status (not normal) [${raw}]`);
+      emit(ws, { type: "trace", message: `Scene Controller status (not normal) · ${raw}` });
+      setControllerNormalStatus(ws, controller, false, raw);
+    } else if (replies.statuses.length) {
+      setControllerNormalStatus(ws, controller, true);
+    }
+    if (replies.visible.length) {
+      const visible = Buffer.concat(replies.visible);
+      log(`← RX controller reply  [${hex(visible)}]`);
+      emit(ws, { type: "trace", message: `Controller reply · ${hex(visible)}` });
+    }
+  });
+  controller.on("timeout", () => {
+    failed = true;
+    log(`✗ controller timed out (${host}:${port})`);
+    controller.destroy();
+    if (!quiet)
+      emit(ws, { type: "status", state: "error", message: "Scene Controller connection timed out" });
+    reportFailure();
+  });
+  controller.on("error", (error) => {
+    failed = true;
+    log(`✗ controller error: ${error.code || ""} ${error.message}`);
+    if (!quiet)
+      emit(ws, { type: "status", state: "error", message: `Controller connection failed: ${error.message}` });
+    reportFailure();
+  });
+  controller.on("close", (hadError) => {
+    controller.flexidimVerifySession?.cancel();
+    if (controller.flexidimStatusTimer) clearTimeout(controller.flexidimStatusTimer);
+    const last = controller.flexidimLastTx;
+    const age = last ? Date.now() - last.at : undefined;
+    const lifetime = connectedAt ? Date.now() - connectedAt : 0;
+    const diagnostic = last
+      ? `; ${age}ms after TX ${last.label} [${hex(last.bytes)}]`
+      : `; no command sent during ${lifetime}ms connection`;
+    log(`controller connection closed${hadError ? " (after error)" : ""}${connected ? "" : " (never established)"}${diagnostic}`);
+    if (controller.flexidimTransferRunner?.active)
+      controller.flexidimTransferRunner.disconnected();
+    if (controller.flexidimUserProfileRunner?.active)
+      controller.flexidimUserProfileRunner.disconnected();
+    if (!connected) reportFailure();
+    if (!quiet && !ws.destroyed && connected && !failed) emit(ws, {
+      type: "status",
+      state: "bridge",
+      message: `Scene Controller disconnected${last ? ` after ${last.label}` : ""}`,
     });
-    controller.on("error", (error) => {
-      failed = true;
-      log(`✗ controller error: ${error.code || ""} ${error.message}`);
-      if (!quiet)
-        emit(ws, { type: "status", state: "error", message: `Controller connection failed: ${error.message}` });
-      reportFailure();
-    });
-    controller.on("close", (hadError) => {
-      controller.flexidimVerifySession?.cancel();
-      if (controller.flexidimStatusTimer) clearTimeout(controller.flexidimStatusTimer);
-      const last = controller.flexidimLastTx;
-      const age = last ? Date.now() - last.at : undefined;
-      const lifetime = connectedAt ? Date.now() - connectedAt : 0;
-      const diagnostic = last
-        ? `; ${age}ms after TX ${last.label} [${hex(last.bytes)}]`
-        : `; no command sent during ${lifetime}ms connection`;
-      log(`controller connection closed${hadError ? " (after error)" : ""}${connected ? "" : " (never established)"}${diagnostic}`);
-      if (controller.flexidimTransferRunner?.active)
-        controller.flexidimTransferRunner.disconnected();
-      if (controller.flexidimUserProfileRunner?.active)
-        controller.flexidimUserProfileRunner.disconnected();
-      if (!connected) reportFailure();
-      if (!quiet && !ws.destroyed && connected && !failed) emit(ws, {
-        type: "status",
-        state: "bridge",
-        message: `Scene Controller disconnected${last ? ` after ${last.label}` : ""}`,
-      });
-    });
+  });
 }
 
 function startLiveTransfer(ws, clientId, message) {
@@ -391,8 +409,8 @@ function handleMessage(ws, raw) {
   try { message = JSON.parse(raw); } catch { log(`✗ invalid message: ${raw}`); return emit(ws, { type: "status", state: "error", message: "Invalid bridge message" }); }
   log(
     `client → ${message.type}` +
-      (message.type === "dim" ? ` (ch ${message.channel}, ${message.level}%, t=${message.transition})` : "") +
-      (message.type === "switch" ? ` (sw ${message.switch}, btn ${message.button})` : ""),
+    (message.type === "dim" ? ` (ch ${message.channel}, ${message.level}%, t=${message.transition})` : "") +
+    (message.type === "switch" ? ` (sw ${message.switch}, btn ${message.button})` : ""),
   );
   // Answered locally, ahead of the capability refusal, so the app gets the
   // precise reason rather than a generic profile error.

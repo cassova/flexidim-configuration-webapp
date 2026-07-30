@@ -298,6 +298,15 @@ select:focus-visible {
   color: #9d3c35;
   background: #f9dfdc;
 }
+/* Connected but not reporting normal status — a distinct amber, overriding the
+   green .connected above (same specificity, so this must come after it). */
+.status-pill.not-normal {
+  color: #8a4b00;
+  background: #ffe4b8;
+}
+.connection-chip.not-normal i {
+  background: #d98a00;
+}
 button.primary,
 .button-row button,
 .card > button,
@@ -3415,15 +3424,4 @@ footer {
 .scene-colour-control input[type="color"] {
   width: 64px;
   height: 42px;
-}
-.user-profile-preflight {
-  margin: 2px 0 0;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: #f4f4f1;
-  text-align: left;
-}
-.user-profile-preflight.failed {
-  color: #7d3b35;
-  background: #fbeceb;
 }

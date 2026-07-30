@@ -5,13 +5,15 @@
 export function parseControllerReplies(buffer) {
   const statuses = [];
   const transferStatuses = [];
+  const abnormalStatuses = [];
   const visible = [];
   const invalid = [];
   let offset = 0;
 
   while (offset < buffer.length) {
     const kind = buffer[offset];
-    const length = kind === 0xf2 ? 4 : kind === 0xf4 || kind === 0xf5 ? 5 : 0;
+    const length =
+      kind === 0xf2 || kind === 0xf3 ? 4 : kind === 0xf4 || kind === 0xf5 ? 5 : 0;
     if (!length) {
       // Unknown reply shape: keep it visible rather than silently discarding it.
       visible.push(buffer.subarray(offset));
@@ -36,6 +38,8 @@ export function parseControllerReplies(buffer) {
         level: record[2],
       });
       transferStatuses.push({ kind, record });
+    } else if (kind === 0xf3) {
+      abnormalStatuses.push({ kind, record });
     } else {
       visible.push(record);
       // The type-0 iOS stream parser's f2 and f4 jump-table branches both
@@ -49,6 +53,7 @@ export function parseControllerReplies(buffer) {
   return {
     statuses,
     transferStatuses,
+    abnormalStatuses,
     visible,
     invalid,
     rest: buffer.subarray(offset),
